@@ -1,0 +1,22 @@
+# DeepNovel-Translator 依赖
+
+# 核心依赖
+openai>=1.0.0
+pydantic>=2.0.0
+pyyaml>=6.0
+python-docx>=1.1.0
+zstandard>=0.23.0
+
+# CLI 美化
+rich>=13.0.0
+
+# 可选：Anthropic Claude 支持
+# anthropic>=0.18.0
+
+# 可选：WebUI (后期)
+# streamlit>=1.30.0
+# gradio>=4.0.0
+
+# 开发依赖
+# pytest>=7.0.0
+# black>=23.0.0

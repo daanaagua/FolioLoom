@@ -1,0 +1,22 @@
+{
+  "name": "deepnovel-translator-v5-pilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --import tsx test/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "pilot": "tsx src/cli.ts",
+    "book": "tsx src/cli.ts book"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2"
+  }
+}

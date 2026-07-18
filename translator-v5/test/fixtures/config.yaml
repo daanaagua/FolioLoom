@@ -1,0 +1,14 @@
+llm:
+  active_provider: deepseek
+  providers:
+    deepseek:
+      api_key: secret-test-key
+      base_url: https://example.invalid/v1
+      timeout: 1800
+      models:
+        draft: deepseek-v4-flash
+      request_options:
+        draft:
+          reasoning_effort: high
+          thinking:
+            type: enabled

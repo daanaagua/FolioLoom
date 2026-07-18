@@ -1,0 +1,96 @@
+# DeepNovel-Translator 两层流程配置
+llm:
+  active_provider: "deepseek"
+  providers:
+    deepseek:
+      base_url: "https://api.deepseek.com"
+      api_key: "${DEEPSEEK_API_KEY}"
+      timeout: 1800
+      models:
+        scan: "deepseek-v4-flash"
+        semantic: "deepseek-v4-flash"
+        reconcile: "deepseek-v4-flash"
+        verify: "deepseek-v4-flash"
+        repair: "deepseek-v4-flash"
+        draft: "deepseek-v4-flash"
+        polish: "deepseek-v4-flash"
+      request_options:
+        draft:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        polish:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        scan:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        semantic:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        verify:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        repair:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+
+translation:
+  chunking:
+    max_tokens: 1100
+    overlap_sentences: 0
+  draft:
+    temperature: 0.1
+    max_tokens: 6144
+  polish:
+    temperature: 0.2
+    max_tokens: 37200
+  memory:
+    rolling_summary_max_chars: 1200
+    recent_chunks: 2
+    recent_source_chars: 600
+    recent_translation_chars: 1000
+  enable_auto_glossary: true
+
+parallel_v4:
+  decision_mode: "auto"
+  pause_on_review: false
+  unattended_failure_policy: "finish_with_warnings"
+  max_knowledge_epochs: 3
+  island_size: 3
+  initial_workers: 2
+  max_workers: 4
+  max_context_chars: 24000
+  enable_semantic_mapper: true
+  semantic_temperature: 0.0
+  semantic_max_tokens: 4096
+  semantic_max_attempts: 2
+  enable_narrative_premap: true
+  dynamic_scheduling: true
+  premap_ahead_blocks: 12
+  premap_max_tokens: 6144
+  premap_max_attempts: 2
+  max_narrative_context_chars: 6000
+  draft_input_soft_tokens: 6000
+  polish_input_soft_tokens: 8000
+  prompt_reserve_ratio: 0.20
+  style_directive_max_tokens: 60
+  style_anchor_max_tokens: 300
+  enable_style_anchors: true
+  use_baseline_reference: false
+  audit_mode: "full"
+
+paths:
+  input_dir: "data/input"
+  output_dir: "data/output"
+  glossary_dir: "data/glossary"
+  cache_dir: "data/cache"
+
+logging:
+  level: "INFO"
+  save_intermediate: true

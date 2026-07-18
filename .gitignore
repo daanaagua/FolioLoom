@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+.venv/
+.worktrees/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# DeepNovel-Translator Specific
+# 忽略项目具体数据，但保留项目结构目录
+projects/*/
+!projects/.gitkeep
+# 忽略 API Key 配置文件（防止泄露）
+config/config.yaml
+# 保留示例配置
+!config/config.example.yaml
+
+# Logs
+*.log
+logs/
+data/cache/
+data/output/
+
+# 本地调试遗留物
+debug_*.py
+deep_test_xml.py
+session-*.md
+streamlit
+test.txt
+log.txt
+
+# V5 TypeScript pilot
+translator-v5/node_modules/
+translator-v5/dist/
+translator-v5/.pilot/
+translator-v5/coverage/
+用于测试的模型.txt

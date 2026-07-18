@@ -1,0 +1,93 @@
+[
+  {
+    "id": "term_autarch",
+    "src": "Autarch",
+    "default_target": "独裁官",
+    "category": "person",
+    "description": "乌尔苏拉（Urth）的最高统治者",
+    "rules": [
+      {
+        "condition": "对话中作为敬称直接呼唤",
+        "target": "至尊",
+        "example": "Yes, Autarch. -> 是的，至尊。"
+      },
+      {
+        "condition": "敌对势力或反讽语境",
+        "target": "独夫",
+        "example": "The so-called Autarch -> 所谓独夫"
+      }
+    ]
+  },
+  {
+    "id": "term_severian",
+    "src": "Severian",
+    "default_target": "塞弗里安",
+    "category": "person",
+    "description": "主角，寻求者行会的刽子手学徒"
+  },
+  {
+    "id": "term_fuligin",
+    "src": "fuligin",
+    "default_target": "墨黑",
+    "category": "concept",
+    "description": "比黑色更黑的颜色，刽子手斗篷的颜色"
+  },
+  {
+    "id": "term_terminus_est",
+    "src": "Terminus Est",
+    "default_target": "终焉之剑",
+    "category": "item",
+    "description": "塞弗里安的行刑剑，名字意为「这就是终结」"
+  },
+  {
+    "id": "term_guild",
+    "src": "Guild",
+    "default_target": "行会",
+    "category": "organization",
+    "rules": [
+      {
+        "condition": "特指寻求者行会（刽子手）",
+        "target": "行会",
+        "example": "the Guild of Seekers for Truth and Penitence -> 寻求真理与忏悔行会"
+      },
+      {
+        "condition": "泛指其他行会组织",
+        "target": "公会",
+        "example": "the Merchant's Guild -> 商人公会"
+      }
+    ]
+  },
+  {
+    "id": "term_foila",
+    "src": "Foila",
+    "default_target": "芙依拉",
+    "category": "person",
+    "description": "女战士，讲故事比赛的发起者"
+  },
+  {
+    "id": "term_melito",
+    "src": "Melito",
+    "default_target": "梅利托",
+    "category": "person"
+  },
+  {
+    "id": "term_hallvard",
+    "src": "Hallvard",
+    "default_target": "哈尔瓦德",
+    "category": "person"
+  },
+  {
+    "id": "term_lazaret",
+    "src": "lazaret",
+    "default_target": "野战医院",
+    "category": "place",
+    "description": "战地临时医疗设施"
+  },
+  {
+    "id": "term_urth",
+    "src": "Urth",
+    "default_target": "乌尔苏拉",
+    "category": "place",
+    "description": "故事发生的世界（远未来的地球）"
+  }
+]
