@@ -1,0 +1,27 @@
+name: FolioLoom CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: translator-v5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: translator-v5/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck

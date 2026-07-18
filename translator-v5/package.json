@@ -1,11 +1,13 @@
 {
-  "name": "deepnovel-translator-v5-pilot",
-  "version": "0.1.0",
+  "name": "folioloom",
+  "version": "1.0.0",
   "private": true,
+  "description": "A continuity-aware translation engine for long-form fiction.",
   "type": "module",
   "scripts": {
     "test": "node --test --import tsx test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
+    "folioloom": "tsx src/cli.ts",
     "pilot": "tsx src/cli.ts",
     "book": "tsx src/cli.ts book"
   },
