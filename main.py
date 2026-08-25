@@ -16,7 +16,7 @@ from src.core.llm_client import LLMManager
 from src.core.translator import TranslationEngine, TranslationConfig
 from src.core.project_manager import ProjectManager
 from src.core.exporter import BookExporter
-from src.core.v5_exporter import V5BookExporter
+from src.core.folioloom_exporter import FolioLoomBookExporter
 from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import ChunkStatus
 from src.core.v4 import (
@@ -1056,17 +1056,20 @@ def cmd_export_v4(args):
     return 0
 
 
-def cmd_export_v5(args):
+def cmd_export_folioloom(args):
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
     try:
-        result = V5BookExporter(project, run_id=args.run_id).export_v5(
+        result = FolioLoomBookExporter(
+            project,
+            run_id=args.run_id,
+        ).export_folioloom(
             output_dir=args.output_dir,
             allow_incomplete=args.allow_incomplete,
         )
     except Exception as exc:
-        print(f"[ERROR] V5 导出失败: {exc}")
+        print(f"[ERROR] FolioLoom 导出失败: {exc}")
         return 1
     print(f"[OK] TXT: {result.txt_path}")
     print(f"[OK] EPUB: {result.epub_path}")
@@ -1417,12 +1420,15 @@ def main(argv=None):
     p_export_v4.add_argument("--include-annotations", action="store_true")
     p_export_v4.set_defaults(func=cmd_export_v4)
 
-    p_export_v5 = subparsers.add_parser("export-v5", help="严格导出translator-v5的TXT和EPUB")
-    p_export_v5.add_argument("book_id", help="项目ID")
-    p_export_v5.add_argument("--output-dir")
-    p_export_v5.add_argument("--run-id", help="schema v2 translation run ID")
-    p_export_v5.add_argument("--allow-incomplete", action="store_true")
-    p_export_v5.set_defaults(func=cmd_export_v5)
+    p_export_folioloom = subparsers.add_parser(
+        "export-folioloom",
+        help="严格导出 FolioLoom 的 TXT 和 EPUB",
+    )
+    p_export_folioloom.add_argument("book_id", help="项目ID")
+    p_export_folioloom.add_argument("--output-dir")
+    p_export_folioloom.add_argument("--run-id", help="schema v2 translation run ID")
+    p_export_folioloom.add_argument("--allow-incomplete", action="store_true")
+    p_export_folioloom.set_defaults(func=cmd_export_folioloom)
 
     p_compare_v4 = subparsers.add_parser("compare-v4", help="生成串行基线与parallel_v4人工对照")
     p_compare_v4.add_argument("book_id", help="项目ID")
@@ -1431,7 +1437,10 @@ def main(argv=None):
     p_compare_v4.add_argument("--baseline", help="指定外部基线名称")
     p_compare_v4.set_defaults(func=cmd_compare_v4)
     
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["export-v5"]:
+        arguments[0] = "export-folioloom"
+    args = parser.parse_args(arguments)
     
     if args.command is None:
         parser.print_help()

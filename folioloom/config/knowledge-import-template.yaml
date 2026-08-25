@@ -1,0 +1,10 @@
+schema: folioloom-knowledge-import-1
+objectType: term
+scope: book
+records:
+  - source: Archon
+    target: 执政官
+    policy: preferred
+    forms:
+      - archon
+    note: 职位称呼

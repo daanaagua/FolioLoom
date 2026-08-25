@@ -7,6 +7,7 @@ __pycache__/
 env/
 .venv/
 .worktrees/
+.superpowers/
 build/
 develop-eggs/
 dist/
@@ -46,9 +47,18 @@ streamlit
 test.txt
 log.txt
 
-# V5 TypeScript pilot
-translator-v5/node_modules/
-translator-v5/dist/
-translator-v5/.pilot/
-translator-v5/coverage/
+# FolioLoom
+folioloom/node_modules/
+folioloom/dist/
+folioloom/.pilot/
+folioloom/coverage/
+folioloom/out/
+folioloom/release/
+folioloom/.local/
+
+# Local archives kept outside the public repository
+local-archive/
 用于测试的模型.txt
+
+# Local copyrighted source text
+/Book of the New Sun.docx

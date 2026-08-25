@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "types": ["node", "electron", "vitest/globals"]
+  },
+  "include": [
+    "src/desktop/**/*.ts",
+    "src/desktop/**/*.tsx",
+    "test/desktop-*.test.ts"
+  ]
+}

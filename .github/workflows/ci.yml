@@ -14,14 +14,15 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: translator-v5
+        working-directory: folioloom
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: translator-v5/package-lock.json
+          cache-dependency-path: folioloom/package-lock.json
       - run: npm ci
+      - run: npm run desktop:build
       - run: npm test
       - run: npm run typecheck

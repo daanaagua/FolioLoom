@@ -1,0 +1,16 @@
+appId: io.folioloom.desktop
+productName: FolioLoom
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: desktop/resources
+    to: folioloom
+win:
+  target:
+    - target: portable
+      arch:
+        - x64
+artifactName: FolioLoom-portable-win-x64.${ext}

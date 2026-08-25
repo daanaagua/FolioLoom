@@ -332,7 +332,7 @@ git grep -n -I -E 'gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z
 
 - 同步到：`D:\llm\novel-translate-public-release`
 
-- [ ] **步骤 1：验证公开副本身份与干净状态**
+- [x] **步骤 1：验证公开副本身份与干净状态**
 
 ```powershell
 Set-Location D:\llm\novel-translate-public-release
@@ -343,7 +343,7 @@ git log --oneline -2
 
 预期：工作树干净，当前历史只有已净化的公开提交，remote 指向 `daanaagua/novel-translate-public`。
 
-- [ ] **步骤 2：生成仅含已提交变更的补丁**
+- [x] **步骤 2：生成仅含已提交变更的补丁**
 
 在私有仓库中运行：
 
@@ -355,7 +355,7 @@ git diff --binary --output="$env:TEMP\folioloom-v1.patch" `
 
 补丁基线 `9e06c1a` 对应首次公开快照的源码状态；它不会包含用户未提交修改或被排除的 DOCX。
 
-- [ ] **步骤 3：在公开副本中应用补丁**
+- [x] **步骤 3：在公开副本中应用补丁**
 
 ```powershell
 Set-Location D:\llm\novel-translate-public-release
@@ -366,7 +366,7 @@ git status --short
 
 预期：只出现本计划涉及的源码、README、LICENSE、CI、规格/计划和 Release notes；不得出现小说或项目工件。
 
-- [ ] **步骤 4：在公开副本重复安全扫描与测试**
+- [x] **步骤 4：在公开副本重复安全扫描与测试**
 
 ```powershell
 git ls-files | Where-Object {
@@ -380,7 +380,7 @@ npm.cmd run typecheck
 
 预期：敏感工件列表为空，测试和类型检查通过。
 
-- [ ] **步骤 5：提交公开发布候选**
+- [x] **步骤 5：提交公开发布候选**
 
 ```powershell
 Set-Location D:\llm\novel-translate-public-release
@@ -396,7 +396,7 @@ git commit -m "release: FolioLoom v1.0.0"
 
 - GitHub 仓库：`daanaagua/novel-translate-public`
 
-- [ ] **步骤 1：确认目标名未被占用**
+- [x] **步骤 1：确认目标名未被占用**
 
 ```powershell
 gh repo view daanaagua/FolioLoom --json nameWithOwner 2>&1
@@ -404,7 +404,7 @@ gh repo view daanaagua/FolioLoom --json nameWithOwner 2>&1
 
 预期：仓库不存在；若已经存在，停止，不覆盖或删除任何远端仓库。
 
-- [ ] **步骤 2：重命名公开仓库**
+- [x] **步骤 2：重命名公开仓库**
 
 ```powershell
 gh repo rename FolioLoom --repo daanaagua/novel-translate-public --yes
@@ -412,7 +412,7 @@ gh repo rename FolioLoom --repo daanaagua/novel-translate-public --yes
 
 预期：返回成功，仓库仍为 `PUBLIC`。
 
-- [ ] **步骤 3：更新并验证公开副本 remote**
+- [x] **步骤 3：更新并验证公开副本 remote**
 
 ```powershell
 Set-Location D:\llm\novel-translate-public-release
@@ -422,7 +422,7 @@ gh repo view daanaagua/FolioLoom --json nameWithOwner,url,visibility,defaultBran
 
 预期：`visibility` 为 `PUBLIC`，默认分支为 `main`。
 
-- [ ] **步骤 4：推送发布候选并等待 CI**
+- [x] **步骤 4：推送发布候选并等待 CI**
 
 ```powershell
 git push origin main
@@ -440,7 +440,7 @@ gh run watch $runId --repo daanaagua/FolioLoom --exit-status
 
 - 使用：`docs/releases/v1.0.0.md`
 
-- [ ] **步骤 1：确认 Tag 尚不存在且工作树干净**
+- [x] **步骤 1：确认 Tag 尚不存在且工作树干净**
 
 ```powershell
 Set-Location D:\llm\novel-translate-public-release
@@ -451,14 +451,14 @@ git ls-remote --tags origin refs/tags/v1.0.0
 
 预期：工作树干净，本地和远端均无 `v1.0.0`。
 
-- [ ] **步骤 2：创建带注释 Tag 并推送**
+- [x] **步骤 2：创建带注释 Tag 并推送**
 
 ```powershell
 git tag -a v1.0.0 -m "FolioLoom v1.0.0"
 git push origin v1.0.0
 ```
 
-- [ ] **步骤 3：创建公开 Release**
+- [x] **步骤 3：创建公开 Release**
 
 ```powershell
 gh release create v1.0.0 `
@@ -470,7 +470,7 @@ gh release create v1.0.0 `
 
 不附加二进制、小说、数据库或翻译产物。
 
-- [ ] **步骤 4：最终远端验证**
+- [x] **步骤 4：最终远端验证**
 
 ```powershell
 gh repo view daanaagua/FolioLoom --json url,visibility,defaultBranchRef,licenseInfo
@@ -487,7 +487,7 @@ gh run list --repo daanaagua/FolioLoom --workflow "FolioLoom CI" --limit 3
 - 修改：`README.md`（仅当最终 URL 与已写内容不同）
 - 不添加公开仓库 remote 到私有仓库，避免误推完整历史。
 
-- [ ] **步骤 1：检查私有 README 的公开链接**
+- [x] **步骤 1：检查私有 README 的公开链接**
 
 ```powershell
 Set-Location D:\llm\小说翻译
@@ -496,7 +496,7 @@ rg -n "github.com/daanaagua/(FolioLoom|novel-translate-public)" README.md
 
 若 README 已使用最终地址，不修改。若仍为旧地址，只替换链接并单独提交。
 
-- [ ] **步骤 2：确认用户修改和私有 remote 未受影响**
+- [x] **步骤 2：确认用户修改和私有 remote 未受影响**
 
 ```powershell
 git status --short

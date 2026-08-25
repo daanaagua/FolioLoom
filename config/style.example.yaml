@@ -1,0 +1,12 @@
+# 只保留你想调整的字段。未填写的字段会沿用 FolioLoom 的书级默认文风。
+# 每个常规字段最多 180 个 Unicode 字符；additionalInstruction 最多 600 个。
+style:
+  register: "现代书面语，准确、克制，不使用网络流行语"
+  sentencePolicy: "长短句的节奏跟随原文，不为追求简洁而拆散必要的句法关系"
+  explicitation: "保留原文的含混与留白，不替读者补写解释"
+  imagery: "保留意象、重复和修辞之间的呼应"
+  dialogue: "对白自然、贴合人物关系，不擅自改变称谓的亲疏"
+  technicalProse: "科学和技术段落优先清晰、精确，必要时保留术语结构"
+  typography: "使用中文全角引号和规范标点，保留原文段落边界"
+  narratorVoice: "叙述声音冷静而有节制，避免夸饰"
+  additionalInstruction: "译文整体避免网络化表达。"

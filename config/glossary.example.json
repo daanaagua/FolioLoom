@@ -1,0 +1,25 @@
+{
+  "schema": "folioloom-glossary-1",
+  "terms": [
+    {
+      "source": "Severian",
+      "target": "塞万里安",
+      "kind": "entity",
+      "policy": "locked",
+      "forms": ["Severian's"]
+    },
+    {
+      "source": "Piaton",
+      "target": "皮亚顿",
+      "kind": "entity",
+      "policy": "preferred"
+    },
+    {
+      "source": "Archon",
+      "target": "执政官",
+      "kind": "title",
+      "policy": "contextual",
+      "note": "作为制度或官职时译为“执政官”；直接呼告时可按中文语境译为“阁下”。"
+    }
+  ]
+}

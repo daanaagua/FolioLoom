@@ -1,0 +1,8 @@
+{
+  "schema": "folioloom-desktop-resource-1",
+  "version": "1.5.3",
+  "apiKeyPolicy": "never-packaged",
+  "projectDataPolicy": "user-selected",
+  "translationWritePolicy": "single-window-trial-and-durable-fullbook",
+  "exportPolicy": "strict-txt-bilingual-epub"
+}
