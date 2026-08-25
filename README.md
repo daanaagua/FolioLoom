@@ -46,8 +46,8 @@ FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调�
 要求：Windows、Python 3.11+、Node.js 24+。
 
 ```powershell
-git clone https://github.com/daanaagua/novel-translate.git
-Set-Location novel-translate
+git clone https://github.com/daanaagua/FolioLoom.git
+Set-Location FolioLoom
 
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -120,7 +120,7 @@ API Key 不会进入项目、日志、界面返回值或安装包。Windows 系�
 
 遇到试译失败时，可以从错误面板或左侧常驻入口导出诊断 JSON。严格隐私模式只保留版本、运行阶段、状态、计数、错误码和已经脱敏的错误链，不保存 API Key、Authorization、原文、译文、提示词、模型原始响应或完整私人路径。
 
-`npm.cmd run desktop:dist` 可在本机生成 Windows x64 portable 构建；普通用户也可以从 [GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest) 下载目录便携 ZIP。桌面端的开发与安全边界见 [`folioloom/README.md`](folioloom/README.md)。
+`npm.cmd run desktop:dist` 可在本机生成 Windows x64 portable 构建；普通用户也可以从 [GitHub Releases](https://github.com/daanaagua/FolioLoom/releases/latest) 下载目录便携 ZIP。桌面端的开发与安全边界见 [`folioloom/README.md`](folioloom/README.md)。
 
 ## 调整翻译文风
 

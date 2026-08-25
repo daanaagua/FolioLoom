@@ -30,7 +30,7 @@ npm.cmd run desktop:dev
 ```
 
 不需要开发环境的用户可以从
-[GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest)
+[GitHub Releases](https://github.com/daanaagua/FolioLoom/releases/latest)
 下载 `FolioLoom-portable-win-x64.zip`，完整解压后运行根目录的 `FolioLoom.exe`。
 
 连接检查会验证真实流式响应、工具调用和多轮连续性；只有 `ready` 状态可以开始试译或整本翻译。`limited` 和 `failed` 会显示可执行原因，不会被包装成成功。试译只运行一个串行窗口，不会暗中启动全书翻译。
