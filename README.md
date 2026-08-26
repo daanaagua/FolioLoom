@@ -1,49 +1,51 @@
 # FolioLoom
 
+**English** | [简体中文](README.zh-CN.md)
+
 > A continuity-aware translation engine for long-form fiction.
 
-FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
+FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-当前版本为 **FolioLoom v1.5.3**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+The current release is **FolioLoom v1.5.3**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-## V1.5.3 能做什么
+## What v1.5.3 can do
 
-- 为原始文本建立带哈希和位置映射的无损账本；
-- 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
-- 按证据记录实体别名、候选关系和再验证状态；
-- 在每个并行波次冻结术语锚点，减少兄弟窗口的译名漂移；
-- 组合书级风格约束、人物声音、语体权重和衰减的局部状态；
-- 对漏译、异常残留和结构错误执行确定性校验与一次局部修复；
-- 从 SQLite 状态库导出中文 TXT、双语 TXT、EPUB 和审计报告；
-- 对新导入的 EPUB 以原书为导出模板，保留脚注、返回链接、跨章节链接、外部 URL、OPF/spine/nav、样式及其他资源；结构槽或内部链接异常时拒绝发布损坏文件；
-- 通过 Electron 桌面端完成书稿导入、模型连接、试译、整本运行、暂停恢复、导出、术语与叙事记忆维护；
-- 导入 JSON、YAML、CSV 或 XLSX 术语数据，并在写入前处理字段映射和冲突；
-- 针对英语、德语、法语、西班牙语、俄语、日语和韩语提供语言画像，并支持常见 Unicode、Windows-1252 及日韩传统编码；
-- 一键导出不含密钥、书稿、译文和完整私人路径的诊断 JSON，便于定位导入、连接、试译、校验或提交阶段的失败；
-- 在桌面端列出需要处理的文本块、失败类别、公开错误码和下一步；可恢复项只允许一次经过影子审计与原子晋升的安全重试；
-- DeepSeek 固定提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`，旧模型名会被明确拒绝而不会进入翻译。
+- Build a lossless source ledger with hashes and positional mappings.
+- Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
+- Record entity aliases, candidate relationships, and revalidation state with evidence.
+- Freeze terminology anchors for each parallel wave to reduce name drift between sibling windows.
+- Combine book-level style constraints, character voices, register weights, and decaying local state.
+- Apply deterministic checks and one bounded local repair for omissions, unexpected residue, and structural errors.
+- Export Chinese TXT, bilingual TXT, EPUB, and audit reports from the SQLite state store.
+- Use newly imported EPUB files as export templates, preserving footnotes, backlinks, cross-chapter links, external URLs, OPF/spine/nav structure, styles, and other resources. FolioLoom refuses to publish an EPUB when structural slots or internal links are invalid.
+- Use the Electron desktop app to import books, connect models, run a trial translation, translate a full book, pause and resume, export results, and maintain terminology and narrative memory.
+- Import terminology from JSON, YAML, CSV, or XLSX files, with field mapping and conflict handling before data is written.
+- Apply language profiles for English, German, French, Spanish, Russian, Japanese, and Korean, with support for common Unicode encodings, Windows-1252, and legacy Japanese and Korean encodings.
+- Export privacy-safe diagnostic JSON without API keys, book text, translations, or complete private paths.
+- Show text blocks requiring attention, failure categories, public error codes, and next actions in the desktop app. Recoverable incidents receive at most one safe retry through shadow audit and atomic promotion.
+- Offer only `deepseek-v4-flash` and `deepseek-v4-pro` for DeepSeek; legacy model names are rejected before translation starts.
 
-## V4 Flash 100K 实测
+## V4 Flash 100K benchmark
 
-FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 增加 EPUB 结构保真，v1.5.3 增加桌面端处理与恢复工作流，均不改变该翻译调度内核：
+FolioLoom v1.5.1 was tested on fresh project databases with the current `deepseek-v4-flash` model, Active/Balanced scheduling, and three concurrent requests. v1.5.2 added EPUB structure preservation, and v1.5.3 added desktop handling and recovery workflows without changing this translation scheduler.
 
-- 德语《变形记》：**10 分 55 秒**；
-- 英语《时间之子》第一部：**18 分 56 秒**。
+- German, *The Metamorphosis*: **10 minutes 55 seconds** for the first 100K characters.
+- English, Part One of *Children of Time*: **18 minutes 56 seconds** for the first 100K characters.
 
-两次运行均完成严格导出与审计，且没有 human-required 或 failed 窗口。实际耗时仍会受模型服务负载、网络状况、段落结构和知识重验证次数影响；上述数字是本次发布验收样本，不是固定速度承诺。详细口径与结果见[双语 100K 验收报告](docs/superpowers/reports/2026-07-30-translation-throughput-and-revalidation-live-validation.md)。
+Both runs passed strict export and audit with no human-required or failed windows. Actual time still depends on model service load, network conditions, paragraph structure, and knowledge revalidation. These figures are release-acceptance samples, not guaranteed throughput. See the [bilingual 100K acceptance report](docs/superpowers/reports/2026-07-30-translation-throughput-and-revalidation-live-validation.md) for the full methodology and results.
 
-## 当前限制
+## Current limitations
 
-- 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
-- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是当前版本主入口；
-- 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
-- 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复、需要处理中心和严格导出；逐段人工改译与批量审阅仍是后续工作；
-- 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
-- EPUB 原模板保真只适用于由 v1.5.2 重新导入的项目；旧项目不会用模糊对齐猜测链接位置，需重新导入原 EPUB 后再翻译。
+- Releases currently include a Windows x64 single-file portable build and a portable ZIP, but they are not code-signed.
+- The local V4 adjudication page and legacy Streamlit page remain in the repository but are not the primary interface.
+- Offline regression tests and live-model one-window and three-window gates are complete; a full-book quality benchmark for the latest architecture has not yet been published.
+- The desktop app supports book import, model compatibility checks, single-fragment trials, full-book start/pause/resume, the attention center, and strict export. Paragraph-level manual rewriting and batch review are still planned.
+- The desktop app includes DeepSeek, Kimi, Alibaba Cloud Model Studio, Volcano Ark, OpenAI, SiliconFlow, and custom OpenAI-compatible endpoints. DeepSeek accepts only V4 Flash/Pro, and every model must pass a live compatibility check.
+- Original-template EPUB preservation applies only to projects re-imported with v1.5.2 or later. Older projects are not fuzzily aligned to guessed link positions; re-import the original EPUB before translating.
 
-## 安装
+## Installation
 
-要求：Windows、Python 3.11+、Node.js 24+。
+Requirements: Windows, Python 3.11+, and Node.js 24+.
 
 ```powershell
 git clone https://github.com/daanaagua/FolioLoom.git
@@ -57,33 +59,33 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.5.3 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+Copy the example configuration. In v1.5.3, you can place a real API key in the untracked `config/config.yaml`, or pass `--opencode-auth` to `book run` and read credentials from your local OpenCode authentication file.
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml
-# 编辑 config\config.yaml，将 api_key 占位值替换为本机密钥；
-# 或在 book run 后附加：
+# Edit config\config.yaml and replace the api_key placeholder with a local key;
+# or append this to book run:
 # --opencode-auth "$HOME\.local\share\opencode\auth.json"
 ```
 
-真实密钥、小说原文、项目数据库和模型输出都不应提交到 Git。
+Never commit real credentials, copyrighted source books, project databases, or model output.
 
-## 快速开始
+## Quick start
 
-以下示例先建立 `my_book` 项目，再只翻译一个窗口进行检查。
+The following example creates a `my_book` project and translates one window for inspection.
 
 ```powershell
-# 在仓库根目录执行；支持 .txt/.md/.docx/.epub
+# Run from the repository root; supports .txt/.md/.docx/.epub
 .\.venv\Scripts\python.exe main.py init my_book "D:\books\my_book.epub" `
   --source-language en
 
 Set-Location folioloom
 
-# 只读检查原文覆盖、分块和异常，不调用模型
+# Read-only source coverage, chunking, and anomaly checks; does not call a model
 npm.cmd run folioloom -- book doctor `
   --manifest ..\projects\my_book\source_manifest.json
 
-# 翻译一个逻辑窗口
+# Translate one logical window
 npm.cmd run folioloom -- book run `
   --manifest ..\projects\my_book\source_manifest.json `
   --store ..\projects\my_book\artifacts\folioloom\book.db `
@@ -91,16 +93,16 @@ npm.cmd run folioloom -- book run `
   --max-windows 1 `
   --max-concurrency 1
 
-# 查看状态；若状态库中只有一个运行，可以省略 --run
+# Inspect status; --run may be omitted when the store contains only one run
 npm.cmd run folioloom -- book status `
   --store ..\projects\my_book\artifacts\folioloom\book.db
 ```
 
-确认试译后，重复 `book run` 并移除 `--max-windows 1` 即可继续。运行器会跳过已经提交的窗口。
+After reviewing the trial translation, repeat `book run` without `--max-windows 1` to continue. The runner skips windows that have already been committed.
 
-## 本地桌面工作台（开发预览）
+## Local desktop workbench (development preview)
 
-桌面工作台允许普通用户选择书稿、连接模型、先试译一小段，再开始整本翻译和导出。它可以直接导入 TXT、EPUB、DOCX 或 Markdown；内部项目文件和数据库无需手动选择。
+The desktop workbench lets non-technical users select a manuscript, connect a model, translate a short trial, and then translate and export the entire book. It imports TXT, EPUB, DOCX, and Markdown directly; users do not need to select internal project files or databases.
 
 ```powershell
 Set-Location folioloom
@@ -108,31 +110,31 @@ npm.cmd install
 npm.cmd run desktop:dev
 ```
 
-打开后按界面完成以下步骤：
+In the application:
 
-1. 选择一本有权处理的书稿；
-2. 选择模型服务，输入自己的 API Key、模型与原始 effort 值；
-3. 测试连接，通过后运行一次单片段试译；
-4. 在“翻译运行”中选择质量或快速模式，开始整本翻译；运行可安全暂停，并可在重启应用后继续；
-5. 翻译完整且审计通过后，在“导出”中选择中文 TXT、双语 TXT、EPUB 或三者全部。
+1. Select a manuscript you are authorized to process.
+2. Select a model provider and enter your API key, model name, and raw effort value.
+3. Test the connection, then run a single-fragment trial translation.
+4. Choose quality or fast mode under Translation Run and start the full book. A run can be paused safely and resumed after restarting the app.
+5. Once the translation is complete and the audit passes, export Chinese TXT, bilingual TXT, EPUB, or all three.
 
-API Key 不会进入项目、日志、界面返回值或安装包。Windows 系统加密可用时，密钥以 Electron `safeStorage` 密文保存；不可用时只保留到当前应用会话结束。试译固定为一个串行窗口；整本运行把进度和译文提交到该书稿自己的 SQLite 状态库，不改写原始文件。暂停或关闭应用会先取消当前模型请求并等待持久状态落稳；恢复时沿用原运行的模型策略。导出只接受已完整翻译且严格校验通过的运行，并为 TXT 与 EPUB 保留可追溯谱系。
+API keys never enter the project, logs, UI return values, or installer. When Windows system encryption is available, keys are stored through Electron `safeStorage`; otherwise, they remain only for the current application session. Trial translation always uses one serial window. Full-book runs commit progress and translations to the manuscript's own SQLite state store without modifying the source file. Pausing or closing the app first cancels the active model request and waits for persistent state to settle; resuming preserves the run's model strategy. Export accepts only complete runs that pass strict validation and retains traceable lineage for TXT and EPUB output.
 
-遇到试译失败时，可以从错误面板或左侧常驻入口导出诊断 JSON。严格隐私模式只保留版本、运行阶段、状态、计数、错误码和已经脱敏的错误链，不保存 API Key、Authorization、原文、译文、提示词、模型原始响应或完整私人路径。
+When a trial fails, export diagnostic JSON from the error panel or the persistent entry in the sidebar. Strict privacy mode retains only the version, run stage, status, counts, error codes, and redacted error chain. It excludes API keys, Authorization headers, source text, translations, prompts, raw model responses, and complete private paths.
 
-`npm.cmd run desktop:dist` 可在本机生成 Windows x64 portable 构建；普通用户也可以从 [GitHub Releases](https://github.com/daanaagua/FolioLoom/releases/latest) 下载目录便携 ZIP。桌面端的开发与安全边界见 [`folioloom/README.md`](folioloom/README.md)。
+Run `npm.cmd run desktop:dist` to build a Windows x64 portable package locally. Users can also download the portable ZIP from [GitHub Releases](https://github.com/daanaagua/FolioLoom/releases/latest). See [`folioloom/README.md`](folioloom/README.md) for desktop development details and security boundaries.
 
-## 调整翻译文风
+## Adjusting translation style
 
-FolioLoom 的文风配置只影响中文措辞、句法节奏和排版偏好；它不能改写原意、消除歧义、替换术语、改变分块边界或绕过校验协议。这样可以在维持全书一致性的同时，让译文更接近你的阅读偏好。
+FolioLoom style configuration affects Chinese wording, sentence rhythm, and typography only. It cannot rewrite meaning, eliminate ambiguity, replace terminology, change chunk boundaries, or bypass validation protocols. This keeps book-level consistency intact while making the translation better match your reading preferences.
 
-### 可复用的 YAML 文风档
+### Reusable YAML style profiles
 
-从示例复制一份配置，只填写需要改动的字段即可：
+Copy the example and specify only the fields you want to change.
 
 ```powershell
 Copy-Item ..\config\style.example.yaml ..\config\style.yaml
-# 编辑 ..\config\style.yaml
+# Edit ..\config\style.yaml
 
 npm.cmd run folioloom -- book run `
   --manifest ..\projects\my_book\source_manifest.json `
@@ -141,29 +143,29 @@ npm.cmd run folioloom -- book run `
   --style-profile ..\config\style.yaml
 ```
 
-文风档使用 `style:` 下的可选字段：`register`、`sentencePolicy`、`explicitation`、`imagery`、`dialogue`、`technicalProse`、`typography`、`narratorVoice` 和 `additionalInstruction`。完整模板见 [`config/style.example.yaml`](config/style.example.yaml)。常规字段上限为 180 个 Unicode 字符，`additionalInstruction` 上限为 600 个。
+A style profile supports these optional fields under `style:`: `register`, `sentencePolicy`, `explicitation`, `imagery`, `dialogue`, `technicalProse`, `typography`, `narratorVoice`, and `additionalInstruction`. See [`config/style.example.yaml`](config/style.example.yaml) for the complete template. Regular fields are limited to 180 Unicode characters; `additionalInstruction` is limited to 600.
 
-### 一次性的 `--prompt`
+### One-time `--prompt`
 
-如果只想为本次运行补一条最终文风要求，可以附加 `--prompt`。它只会追加到运行时的 `additionalInstruction`，不会改写你的 YAML 文件，也不会替换系统提示词：
+Add `--prompt` for a final style instruction that applies only to the current run. It is appended to the runtime `additionalInstruction`; it does not modify the YAML file or replace the system prompt.
 
 ```powershell
 npm.cmd run folioloom -- book run `
   --manifest ..\projects\my_book\source_manifest.json `
   --store ..\projects\my_book\artifacts\folioloom\book.db `
   --config ..\config\config.yaml `
-  --prompt "这一版对白更克制，避免现代网络口吻"
+  --prompt "Keep dialogue restrained and avoid modern internet slang."
 ```
 
-`--style-profile` 和 `--prompt` 可以同时使用；两者的附加要求会按“YAML 在前、`--prompt` 在后”合并，合计最多 600 个 Unicode 字符。
+`--style-profile` and `--prompt` can be used together. Their additional instructions are merged in YAML-then-prompt order, with a combined limit of 600 Unicode characters.
 
-每次运行都会把**生效后的**文风配置哈希写入 SQLite metadata。恢复已有运行时，必须继续传入能产生相同生效配置的 `--style-profile` 和/或 `--prompt`；配置发生变化时，FolioLoom 会拒绝恢复，防止一本书的后半段悄悄换一种文风。若需要尝试新文风，请使用新的状态库（`--store`）开启新运行。
+Every run stores a hash of the **effective** style configuration in SQLite metadata. Resuming an existing run requires `--style-profile` and/or `--prompt` arguments that produce the same effective configuration. FolioLoom rejects a changed profile so the second half of a book cannot silently switch style. To try a new style, start a new run with a new state store (`--store`).
 
-## 导入术语表
+## Importing a glossary
 
-术语表是给已经明确的译名、别名和称谓规则准备的“用户种子”，不是另一份需要模型全文阅读的提示词。FolioLoom 会在本地按源语言词元规则定位这些形式；这一步不调用模型，也不消耗 API token。翻译时，只有当前请求原文中实际出现的导入术语会进入模型上下文，既有叙事记忆和模型已确认的锚点仍按原有方式维持全局连续性。
+A glossary supplies user-confirmed translations, aliases, and forms of address. It is not another prompt that the model must read in full. FolioLoom locates source forms locally using source-language token rules, without calling a model or consuming API tokens. During translation, only imported terms actually present in the current source request enter model context. Existing narrative memory and model-confirmed anchors continue to preserve global continuity.
 
-最简单的 JSON 可以直接写成“原文形式 → 默认译法”：
+The simplest JSON maps each source form to its default Chinese translation.
 
 ```json
 {
@@ -172,7 +174,7 @@ npm.cmd run folioloom -- book run `
 }
 ```
 
-需要处理别形或中文语境差异时，使用结构化格式；可复制 [`config/glossary.example.json`](config/glossary.example.json)：
+Use the structured format for inflected forms or context-sensitive Chinese. You can copy [`config/glossary.example.json`](config/glossary.example.json).
 
 ```json
 {
@@ -188,19 +190,19 @@ npm.cmd run folioloom -- book run `
       "source": "Archon",
       "target": "执政官",
       "policy": "contextual",
-      "note": "作为官职时译为“执政官”；直接呼告时可按中文语境译为“阁下”。"
+      "note": "Use 执政官 as an official title; direct address may become 阁下 when Chinese context requires it."
     }
   ]
 }
 ```
 
-三种 `policy` 的区别：
+The three `policy` values behave as follows:
 
-- `locked`：在命中该原文形式的块中，校验器要求使用指定译法；适合已经确定的专名。
-- `preferred`：默认策略，作为首选译法提供给模型，但不把所有语境冻结为一个字面形式。
-- `contextual`：提供译名与说明，不启用字面硬锁；适合官职、敬语和中文必须随句法变化的称谓。
+- `locked`: the validator requires the specified translation in every block containing the matched source form. Use it for confirmed proper names.
+- `preferred`: the default policy. It gives the model a preferred translation without freezing every context to one literal form.
+- `contextual`: supplies a translation and note without a literal hard lock. Use it for titles, honorifics, and forms of address that must change with Chinese syntax.
 
-先运行无模型的检查，查看每个词命中了哪些 `globalIndex`，以及有哪些形式在原文中尚未命中：
+Run a model-free check first to see which `globalIndex` values each term matches and which forms do not occur in the source.
 
 ```powershell
 npm.cmd run folioloom -- book doctor `
@@ -208,7 +210,7 @@ npm.cmd run folioloom -- book doctor `
   --glossary ..\config\glossary.json
 ```
 
-确认报告后，把同一份表传给正式运行：
+After reviewing the report, pass the same glossary to the production run.
 
 ```powershell
 npm.cmd run folioloom -- book run `
@@ -218,33 +220,33 @@ npm.cmd run folioloom -- book run `
   --glossary ..\config\glossary.json
 ```
 
-术语表会被规范化后计算语义哈希并写入 run metadata。恢复同一 run 时必须继续提供语义相同的 `--glossary`；只调整 JSON 空白、对象键顺序、术语数组顺序或文件路径不影响恢复，修改原文形式、译法、策略、别形或注释则会被拒绝。若要换一份术语表，请使用新的 `--store` 开始新 run。
+FolioLoom normalizes the glossary, computes a semantic hash, and stores it in run metadata. Resuming the same run requires a semantically identical glossary. Changing JSON whitespace, object-key order, term-array order, or the file path does not matter; changing a source form, translation, policy, inflection, or note is rejected. Start a new run with a new `--store` when switching glossaries.
 
-## V1.0 命令
+## Core CLI commands
 
-所有命令在 `folioloom/` 中执行。
+Run these commands from `folioloom/`.
 
 ```powershell
-# 使用旧 V4 SQLite 数据估算窗口；只读且不调用模型
+# Estimate windows from a legacy V4 SQLite database; read-only and model-free
 npm.cmd run folioloom -- book preflight --db ..\projects\my_book\artifacts\parallel_v4\book.db
 
-# 对认证原文执行独立检查
+# Independently inspect the authenticated source
 npm.cmd run folioloom -- book doctor --manifest ..\projects\my_book\source_manifest.json
 
-# 运行或继续翻译
+# Start or resume translation
 npm.cmd run folioloom -- book run `
   --manifest ..\projects\my_book\source_manifest.json `
   --store ..\projects\my_book\artifacts\folioloom\book.db `
   --config ..\config\config.yaml
 
-# 状态和恢复
+# Status and recovery
 npm.cmd run folioloom -- book status --store ..\projects\my_book\artifacts\folioloom\book.db
 npm.cmd run folioloom -- book recover `
   --store ..\projects\my_book\artifacts\folioloom\book.db `
   --run RUN_ID `
   --incident INCIDENT_CODE
 
-# 独立审计与导出
+# Independent audit and export
 npm.cmd run folioloom -- book audit `
   --store ..\projects\my_book\artifacts\folioloom\book.db `
   --run RUN_ID
@@ -254,31 +256,31 @@ npm.cmd run folioloom -- book export `
   --output ..\projects\my_book\exports\folioloom
 ```
 
-`recover` 的附加参数取决于事件类型。结构或源文本事件可能还需要 `--manifest`；需要模型参与的受限修复需要 `--config`。系统不会通过压缩原文、丢弃规则或伪造完成状态来绕过预算错误。
+Additional `recover` arguments depend on the incident type. Structural or source-text incidents may also require `--manifest`; bounded repairs that involve a model require `--config`. The system never bypasses budget errors by compressing source text, discarding rules, or fabricating completion state.
 
-## 设计重点
+## Design principles
 
-FolioLoom 的核心不是把尽可能多的背景材料塞进模型，而是只按当前位置投影必要知识：
+FolioLoom does not try to stuff as much background material as possible into every model request. It projects only the knowledge needed at the current position.
 
-1. 原文账本和窗口规划器决定不可丢失的文本边界；
-2. 有界 Agent 只登记翻译所需疑问，并通过受限工具检索证据；
-3. 已确认实体、术语和叙事记忆按位置开放；
-4. 同一并行波次共享不可变锚点和前态；
-5. 每个窗口单独校验、提交或隔离，失败不会污染相邻译文；
-6. 独立 Auditor 从认证原文和 SQLite 重新计算覆盖与顺序。
+1. The source ledger and window planner define source boundaries that cannot be dropped.
+2. A bounded agent records only translation-relevant questions and retrieves evidence through restricted tools.
+3. Confirmed entities, terminology, and narrative memory become available according to their positions in the book.
+4. Every parallel wave shares immutable anchors and prior state.
+5. Each window is validated and then committed or quarantined independently, so a failure cannot contaminate neighboring translations.
+6. An independent auditor recomputes coverage and ordering from the authenticated source and SQLite state.
 
-详细设计和实施记录位于 [`docs/superpowers/`](docs/superpowers/)。
+Detailed design and implementation records are under [`docs/superpowers/`](docs/superpowers/).
 
-## 数据、密钥与版权
+## Data, credentials, and copyright
 
-- API Key 只应存在于环境变量、本机配置或未跟踪的 `config/config.yaml`；
-- `projects/`、数据库、日志、导出文件和下载的小说由 `.gitignore` 排除；
-- 源文件异常只会报告，不会静默改写认证原文；
-- 请只翻译自己拥有或获准处理的文本，并自行承担译文发布所需的版权责任。
+- Keep API keys only in environment variables, local configuration, or the untracked `config/config.yaml`.
+- `.gitignore` excludes `projects/`, databases, logs, exports, and downloaded books.
+- Source anomalies are reported and never silently rewritten in the authenticated source.
+- Translate only text that you own or are authorized to process, and obtain any rights required before publishing the result.
 
 ## Legacy V1–V4
 
-仓库根目录的 `main.py` 仍保留旧串行流程和 parallel_v4 工具，用于创建输入项目、导入旧译文、人工盲评及历史数据迁移。常用入口包括：
+The root-level `main.py` retains the legacy serial pipeline and `parallel_v4` tools for creating input projects, importing older translations, human blind review, and historical data migration. Common entry points include:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py serve-v4 my_book
@@ -286,7 +288,7 @@ FolioLoom 的核心不是把尽可能多的背景材料塞进模型，而是只�
 .\.venv\Scripts\python.exe main.py export-v4 my_book
 ```
 
-这些入口继续可用，但 FolioLoom V1.0 的正式翻译内核是 `folioloom`。
+These entry points remain available, but `folioloom` is the production translation core.
 
 ## License
 
