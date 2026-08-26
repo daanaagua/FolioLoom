@@ -6,9 +6,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.5.3**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.6.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.5.3 能做什么
+## V1.6.0 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -24,10 +24,13 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 一键导出不含密钥、书稿、译文和完整私人路径的诊断 JSON，便于定位导入、连接、试译、校验或提交阶段的失败；
 - 在桌面端列出需要处理的文本块、失败类别、公开错误码和下一步；可恢复项只允许一次经过影子审计与原子晋升的安全重试；
 - DeepSeek 固定提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`，旧模型名会被明确拒绝而不会进入翻译。
+- 可选使用隔离的 `codex exec` worker，复用用户现有的 Codex CLI 登录，不需要另配模型 API Key 或服务商配置；
+- 通过仓库内的 [`$folioloom-translate`](.agents/skills/folioloom-translate/SKILL.md) skill 完成书稿导入、有界试译、原运行续跑、审计和严格导出；
+- 在相邻逻辑窗口之间安全摊薄 Codex 文件调用开销，同时保留逐窗口校验与提交；高段落块先整块尝试、失败后再进入有界碎片恢复，并将重段落 DOCX 导入改为线性处理。
 
 ## V4 Flash 100K 实测
 
-FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 增加 EPUB 结构保真，v1.5.3 增加桌面端处理与恢复工作流，均不改变该翻译调度内核：
+FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 增加 EPUB 结构保真，v1.5.3 增加桌面端处理与恢复工作流，v1.6.0 则新增独立的 Codex worker 路径，不改变这些历史实测数据：
 
 - 德语《变形记》：**10 分 55 秒**；
 - 英语《时间之子》第一部：**18 分 56 秒**。
@@ -41,6 +44,7 @@ FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调�
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
 - 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复、需要处理中心和严格导出；逐段人工改译与批量审阅仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
+- Codex worker 当前只提供命令行/skill 工作流，需要本机安装并登录 Codex CLI，并有意限制为 `--max-concurrency 1`；它尚未接入桌面端。
 - EPUB 原模板保真只适用于由 v1.5.2 重新导入的项目；旧项目不会用模糊对齐猜测链接位置，需重新导入原 EPUB 后再翻译。
 
 ## 安装
@@ -59,7 +63,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.5.3 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+使用服务商 API 时，先复制示例配置。可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取；Codex worker 不使用这两个选项。
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml
@@ -99,6 +103,34 @@ npm.cmd run folioloom -- book status `
 ```
 
 确认试译后，重复 `book run` 并移除 `--max-windows 1` 即可继续。运行器会跳过已经提交的窗口。
+
+## 使用已登录的 Codex CLI 翻译
+
+FolioLoom v1.6.0 可以把隔离的 `codex exec` 子进程用作模型传输层。它复用本机 Codex 的交互式登录，因此不需要单独的模型 API Key。原文身份、有界请求、校验、恢复、SQLite 提交、审计与导出仍由 FolioLoom 负责；每个子进程只看到当前模型任务，且不能写入项目。
+
+安装 Codex CLI 并执行 `codex login` 后，从仓库根目录启动 Codex。Codex 会从 `.agents/skills/folioloom-translate` 发现仓库级 skill；直接传入待翻译文件，不要把整本书粘贴进对话：
+
+```text
+使用 $folioloom-translate，把 D:\books\my_book.epub 从英语翻译为简体中文，模型使用 MODEL_ID。
+```
+
+skill 会先执行只读环境检查，导入获准处理的原文，完成确定性预检，最多试译两个逻辑窗口供检查，然后沿同一个持久运行继续，最后完成审计与严格导出。若要在仓库外使用，可把完整的 `.agents/skills/folioloom-translate` 目录复制到用户级 `.agents/skills`；不要同时复制书稿、`projects/`、数据库、导出文件或 Codex 登录状态。
+
+完成原生 `book import` 和 `book doctor` 后，对应的首次命令行调用是：
+
+```powershell
+Set-Location folioloom
+npm.cmd run folioloom -- book run `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --store ..\projects\my_book\artifacts\folioloom\book.db `
+  --worker codex `
+  --codex-model "MODEL_ID" `
+  --max-windows 2 `
+  --max-concurrency 1 `
+  --output ..\projects\my_book\exports\codex
+```
+
+续跑时必须使用返回的 `--run` ID，并保持模型、文风、术语表和策略选项不变；检查部分导出后再移除 `--max-windows 2`。最终交付仍须依次通过 `book audit`、严格 `book export` 和 `book verify-export`。
 
 ## 本地桌面工作台（开发预览）
 

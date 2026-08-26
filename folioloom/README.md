@@ -15,7 +15,7 @@ npm.cmd install
 
 ## 本地桌面工作台
 
-桌面端已经随 FolioLoom v1.5.3 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按以下步骤操作即可：
+桌面端随 FolioLoom v1.6.0 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按以下步骤操作即可：
 
 1. 选择 TXT、EPUB、DOCX 或 Markdown 书稿；
 2. 选择 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动或自定义兼容服务，填写 API Key、模型与 provider 原始 effort 值；DeepSeek 只提供当前的 `deepseek-v4-flash` 和 `deepseek-v4-pro`；
