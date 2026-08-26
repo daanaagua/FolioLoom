@@ -143,6 +143,7 @@ const SYSTEM_LEAK_PATTERNS = [
   /<\/?tool_call>/iu,
   /["']toolCallId["']\s*:/iu,
   /\{\s*["']translations["']\s*:/iu,
+  /\}\]\s*,\s*$/u,
 ];
 const SOURCE_LAYOUT_TOKEN_PATTERN = /(?:\[[ \t]*\[[ \t]*\][ \t]*\]|［[ \t]*［[ \t]*］[ \t]*］)/u;
 

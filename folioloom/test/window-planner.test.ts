@@ -273,6 +273,44 @@ test("request batcher enforces token and window-count micro-batch limits", () =>
   assert.deepEqual(countBound.map((item) => item.windows.length), [2, 2, 1]);
 });
 
+test("bounded request packing amortizes ordinary pending windows without crossing limits", () => {
+  const windows = [
+    window(0, 1_500),
+    window(1, 1_400),
+    window(2, 1_300),
+    window(3, 1_200),
+  ];
+  const requests = packPhysicalRequests(windows, {
+    tinyWindowTokens: 64,
+    maxRequestTokens: 3_200,
+    maxWindowsPerRequest: 2,
+    packingMode: "bounded",
+  });
+
+  assert.deepEqual(requests.map((item) => item.windows.length), [2, 2]);
+  assert.deepEqual(requests.map((item) => item.sourceTokens), [2_900, 2_500]);
+  assert.deepEqual(
+    requests.flatMap((item) => item.windows.map((entry) => entry.windowId)),
+    windows.map((item) => item.windowId),
+  );
+});
+
+test("bounded request packing still isolates non-pending and non-contiguous windows", () => {
+  const requests = packPhysicalRequests([
+    window(0, 1_000),
+    window(1, 1_000, "completed"),
+    window(2, 1_000),
+    window(4, 1_000),
+  ], {
+    tinyWindowTokens: 64,
+    maxRequestTokens: 3_200,
+    maxWindowsPerRequest: 2,
+    packingMode: "bounded",
+  });
+
+  assert.deepEqual(requests.map((item) => item.windows.length), [1, 1, 1, 1]);
+});
+
 test("request batcher rejects one oversized logical window without rewriting it", () => {
   const oversized = {
     ...window(0, 2_601),

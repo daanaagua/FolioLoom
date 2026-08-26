@@ -140,24 +140,25 @@ function normalizeNewlines(value: string): string {
 }
 
 function scalarSegments(parts: readonly ExtractedPart[]): Pick<ExtractedSource, "sourceText" | "canonicalSegments"> {
-  let sourceText = "";
+  const sourceParts: string[] = [];
   const canonicalSegments: CanonicalSegment[] = [];
+  let canonicalCursor = 0;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index]!;
-    const start = scalarLength(sourceText);
-    sourceText += normalizeNewlines(part.text);
-    if (index < parts.length - 1) {
-      sourceText += "\n\n";
-    }
+    const separator = index < parts.length - 1 ? "\n\n" : "";
+    const contribution = normalizeNewlines(part.text) + separator;
+    const start = canonicalCursor;
+    canonicalCursor += scalarLength(contribution);
+    sourceParts.push(contribution);
     canonicalSegments.push({
       canonicalStart: start,
-      canonicalEnd: scalarLength(sourceText),
+      canonicalEnd: canonicalCursor,
       originKind: part.originKind,
       originRef: part.originRef,
       transformation: part.transformation,
     });
   }
-  return { sourceText, canonicalSegments };
+  return { sourceText: sourceParts.join(""), canonicalSegments };
 }
 
 function sourceFormat(path: string): ".txt" | ".md" | ".markdown" | ".docx" | ".epub" {

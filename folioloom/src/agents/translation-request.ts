@@ -121,9 +121,12 @@ function canonicalizeFinalizerEnvelope(
   if (envelopeKeys.length > 0 && soleWindow !== undefined) {
     for (const key of envelopeKeys) {
       if (soleWindow[key] !== undefined) {
-        throw new Error(
-          `ambiguous ${key}: submit it inside the logical window only`,
-        );
+        if (canonicalJson(soleWindow[key]) !== canonicalJson(rawArgs[key])) {
+          throw new Error(
+            `ambiguous ${key}: submit it inside the logical window only`,
+          );
+        }
+        continue;
       }
       soleWindow[key] = structuredClone(rawArgs[key]) as never;
     }

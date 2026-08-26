@@ -322,6 +322,42 @@ test("fragment typed submission requires exact paragraph identity and joins loca
   );
 });
 
+test("fragment accepts identical envelope and window term receipts without a correction turn", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    {
+      termUsages: [],
+      windows: [{
+        windowId: request.windows[0]?.windowId,
+        termUsages: [],
+        translations: [{
+          blockId: sourceBlock.id,
+          paragraphs: [
+            { text: "第一段完整译文保留了源文的全部信息。" },
+            { text: "第二段完整译文继续场景并保持清晰连贯。" },
+          ],
+        }],
+      }],
+    },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks: [sourceBlock],
+    stableTerms: [],
+    snapshot: { id: "snapshot-1", revisions: [] },
+    paragraphFragment: executionScope,
+    repairEnabled: false,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed", result.windows[0]?.error);
+});
+
 test("fragment rejects discovery metadata and accepts a minimal correction", async () => {
   const faux = fauxProvider();
   const fragmentSubmission = {

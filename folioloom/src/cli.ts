@@ -29,6 +29,7 @@ import {
 } from "./fullbook/book-runner.js";
 import { BookContext } from "./fullbook/book-context.js";
 import type {
+  TranslationExecutionPolicy,
   TranslationRunMode,
   TranslationRuntimeSet,
 } from "./fullbook/types.js";
@@ -72,6 +73,7 @@ import {
 } from "./source/anomaly-report.js";
 import { buildLosslessBlocks } from "./source/block-builder.js";
 import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
+import { importSource } from "./source/source-importer.js";
 import { annotateStructure } from "./source/structure-annotator.js";
 import { LosslessBookStore } from "./storage/lossless-book-store.js";
 import { RuntimeProfileStore } from "./storage/runtime-profile-store.js";
@@ -82,6 +84,7 @@ import {
 
 export type CliCommand =
   | "preview"
+  | "book-import"
   | "book-preflight"
   | "book-doctor"
   | "book-audit"
@@ -94,6 +97,10 @@ export type CliCommand =
 
 export interface CliOptions {
   command: CliCommand;
+  source?: string;
+  project?: string;
+  sourceLanguage?: string;
+  sourceEncoding?: string;
   db?: string;
   manifest?: string;
   legacyV4Db?: string;
@@ -590,6 +597,27 @@ export function runMetadataForExecutionBackend(
   return metadata;
 }
 
+export function codexFilePolicyForRun(
+  metadata: unknown,
+  resuming: boolean,
+): {
+  metadata: unknown;
+  executionPolicy?: TranslationExecutionPolicy;
+} {
+  const existing = metadataRecord(metadata);
+  const stored = existing.codexExecutionPolicy;
+  if (resuming && stored === undefined) {
+    return { metadata };
+  }
+  if (stored !== undefined && stored !== "codex-file-v1") {
+    throw new Error(`unsupported Codex execution policy: ${String(stored)}`);
+  }
+  return {
+    metadata: { ...existing, codexExecutionPolicy: "codex-file-v1" },
+    executionPolicy: "codex-file-v1",
+  };
+}
+
 export function parseArgs(argv: readonly string[]): CliOptions {
   if (argv[0] === "preview") {
     const { values, booleans } = parseFlags(
@@ -616,6 +644,21 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     );
   }
   const action = argv[1];
+  if (action === "import") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book import",
+      ["--source", "--project", "--source-language", "--encoding"],
+    );
+    const sourceEncoding = identifierValue(values, "--encoding");
+    return {
+      command: "book-import",
+      source: pathValue(values, "--source"),
+      project: pathValue(values, "--project"),
+      sourceLanguage: identifierValue(values, "--source-language", true),
+      ...(sourceEncoding === undefined ? {} : { sourceEncoding }),
+    };
+  }
   if (action === "preflight") {
     const { values } = parseFlags(
       argv.slice(2),
@@ -935,17 +978,21 @@ export function buildTranslationRuntimeSet(
 }
 
 export function buildCodexTranslationRuntimeSet(
-  options: CodexExecRuntimeOptions,
+  options: CodexExecRuntimeOptions & {
+    readonly executionPolicy?: TranslationExecutionPolicy;
+  },
   factory: (
     runtimeOptions: CodexExecRuntimeOptions,
   ) => ReturnType<typeof createCodexExecRuntime> = createCodexExecRuntime,
 ): TranslationRuntimeSet {
-  const created = factory({ ...options, reasoningEffort: "high" });
+  const { executionPolicy, ...runtimeOptions } = options;
+  const created = factory({ ...runtimeOptions, reasoningEffort: "high" });
   const runtime = {
     effort: "high" as const,
     thinkingLevel: "high" as const,
     model: created.model,
     streamFn: created.streamFn,
+    ...(executionPolicy === undefined ? {} : { executionPolicy }),
   };
   return {
     mode: "quality",
@@ -960,6 +1007,18 @@ export async function main(
   dependencyOverrides: Partial<CliRuntimeDependencies> = {},
 ): Promise<void> {
   const options = parseArgs(argv);
+  if (options.command === "book-import") {
+    const result = await importSource({
+      sourcePath: requireOption(options, "source"),
+      projectDirectory: requireOption(options, "project"),
+      sourceLanguage: requireOption(options, "sourceLanguage"),
+      ...(options.sourceEncoding === undefined
+        ? {}
+        : { explicitEncoding: options.sourceEncoding }),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   if (options.command === "book-preflight") {
     console.log(JSON.stringify(preflightBook(requireOption(options, "db"), {
       maxBlocks: options.maxBlocks,
@@ -1163,14 +1222,24 @@ export async function main(
       schedulerMode,
       selectedRun !== undefined,
     );
-    const runMetadata = runMetadataForExecutionBackend(
+    const executionBackendMetadata = runMetadataForExecutionBackend(
       schedulerMetadata,
       options.worker === "codex" ? "codex-exec" : "provider-api",
       selectedRun !== undefined,
     );
+    const codexPolicy = options.worker === "codex"
+      ? codexFilePolicyForRun(
+        executionBackendMetadata,
+        selectedRun !== undefined,
+      )
+      : { metadata: executionBackendMetadata };
+    const runMetadata = codexPolicy.metadata;
     const runtimeSet = options.worker === "codex"
       ? buildCodexTranslationRuntimeSet({
         modelId: requireOption(options, "codexModel"),
+        ...(codexPolicy.executionPolicy === undefined
+          ? {}
+          : { executionPolicy: codexPolicy.executionPolicy }),
         ...(options.codexContextWindow === undefined
           ? {}
           : { contextWindow: options.codexContextWindow }),

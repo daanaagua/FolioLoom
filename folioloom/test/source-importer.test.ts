@@ -454,6 +454,35 @@ test("source importer preserves DOCX run order through hyperlinks and table para
   }
 });
 
+test("source importer assembles a paragraph-heavy DOCX in linear time", { timeout: 15_000 }, async () => {
+  const paragraphs = Array.from(
+    { length: 12_000 },
+    (_, index) => `<w:p><w:r><w:t>Paragraph ${index} keeps its text.</w:t></w:r></w:p>`,
+  );
+  const document = `<?xml version="1.0" encoding="UTF-8"?>`
+    + `<w:document xmlns:w="urn:test"><w:body>${paragraphs.join("")}</w:body></w:document>`;
+  const fixture = writeFixture("paragraph-heavy.docx", zip([{
+    name: "word/document.xml",
+    data: document,
+    method: 8,
+  }]));
+  try {
+    const startedAt = performance.now();
+    const result = await importSource({
+      sourcePath: fixture.sourcePath,
+      projectDirectory: projectDirectory(fixture.directory),
+      sourceLanguage: "en",
+    });
+    const durationMs = performance.now() - startedAt;
+    const ledger = SourceLedger.open(result.manifestPath);
+    assert.equal(ledger.canonicalSegments.length, paragraphs.length);
+    assert.match(ledger.sourceText, /Paragraph 11999 keeps its text\.$/u);
+    assert.ok(durationMs < 5_000, `paragraph-heavy DOCX import took ${durationMs} ms`);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("source importer follows EPUB container, OPF manifest and spine order", async () => {
   const container = `<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>`;
   const opf = `<package><manifest>

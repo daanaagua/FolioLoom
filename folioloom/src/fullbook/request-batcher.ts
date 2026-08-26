@@ -53,6 +53,10 @@ function isPendingTiny(
     && window.sourceTokens < tinyWindowTokens;
 }
 
+function isPending(window: RequestBatchWindow): boolean {
+  return (window.status ?? "pending") === "pending";
+}
+
 function physicalRequest(
   windows: RequestBatchWindow[],
 ): PhysicalRequestPlan {
@@ -82,6 +86,10 @@ export function packPhysicalRequests(
     options.maxWindowsPerRequest,
     "maxWindowsPerRequest",
   );
+  const packingMode = options.packingMode ?? "tiny-only";
+  if (packingMode !== "tiny-only" && packingMode !== "bounded") {
+    throw new TypeError(`unsupported request packing mode: ${String(packingMode)}`);
+  }
   const windows = [...input].sort((left, right) =>
     left.ordinal - right.ordinal || left.windowId.localeCompare(right.windowId));
   for (const window of windows) {
@@ -108,8 +116,11 @@ export function packPhysicalRequests(
   for (const window of windows) {
     const previous = current.at(-1);
     const mayJoin = previous !== undefined
-      && isPendingTiny(previous, tinyWindowTokens)
-      && isPendingTiny(window, tinyWindowTokens)
+      && isPending(previous)
+      && isPending(window)
+      && (packingMode === "bounded"
+        || (isPendingTiny(previous, tinyWindowTokens)
+          && isPendingTiny(window, tinyWindowTokens)))
       && window.ordinal === previous.ordinal + 1
       && current.length < maxWindowsPerRequest
       && currentTokens + window.sourceTokens <= maxRequestTokens;
