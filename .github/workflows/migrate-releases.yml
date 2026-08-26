@@ -1,0 +1,80 @@
+name: One-time release migration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy historical releases and verify assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_repo="daanaagua/novel-translate"
+          target_repo="${GITHUB_REPOSITORY}"
+          tags=(
+            v1.1.0
+            v1.1.1
+            v1.3.0
+            v1.3.1
+            v1.4.0
+            v1.5.0
+            v1.5.1
+            v1.5.2
+            v1.5.3
+          )
+
+          for tag in "${tags[@]}"; do
+            if gh release view "$tag" --repo "$target_repo" >/dev/null 2>&1; then
+              echo "SKIP_EXISTING $tag"
+              continue
+            fi
+
+            work_dir="$(mktemp -d)"
+            asset_dir="$work_dir/assets"
+            notes_file="$work_dir/notes.md"
+            mkdir -p "$asset_dir"
+
+            echo "DOWNLOAD_START $tag"
+            gh release download "$tag" --repo "$source_repo" --dir "$asset_dir"
+            gh api "repos/$source_repo/releases/tags/$tag" --jq .body > "$notes_file"
+            release_name="$(gh api "repos/$source_repo/releases/tags/$tag" --jq .name)"
+
+            while IFS=$'\t' read -r asset_name asset_size asset_digest; do
+              asset_path="$asset_dir/$asset_name"
+              test -f "$asset_path"
+              test "$(stat -c %s "$asset_path")" = "$asset_size"
+              test "sha256:$(sha256sum "$asset_path" | cut -d' ' -f1)" = "$asset_digest"
+            done < <(
+              gh api "repos/$source_repo/releases/tags/$tag" \
+                --jq '.assets[] | [.name, .size, .digest] | @tsv'
+            )
+
+            echo "UPLOAD_START $tag"
+            gh release create "$tag" \
+              --repo "$target_repo" \
+              --verify-tag \
+              --title "$release_name" \
+              --notes-file "$notes_file" \
+              "$asset_dir"/*
+
+            source_assets="$(
+              gh api "repos/$source_repo/releases/tags/$tag" \
+                --jq '[.assets[] | {name, size, digest}] | sort_by(.name)'
+            )"
+            target_assets="$(
+              gh api "repos/$target_repo/releases/tags/$tag" \
+                --jq '[.assets[] | {name, size, digest}] | sort_by(.name)'
+            )"
+            test "$source_assets" = "$target_assets"
+            echo "VERIFIED $tag"
+          done
+
+          echo "ALL_RELEASES_TRANSFERRED"
