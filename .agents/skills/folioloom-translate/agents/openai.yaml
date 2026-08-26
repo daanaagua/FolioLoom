@@ -1,0 +1,7 @@
+interface:
+  display_name: "FolioLoom Translate"
+  short_description: "用 Codex worker 编排可恢复、可审计的长篇翻译"
+  default_prompt: "Use $folioloom-translate to translate an authorized book with the local FolioLoom checkout through an isolated Codex worker."
+
+policy:
+  allow_implicit_invocation: true
