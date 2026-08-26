@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -9,11 +9,14 @@ import { DatabaseSync } from "node:sqlite";
 
 import { ModelProviderError } from "../src/agents/pi-runtime.js";
 import {
+  buildCodexTranslationRuntimeSet,
   buildTranslationRuntimeSet,
+  codexFilePolicyForRun,
   cliErrorPayload,
   main,
   parseArgs,
   resolveRunSelection,
+  runMetadataForExecutionBackend,
 } from "../src/cli.js";
 import type { PilotModelConfig } from "../src/config.js";
 import { BookContext } from "../src/fullbook/book-context.js";
@@ -231,6 +234,233 @@ test("book run accepts optimization profile and scheduler mode", () => {
   assert.equal(parsed.optimizationProfile, "balanced");
   assert.equal(parsed.schedulerMode, "active");
   assert.equal(parsed.runtimeProfileStore, resolve("profiles.db"));
+});
+
+test("CLI parses native source import for a file-backed project", () => {
+  assert.deepEqual(parseArgs([
+    "book", "import",
+    "--source", "Book of the New Sun.docx",
+    "--project", "projects/new-sun",
+    "--source-language", "en",
+  ]), {
+    command: "book-import",
+    source: resolve("Book of the New Sun.docx"),
+    project: resolve("projects/new-sun"),
+    sourceLanguage: "en",
+  });
+});
+
+test("native book import creates a certified project without the Python control path", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "v5-cli-import-"));
+  const source = join(directory, "source.txt");
+  const project = join(directory, "project");
+  writeFileSync(source, "A complete source paragraph.\n\nA second paragraph.", "utf8");
+  const originalLog = console.log;
+  let output = "";
+  console.log = (value?: unknown) => {
+    output += String(value ?? "");
+  };
+  try {
+    await main([
+      "book", "import",
+      "--source", source,
+      "--project", project,
+      "--source-language", "en",
+    ]);
+    assert.equal(existsSync(join(project, "source_manifest.json")), true);
+    assert.equal(existsSync(join(project, "source.txt")), true);
+    assert.equal(JSON.parse(output).canonicalChars, 49);
+  } finally {
+    console.log = originalLog;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("book run parses a config-free single Codex worker", () => {
+  const parsed = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--worker", "codex",
+    "--codex-model", "gpt-test",
+    "--codex-context-window", "200000",
+    "--codex-max-output-tokens", "24000",
+    "--codex-executable", "C:\\tools\\codex.exe",
+  ]);
+
+  assert.equal(parsed.worker, "codex");
+  assert.equal(parsed.config, undefined);
+  assert.equal(parsed.codexModel, "gpt-test");
+  assert.equal(parsed.codexContextWindow, 200_000);
+  assert.equal(parsed.codexMaxOutputTokens, 24_000);
+  assert.equal(parsed.codexExecutable, resolve("C:\\tools\\codex.exe"));
+  assert.equal(parsed.maxConcurrency, 1);
+});
+
+test("Codex worker parsing rejects ambiguous backends and non-sequential execution", () => {
+  const base = [
+    "book", "run", "--manifest", "source_manifest.json", "--store", "state.db",
+    "--worker", "codex",
+  ];
+  assert.throws(
+    () => parseArgs([...base]),
+    /--codex-model is required/u,
+  );
+  assert.throws(
+    () => parseArgs([...base, "--codex-model", "gpt-test", "--config", "config.yaml"]),
+    /--worker codex cannot be combined with --config/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      ...base, "--codex-model", "gpt-test", "--opencode-auth", "auth.json",
+    ]),
+    /--worker codex cannot be combined with --opencode-auth/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      ...base, "--codex-model", "gpt-test", "--max-concurrency", "2",
+    ]),
+    /Codex worker requires --max-concurrency 1/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      ...base, "--codex-model", "gpt-test", "--run-mode", "fast",
+    ]),
+    /Codex worker currently supports only quality run mode/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      "book", "run", "--manifest", "source_manifest.json", "--store", "state.db",
+      "--config", "config.yaml", "--codex-model", "gpt-test",
+    ]),
+    /--codex-model requires --worker codex/u,
+  );
+});
+
+test("execution backend metadata prevents provider and Codex runs from mixing", () => {
+  assert.deepEqual(
+    runMetadataForExecutionBackend({ fixture: true }, "codex-exec", false),
+    { fixture: true, executionBackend: "codex-exec" },
+  );
+  assert.throws(
+    () => runMetadataForExecutionBackend({ fixture: true }, "codex-exec", true),
+    /cannot resume a provider run with the Codex worker/u,
+  );
+  assert.throws(
+    () => runMetadataForExecutionBackend(
+      { executionBackend: "codex-exec" },
+      "provider-api",
+      true,
+    ),
+    /requires --worker codex/u,
+  );
+});
+
+test("new Codex runs opt into file policy while legacy resumes preserve old behavior", () => {
+  assert.deepEqual(codexFilePolicyForRun({ fixture: true }, false), {
+    metadata: { fixture: true, codexExecutionPolicy: "codex-file-v1" },
+    executionPolicy: "codex-file-v1",
+  });
+  assert.deepEqual(codexFilePolicyForRun({
+    fixture: true,
+    executionBackend: "codex-exec",
+  }, true), {
+    metadata: { fixture: true, executionBackend: "codex-exec" },
+  });
+  assert.deepEqual(codexFilePolicyForRun({
+    executionBackend: "codex-exec",
+    codexExecutionPolicy: "codex-file-v1",
+  }, true), {
+    metadata: {
+      executionBackend: "codex-exec",
+      codexExecutionPolicy: "codex-file-v1",
+    },
+    executionPolicy: "codex-file-v1",
+  });
+  assert.throws(
+    () => codexFilePolicyForRun({ codexExecutionPolicy: "future-policy" }, true),
+    /unsupported Codex execution policy/u,
+  );
+
+  const runtimeSet = buildCodexTranslationRuntimeSet({
+    modelId: "gpt-test",
+    executionPolicy: "codex-file-v1",
+  }, () => ({
+    model: {
+      id: "gpt-test",
+      provider: "codex-cli",
+      contextWindow: 256_000,
+      maxTokens: 32_768,
+    } as never,
+    streamFn: (() => undefined) as never,
+  }));
+  assert.equal(runtimeSet.primary.executionPolicy, "codex-file-v1");
+  assert.equal(runtimeSet.escalation.executionPolicy, "codex-file-v1");
+});
+
+test("book run wires one injected Codex runtime without constructing an API provider", async () => {
+  const manifest = sourceManifest("Gregor woke from uneasy dreams.");
+  const storePath = join(dirname(manifest), "codex-worker.db");
+  let apiProviderConstructions = 0;
+  let codexOptions: Record<string, unknown> | undefined;
+  let received: Record<string, unknown> | undefined;
+  const originalLog = console.log;
+  console.log = () => undefined;
+  try {
+    await main([
+      "book", "run",
+      "--manifest", manifest,
+      "--store", storePath,
+      "--worker", "codex",
+      "--codex-model", "gpt-test",
+    ], {
+      createModel: (() => {
+        apiProviderConstructions += 1;
+        throw new Error("API provider must not be constructed");
+      }) as never,
+      createCodexRuntime: ((options: Record<string, unknown>) => {
+        codexOptions = options;
+        const model = {
+          id: "gpt-test",
+          provider: "codex-cli",
+          contextWindow: 256_000,
+          maxTokens: 32_768,
+        };
+        const streamFn = () => {
+          throw new Error("stream is not used by this wiring test");
+        };
+        return { model, streamFn };
+      }) as never,
+      runBook: (async (options: unknown) => {
+        received = options as Record<string, unknown>;
+        return { artifacts: null } as never;
+      }) as never,
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.equal(apiProviderConstructions, 0);
+  assert.equal(codexOptions?.modelId, "gpt-test");
+  assert.equal(received?.maxConcurrency, 1);
+  const runtimeSet = received?.runtimeSet as {
+    primary?: {
+      effort?: string;
+      thinkingLevel?: string;
+      executionPolicy?: string;
+      model?: { id?: string };
+    };
+    escalation?: unknown;
+  };
+  assert.equal(runtimeSet.primary?.model?.id, "gpt-test");
+  assert.equal(runtimeSet.primary?.effort, "high");
+  assert.equal(runtimeSet.primary?.thinkingLevel, "high");
+  assert.equal(runtimeSet.primary?.executionPolicy, "codex-file-v1");
+  assert.equal(runtimeSet.primary, runtimeSet.escalation);
+  const runMeta = received?.runMeta as { modelId?: string; metadata?: Record<string, unknown> };
+  assert.equal(runMeta.modelId, "gpt-test");
+  assert.equal(runMeta.metadata?.executionBackend, "codex-exec");
+  assert.equal(runMeta.metadata?.codexExecutionPolicy, "codex-file-v1");
 });
 
 test("legacy quality mode maps to balanced when no profile is supplied", () => {

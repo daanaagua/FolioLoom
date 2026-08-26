@@ -66,7 +66,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
   };
   assert.deepEqual(resource, {
     schema: "folioloom-desktop-resource-1",
-    version: "1.5.3",
+    version: "1.6.0",
     apiKeyPolicy: "never-packaged",
     projectDataPolicy: "user-selected",
     translationWritePolicy: "single-window-trial-and-durable-fullbook",

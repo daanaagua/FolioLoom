@@ -530,6 +530,45 @@ test("clean fast waves prepare two scheduler horizons without exceeding runtime 
   assert.equal(result.status.completedWindows, result.status.totalWindows);
 });
 
+test("codex file policy amortizes lexical anchoring across two physical request horizons", async () => {
+  const fixture = losslessFixture([
+    "BOOK ONE", "CHAPTER ONE", "BOOK TWO", "CHAPTER TWO",
+    "BOOK THREE", "CHAPTER THREE", "BOOK FOUR", "CHAPTER FOUR",
+  ].join("\n\n"));
+  assert.ok(fixture.submission.windows.length >= 4);
+  fixture.faux.setResponses(Array.from(
+    { length: fixture.submission.windows.length },
+    () => losslessBatchResponse,
+  ));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+  const runtime = {
+    model,
+    streamFn,
+    effort: "high" as const,
+    thinkingLevel: "high" as const,
+    executionPolicy: "codex-file-v1" as const,
+  };
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 2,
+    maxConcurrency: 1,
+    runtimeSet: {
+      mode: "quality",
+      primary: runtime,
+      escalation: runtime,
+    },
+  } as never);
+
+  assert.equal(result.waves[0]?.windowIds.length, 4);
+  assert.ok(result.waves.every((wave) => wave.windowIds.length <= 4));
+  assert.equal(result.status.completedWindows, result.status.totalWindows);
+});
+
 test("fast waves fall back to one scheduler horizon after a retry", async () => {
   const fixture = losslessFixture([
     "BOOK ONE", "CHAPTER ONE", "BOOK TWO", "CHAPTER TWO",
@@ -687,6 +726,135 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
   } finally {
     store.close();
   }
+});
+
+test("codex file policy tries a high-paragraph block whole before fragment fallback", async () => {
+  const sourceParagraphs = Array.from(
+    { length: 23 },
+    (_, index) =>
+      `the quiet mechanism continued its ordinary movement through source paragraph ${index + 1}.`,
+  );
+  const fixture = losslessFixture(sourceParagraphs.join("\n\n"));
+  let sawWholeRequest = false;
+  fixture.faux.setResponses([(context: Context) => {
+    const prompt = userText(context);
+    sawWholeRequest = !prompt.includes("TARGET SOURCE FRAGMENT");
+    return losslessBatchResponse(context);
+  }]);
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(
+    fixture.faux.provider,
+  );
+  const runtime = {
+    model,
+    streamFn,
+    effort: "high" as const,
+    thinkingLevel: "high" as const,
+    executionPolicy: "codex-file-v1" as const,
+  };
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    maxAttempts: 1,
+    maxConcurrency: 1,
+    maxWindowsPerRequest: 2,
+    maxRequestTokens: 4_000,
+    windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
+    runtimeSet: {
+      mode: "quality",
+      primary: runtime,
+      escalation: runtime,
+    },
+  } as never);
+
+  assert.equal(sawWholeRequest, true);
+  assert.equal(fixture.faux.state.callCount, 1);
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
+});
+
+test("codex file policy recovers a collapsed whole block through typed paragraph fragments", async () => {
+  const sourceParagraphs = Array.from(
+    { length: 13 },
+    (_, index) =>
+      `the resilient mechanism preserves every ordinary source detail in paragraph ${index + 1}.`,
+  );
+  const fixture = losslessFixture(sourceParagraphs.join("\n\n"));
+  const observedProtocols: string[] = [];
+  const response = (context: Context) => {
+    const prompt = userText(context);
+    const fragmentMatch =
+      /TARGET SOURCE FRAGMENT\n\n(\[[\s\S]*?\])\n\nCONTEXT-ONLY PARAGRAPHS/u.exec(prompt);
+    if (fragmentMatch?.[1] === undefined) {
+      observedProtocols.push("whole");
+      const [window] = promptBatchWindows(context);
+      const blockId = window?.blocks[0]?.blockId;
+      assert.ok(window && blockId);
+      return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+        windows: [{
+          windowId: window.windowId,
+          translations: [{ blockId, text: "过短。" }],
+          notes: [],
+        }],
+      }), { stopReason: "toolUse" });
+    }
+    observedProtocols.push("paragraph");
+    const [window] = JSON.parse(fragmentMatch[1]) as Array<{
+      windowId: string;
+      blocks: Array<{
+        blockId: string;
+        paragraphs: Array<{ sourceText: string }>;
+      }>;
+    }>;
+    const block = window?.blocks[0];
+    assert.ok(window && block);
+    return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: window.windowId,
+        translations: [{
+          blockId: block.blockId,
+          paragraphs: block.paragraphs.map((_, index) => ({
+            text: `这是恢复后的第${index + 1}段完整译文，保留源段落的全部普通信息。`,
+          })),
+        }],
+      }],
+    }), { stopReason: "toolUse" });
+  };
+  fixture.faux.setResponses(Array.from({ length: 5 }, () => response));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(
+    fixture.faux.provider,
+  );
+  const runtime = {
+    model,
+    streamFn,
+    effort: "high" as const,
+    thinkingLevel: "high" as const,
+    executionPolicy: "codex-file-v1" as const,
+  };
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    maxAttempts: 1,
+    maxConcurrency: 1,
+    maxRequestTokens: 4_000,
+    windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
+    runtimeSet: {
+      mode: "quality",
+      primary: runtime,
+      escalation: runtime,
+    },
+  } as never);
+
+  assert.equal(observedProtocols[0], "whole");
+  assert.ok(observedProtocols.slice(1).every((item) => item === "paragraph"));
+  assert.ok(observedProtocols.length >= 3);
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
 });
 
 test("a high-risk block inside a multi-block window is fragmented without losing its siblings", async () => {

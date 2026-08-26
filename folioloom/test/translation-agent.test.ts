@@ -360,6 +360,20 @@ test("deterministic validator rejects missing blocks and leaked system JSON", ()
   assert.ok(result.failures.some((failure) => failure.code === "system_json_leak"));
 });
 
+test("deterministic validator rejects a leaked typed-tool array tail", () => {
+  const block = chapterBlock(0, "We are almost entirely women of the sword or women of rank.");
+  const result = new TranslationValidator().validate([block], {
+    translations: [{
+      blockId: block.id,
+      text: "我们几乎全是武门女子或显贵女子。”}],",
+    }],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(result.failures.some((failure) => failure.code === "system_json_leak"));
+});
+
 test("exact paragraph overlap is removed before adjacent blocks are translated", () => {
   const first = chapterBlock(0, "First paragraph.\n\nShared boundary paragraph.");
   const second = chapterBlock(1, "Shared boundary paragraph.\n\nNext paragraph.");

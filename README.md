@@ -6,9 +6,9 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current release is **FolioLoom v1.5.3**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current release is **FolioLoom v1.6.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-## What v1.5.3 can do
+## What v1.6.0 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
@@ -24,10 +24,13 @@ The current release is **FolioLoom v1.5.3**. The production TypeScript core live
 - Export privacy-safe diagnostic JSON without API keys, book text, translations, or complete private paths.
 - Show text blocks requiring attention, failure categories, public error codes, and next actions in the desktop app. Recoverable incidents receive at most one safe retry through shadow audit and atomic promotion.
 - Offer only `deepseek-v4-flash` and `deepseek-v4-pro` for DeepSeek; legacy model names are rejected before translation starts.
+- Run an optional, isolated `codex exec` worker with the user's existing Codex CLI login, without a separate model API key or provider configuration.
+- Use the repository-scoped [`$folioloom-translate`](.agents/skills/folioloom-translate/SKILL.md) skill to import a manuscript, run a bounded smoke translation, resume the same durable run, audit it, and strictly export it.
+- Amortize safe Codex file work across adjacent logical windows, retain per-window validation and commits, try paragraph-heavy blocks whole before bounded fragment recovery, and import paragraph-heavy DOCX files in linear time.
 
 ## V4 Flash 100K benchmark
 
-FolioLoom v1.5.1 was tested on fresh project databases with the current `deepseek-v4-flash` model, Active/Balanced scheduling, and three concurrent requests. v1.5.2 added EPUB structure preservation, and v1.5.3 added desktop handling and recovery workflows without changing this translation scheduler.
+FolioLoom v1.5.1 was tested on fresh project databases with the current `deepseek-v4-flash` model, Active/Balanced scheduling, and three concurrent requests. v1.5.2 added EPUB structure preservation, v1.5.3 added desktop handling and recovery workflows, and v1.6.0 adds the separate Codex worker path without changing these historical measurements.
 
 - German, *The Metamorphosis*: **10 minutes 55 seconds** for the first 100K characters.
 - English, Part One of *Children of Time*: **18 minutes 56 seconds** for the first 100K characters.
@@ -41,6 +44,7 @@ Both runs passed strict export and audit with no human-required or failed window
 - Offline regression tests and live-model one-window and three-window gates are complete; a full-book quality benchmark for the latest architecture has not yet been published.
 - The desktop app supports book import, model compatibility checks, single-fragment trials, full-book start/pause/resume, the attention center, and strict export. Paragraph-level manual rewriting and batch review are still planned.
 - The desktop app includes DeepSeek, Kimi, Alibaba Cloud Model Studio, Volcano Ark, OpenAI, SiliconFlow, and custom OpenAI-compatible endpoints. DeepSeek accepts only V4 Flash/Pro, and every model must pass a live compatibility check.
+- The Codex worker is currently a CLI/skill workflow, requires a locally installed and signed-in Codex CLI, and intentionally runs with `--max-concurrency 1`. It is not yet exposed in the desktop app.
 - Original-template EPUB preservation applies only to projects re-imported with v1.5.2 or later. Older projects are not fuzzily aligned to guessed link positions; re-import the original EPUB before translating.
 
 ## Installation
@@ -59,7 +63,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-Copy the example configuration. In v1.5.3, you can place a real API key in the untracked `config/config.yaml`, or pass `--opencode-auth` to `book run` and read credentials from your local OpenCode authentication file.
+For provider-API runs, copy the example configuration. You can place a real API key in the untracked `config/config.yaml`, or pass `--opencode-auth` to `book run` and read credentials from your local OpenCode authentication file. Codex-worker runs use neither option.
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml
@@ -99,6 +103,34 @@ npm.cmd run folioloom -- book status `
 ```
 
 After reviewing the trial translation, repeat `book run` without `--max-windows 1` to continue. The runner skips windows that have already been committed.
+
+## Translate with a signed-in Codex CLI
+
+FolioLoom v1.6.0 can use an isolated `codex exec` subprocess as its model transport. This path reuses your local interactive Codex login, so it does not require a separate model API key. FolioLoom still owns source identity, bounded requests, validation, recovery, SQLite commits, audit, and export; each subprocess sees only its current model job and cannot write to the project.
+
+Install the Codex CLI, run `codex login`, then start Codex from the repository root. The repository-scoped skill is discovered from `.agents/skills/folioloom-translate`; invoke it directly with a file rather than pasting the book into chat:
+
+```text
+Use $folioloom-translate to translate D:\books\my_book.epub from English to Simplified Chinese with MODEL_ID.
+```
+
+The skill performs a read-only environment doctor, imports the authorized source, runs deterministic preflight, translates at most two logical windows for inspection, and then resumes the exact durable run before audit and strict export. To install the skill for use outside this checkout, copy the complete `.agents/skills/folioloom-translate` directory to your user-scoped `.agents/skills` directory; do not copy books, `projects/`, databases, exports, or Codex authentication state with it.
+
+The equivalent initial CLI call, after native `book import` and `book doctor`, is:
+
+```powershell
+Set-Location folioloom
+npm.cmd run folioloom -- book run `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --store ..\projects\my_book\artifacts\folioloom\book.db `
+  --worker codex `
+  --codex-model "MODEL_ID" `
+  --max-windows 2 `
+  --max-concurrency 1 `
+  --output ..\projects\my_book\exports\codex
+```
+
+Resume with the returned `--run` ID and the same model, style, glossary, and policy options. Remove `--max-windows 2` only after inspecting the partial export. Final delivery still requires `book audit`, strict `book export`, and `book verify-export`.
 
 ## Local desktop workbench (development preview)
 

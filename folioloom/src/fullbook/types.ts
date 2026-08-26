@@ -4,6 +4,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ProviderEffort } from "../providers/types.js";
 
 export type TranslationRunMode = "quality" | "fast";
+export type TranslationExecutionPolicy = "codex-file-v1";
 
 export interface TranslationRuntime {
   model: Model<Api>;
@@ -12,6 +13,8 @@ export interface TranslationRuntime {
   effort?: ProviderEffort;
   /** Agent-facing level; `off` must remain explicit rather than becoming a default. */
   thinkingLevel?: ThinkingLevel;
+  /** Opt-in request shaping for new file-backed Codex runs. Undefined preserves legacy behavior. */
+  executionPolicy?: TranslationExecutionPolicy;
 }
 
 export interface TranslationRuntimeSet {
@@ -49,6 +52,7 @@ export interface RequestBatchOptions {
   tinyWindowTokens: number;
   maxRequestTokens: number;
   maxWindowsPerRequest: number;
+  packingMode?: "tiny-only" | "bounded";
 }
 
 export interface PhysicalRequestPlan {

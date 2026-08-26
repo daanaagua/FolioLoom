@@ -289,6 +289,9 @@ function runMetadataWithLanguageProfile(
           ...(runtimeSet.primary.thinkingLevel === undefined
             ? {}
             : { thinkingLevel: runtimeSet.primary.thinkingLevel }),
+          ...(runtimeSet.primary.executionPolicy === undefined
+            ? {}
+            : { executionPolicy: runtimeSet.primary.executionPolicy }),
         },
         escalation: {
           modelId: runtimeSet.escalation.model.id,
@@ -298,6 +301,9 @@ function runMetadataWithLanguageProfile(
           ...(runtimeSet.escalation.thinkingLevel === undefined
             ? {}
             : { thinkingLevel: runtimeSet.escalation.thinkingLevel }),
+          ...(runtimeSet.escalation.executionPolicy === undefined
+            ? {}
+            : { executionPolicy: runtimeSet.escalation.executionPolicy }),
         },
       },
     }),
@@ -1218,6 +1224,9 @@ function normalizeRuntimeSet(options: LosslessBookRunOptions): TranslationRuntim
   };
   if (runtimeSet.primary.model.id !== runtimeSet.escalation.model.id) {
     throw new TypeError("primary and escalation runtimes must use the same model identity");
+  }
+  if (runtimeSet.primary.executionPolicy !== runtimeSet.escalation.executionPolicy) {
+    throw new TypeError("primary and escalation runtimes must use the same execution policy");
   }
   if (runtimeSet.mode === "quality"
     && (runtimeSet.primary.effort !== runtimeSet.escalation.effort
@@ -2322,13 +2331,25 @@ async function runLosslessBook(
   );
   const maxRequestTokens = positiveInteger(
     options.maxRequestTokens
-      ?? (runtimeSet.mode === "fast" ? FAST_MAX_SOURCE_TOKENS : 3_200),
+      ?? (runtimeSet.mode === "fast"
+        || runtimeSet.primary.executionPolicy === "codex-file-v1"
+        ? FAST_MAX_SOURCE_TOKENS
+        : 3_200),
     "maxRequestTokens",
   );
   const maxWindowsPerRequest = positiveInteger(
-    options.maxWindowsPerRequest ?? 4,
+    options.maxWindowsPerRequest
+      ?? (runtimeSet.primary.executionPolicy === "codex-file-v1" ? 2 : 4),
     "maxWindowsPerRequest",
   );
+  const requestBatchOptions = {
+    tinyWindowTokens,
+    maxRequestTokens,
+    maxWindowsPerRequest,
+    packingMode: runtimeSet.primary.executionPolicy === "codex-file-v1"
+      ? "bounded" as const
+      : "tiny-only" as const,
+  };
   const maxInFlightTokens = positiveInteger(
     options.maxInFlightTokens ?? Math.min(
       runtimeSet.primary.model.contextWindow * maxConcurrency,
@@ -2655,7 +2676,9 @@ async function runLosslessBook(
       store.latestKnowledgeSnapshot(runId).id,
     );
     let revalidationDrain = emptyRevalidationDrainReport();
-    let fastWaveHorizonMultiplier = runtimeSet.mode === "fast" ? 2 : 1;
+    const usesAmortizedWaveHorizon = runtimeSet.mode === "fast"
+      || runtimeSet.primary.executionPolicy === "codex-file-v1";
+    let waveHorizonMultiplier = usesAmortizedWaveHorizon ? 2 : 1;
     const translateRevalidation = async (
       work: RevalidationWorkItem,
       action: "repair" | "retranslate",
@@ -3073,7 +3096,7 @@ async function runLosslessBook(
       }
       const remaining = maxWindows - processedWindows;
       const selected: PersistedLosslessWindow[] = [];
-      const physicalRequestHorizon = maxConcurrency * fastWaveHorizonMultiplier;
+      const physicalRequestHorizon = maxConcurrency * waveHorizonMultiplier;
       for (const window of allWindows.slice(barrier.ordinal)) {
         if (window.status !== "pending"
           || selected.length >= remaining) {
@@ -3082,7 +3105,7 @@ async function runLosslessBook(
         const tentative = [...selected, window];
         const physicalCount = packPhysicalRequests(
           tentative.map((item) => ({ ...item, status: "pending" as const })),
-          { tinyWindowTokens, maxRequestTokens, maxWindowsPerRequest },
+          requestBatchOptions,
         ).length;
         if (physicalCount > physicalRequestHorizon) {
           break;
@@ -3487,7 +3510,7 @@ async function runLosslessBook(
         );
         const requests = packPhysicalRequests(
           retryWindows.map((window) => ({ ...window, status: "pending" as const })),
-          { tinyWindowTokens, maxRequestTokens, maxWindowsPerRequest },
+          requestBatchOptions,
         );
         const executionRuntime = retryRound === 0
           ? runtimeSet.primary
@@ -4194,7 +4217,7 @@ async function runLosslessBook(
 
       const initialRequests = packPhysicalRequests(
         selected.map((window) => ({ ...window, status: "pending" as const })),
-        { tinyWindowTokens, maxRequestTokens, maxWindowsPerRequest },
+        requestBatchOptions,
       );
       waves.push({
         wave: waves.length,
@@ -4212,14 +4235,14 @@ async function runLosslessBook(
         ? selected.length
         : selected.filter((window) =>
             completedWindowIds.has(window.windowId)).length;
-      if (runtimeSet.mode === "fast") {
+      if (usesAmortizedWaveHorizon) {
         const hasUnresolvedKnowledge = store.latestKnowledgeSnapshot(runId).revisions
           .some((revision) => revision.status === "needs_revalidate");
         const waveWasUnstable = retryRound > 1
           || freshWaveRequired
           || entityLinkWarnings.length > 0
           || hasUnresolvedKnowledge;
-        fastWaveHorizonMultiplier = waveWasUnstable ? 1 : 2;
+        waveHorizonMultiplier = waveWasUnstable ? 1 : 2;
       }
       if (providerFailure !== undefined) {
         throw providerFailure;

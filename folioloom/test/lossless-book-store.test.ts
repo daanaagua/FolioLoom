@@ -753,6 +753,53 @@ test("stage writes only inactive rows and promote commits the complete window at
   store.close();
 });
 
+test("terminal protocol-tail repair creates an audited translation version", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  const runId = initialize(store);
+  const [first] = blocks();
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(),
+    translations: validStage().translations.map((translation) =>
+      translation.blockId === first!.id
+        ? { ...translation, text: "阿尔法。}]," }
+        : translation),
+    knowledgeCandidates: [],
+  });
+  store.promoteStagedWindow(runId, "window-0");
+
+  const repaired = store.repairTerminalProtocolTail(runId, first!.id, 1);
+  assert.equal(repaired.text, "阿尔法。");
+  assert.equal(repaired.version, 2);
+  const history = store.auditState(runId).translations.filter((translation) =>
+    translation.blockId === first!.id);
+  assert.deepEqual(history.map(({ version, active, text }) => ({ version, active, text })), [
+    { version: 1, active: false, text: "阿尔法。}]," },
+    { version: 2, active: true, text: "阿尔法。" },
+  ]);
+  assert.throws(
+    () => store.repairTerminalProtocolTail(runId, first!.id, 1),
+    /active translation version changed/u,
+  );
+  store.close();
+
+  const database = new DatabaseSync(path);
+  const event = database.prepare(`
+    SELECT payload_json FROM events
+    WHERE run_id=? AND kind='translation_protocol_tail_repaired'
+  `).get(runId) as { payload_json: string };
+  database.close();
+  const payload = JSON.parse(event.payload_json) as {
+    blockId: string;
+    oldVersion: number;
+    newVersion: number;
+  };
+  assert.equal(payload.blockId, first!.id);
+  assert.equal(payload.oldVersion, 1);
+  assert.equal(payload.newVersion, 2);
+});
+
 test("lexical concept revisions and occurrence replacement are idempotent", () => {
   const store = new LosslessBookStore(fixturePath());
   const runId = initialize(store);

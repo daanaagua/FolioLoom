@@ -5236,6 +5236,136 @@ export class LosslessBookStore {
     }));
   }
 
+  repairTerminalProtocolTail(
+    runId: string,
+    blockId: string,
+    expectedVersion: number,
+  ): ActiveLosslessTranslation {
+    requireNonempty(runId, "runId");
+    requireNonempty(blockId, "blockId");
+    requireSafeInteger(expectedVersion, "expectedVersion", 1);
+    return this.#transaction(() => {
+      const current = one<{
+        translation_id: number;
+        window_id: string;
+        source_version: string;
+        source_hash: string;
+        text: string;
+        result_status: "completed" | "completed_with_warnings";
+        stage_state: string;
+        snapshot_id: string;
+        version: number;
+        window_status: string;
+      }>(this.#database.prepare(`
+        SELECT t.translation_id, t.window_id, t.source_version, t.source_hash,
+               t.text, t.result_status, t.stage_state, t.snapshot_id, t.version,
+               w.status AS window_status
+        FROM translations AS t
+        JOIN window_plans AS w
+          ON w.run_id=t.run_id AND w.window_id=t.window_id
+        WHERE t.run_id=? AND t.block_id=? AND t.active=1
+      `), runId, blockId);
+      if (current === undefined) {
+        throw new Error(`run ${runId} has no active translation for block ${blockId}`);
+      }
+      if (current.version !== expectedVersion) {
+        throw new Error(
+          `active translation version changed for ${blockId}: expected ${expectedVersion}, got ${current.version}`,
+        );
+      }
+      if (current.stage_state !== "promoted"
+        || (current.window_status !== "completed"
+          && current.window_status !== "completed_with_warnings")) {
+        throw new Error(`active translation is not committed for block ${blockId}`);
+      }
+      const replacementText = current.text.replace(/\}\]\s*,\s*$/u, "");
+      if (replacementText === current.text) {
+        throw new Error(`active translation has no terminal protocol tail for block ${blockId}`);
+      }
+      if (replacementText.trim().length === 0) {
+        throw new Error(`protocol-tail repair would empty translation for block ${blockId}`);
+      }
+      const openRevalidationTasks = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM knowledge_revalidation_tasks
+        WHERE run_id=? AND translation_id=? AND status IN ('pending','validating')
+      `), runId, current.translation_id)?.count ?? 0;
+      if (openRevalidationTasks !== 0) {
+        throw new Error(`active translation has open revalidation work for block ${blockId}`);
+      }
+      const nextVersion = one<{ version: number }>(this.#database.prepare(`
+        SELECT COALESCE(MAX(version), 0) + 1 AS version
+        FROM translations WHERE run_id=? AND block_id=?
+      `), runId, blockId)?.version;
+      if (nextVersion === undefined) {
+        throw new Error(`failed to allocate translation version for block ${blockId}`);
+      }
+      const inserted = this.#database.prepare(`
+        INSERT INTO translations(
+          run_id, window_id, source_version, block_id, version, source_hash,
+          text, result_status, stage_state, active, snapshot_id
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'promoted', 0, ?)
+      `).run(
+        runId,
+        current.window_id,
+        current.source_version,
+        blockId,
+        nextVersion,
+        current.source_hash,
+        replacementText,
+        current.result_status,
+        current.snapshot_id,
+      );
+      const replacementTranslationId = Number(inserted.lastInsertRowid);
+      if (!Number.isSafeInteger(replacementTranslationId)
+        || replacementTranslationId < 1) {
+        throw new Error(`failed to insert repaired translation for block ${blockId}`);
+      }
+      this.#database.prepare(`
+        INSERT INTO translation_concept_bindings(
+          translation_id, concept_id, applied_revision_id,
+          applied_render_fingerprint, term_usages_json, validation_status,
+          validated_revision_id
+        )
+        SELECT ?, concept_id, applied_revision_id, applied_render_fingerprint,
+               term_usages_json, validation_status, validated_revision_id
+        FROM translation_concept_bindings WHERE translation_id=?
+      `).run(replacementTranslationId, current.translation_id);
+      const deactivated = this.#database.prepare(`
+        UPDATE translations SET active=0
+        WHERE translation_id=? AND run_id=? AND active=1
+      `).run(current.translation_id, runId);
+      if (Number(deactivated.changes) !== 1) {
+        throw new Error(`active translation changed while repairing block ${blockId}`);
+      }
+      const activated = this.#database.prepare(`
+        UPDATE translations SET active=1
+        WHERE translation_id=? AND run_id=? AND active=0 AND stage_state='promoted'
+      `).run(replacementTranslationId, runId);
+      if (Number(activated.changes) !== 1) {
+        throw new Error(`failed to activate repaired translation for block ${blockId}`);
+      }
+      this.#appendEvent(runId, "translation_protocol_tail_repaired", {
+        blockId,
+        oldTranslationId: current.translation_id,
+        replacementTranslationId,
+        oldVersion: current.version,
+        newVersion: nextVersion,
+        oldTextHash: hashText(current.text),
+        newTextHash: hashText(replacementText),
+      });
+      return {
+        runId,
+        windowId: current.window_id,
+        blockId,
+        sourceVersion: current.source_version,
+        sourceHash: current.source_hash,
+        text: replacementText,
+        status: current.result_status,
+        version: nextVersion,
+      };
+    });
+  }
+
   knowledgeRevisions(runId: string): KnowledgeRevision[] {
     this.#run(runId);
     const rows = all<{

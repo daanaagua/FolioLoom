@@ -812,13 +812,15 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
   buildInput: (request: PhysicalRequestPlan) => TInput,
 ): AdmittedTranslationRequest<TInput>[] {
   return requests.map((request) => {
-    let fragments = admitHighRiskParagraphFragments(
-      request,
-      runtime,
-      estimator,
-      blockById,
-      buildInput,
-    );
+    let fragments = runtime.executionPolicy === "codex-file-v1"
+      ? undefined
+      : admitHighRiskParagraphFragments(
+        request,
+        runtime,
+        estimator,
+        blockById,
+        buildInput,
+      );
     if (fragments === undefined) {
       try {
         fragments = admitTranslationFragments(
