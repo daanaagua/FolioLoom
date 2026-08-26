@@ -14,6 +14,7 @@ import {
   main,
   parseArgs,
   resolveRunSelection,
+  runMetadataForExecutionBackend,
 } from "../src/cli.js";
 import type { PilotModelConfig } from "../src/config.js";
 import { BookContext } from "../src/fullbook/book-context.js";
@@ -231,6 +232,144 @@ test("book run accepts optimization profile and scheduler mode", () => {
   assert.equal(parsed.optimizationProfile, "balanced");
   assert.equal(parsed.schedulerMode, "active");
   assert.equal(parsed.runtimeProfileStore, resolve("profiles.db"));
+});
+
+test("book run parses a config-free single Codex worker", () => {
+  const parsed = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--worker", "codex",
+    "--codex-model", "gpt-test",
+    "--codex-context-window", "200000",
+    "--codex-max-output-tokens", "24000",
+    "--codex-executable", "C:\\tools\\codex.exe",
+  ]);
+
+  assert.equal(parsed.worker, "codex");
+  assert.equal(parsed.config, undefined);
+  assert.equal(parsed.codexModel, "gpt-test");
+  assert.equal(parsed.codexContextWindow, 200_000);
+  assert.equal(parsed.codexMaxOutputTokens, 24_000);
+  assert.equal(parsed.codexExecutable, resolve("C:\\tools\\codex.exe"));
+  assert.equal(parsed.maxConcurrency, 1);
+});
+
+test("Codex worker parsing rejects ambiguous backends and non-sequential execution", () => {
+  const base = [
+    "book", "run", "--manifest", "source_manifest.json", "--store", "state.db",
+    "--worker", "codex",
+  ];
+  assert.throws(
+    () => parseArgs([...base]),
+    /--codex-model is required/u,
+  );
+  assert.throws(
+    () => parseArgs([...base, "--codex-model", "gpt-test", "--config", "config.yaml"]),
+    /--worker codex cannot be combined with --config/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      ...base, "--codex-model", "gpt-test", "--opencode-auth", "auth.json",
+    ]),
+    /--worker codex cannot be combined with --opencode-auth/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      ...base, "--codex-model", "gpt-test", "--max-concurrency", "2",
+    ]),
+    /Codex worker requires --max-concurrency 1/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      ...base, "--codex-model", "gpt-test", "--run-mode", "fast",
+    ]),
+    /Codex worker currently supports only quality run mode/u,
+  );
+  assert.throws(
+    () => parseArgs([
+      "book", "run", "--manifest", "source_manifest.json", "--store", "state.db",
+      "--config", "config.yaml", "--codex-model", "gpt-test",
+    ]),
+    /--codex-model requires --worker codex/u,
+  );
+});
+
+test("execution backend metadata prevents provider and Codex runs from mixing", () => {
+  assert.deepEqual(
+    runMetadataForExecutionBackend({ fixture: true }, "codex-exec", false),
+    { fixture: true, executionBackend: "codex-exec" },
+  );
+  assert.throws(
+    () => runMetadataForExecutionBackend({ fixture: true }, "codex-exec", true),
+    /cannot resume a provider run with the Codex worker/u,
+  );
+  assert.throws(
+    () => runMetadataForExecutionBackend(
+      { executionBackend: "codex-exec" },
+      "provider-api",
+      true,
+    ),
+    /requires --worker codex/u,
+  );
+});
+
+test("book run wires one injected Codex runtime without constructing an API provider", async () => {
+  const manifest = sourceManifest("Gregor woke from uneasy dreams.");
+  const storePath = join(dirname(manifest), "codex-worker.db");
+  let apiProviderConstructions = 0;
+  let codexOptions: Record<string, unknown> | undefined;
+  let received: Record<string, unknown> | undefined;
+  const originalLog = console.log;
+  console.log = () => undefined;
+  try {
+    await main([
+      "book", "run",
+      "--manifest", manifest,
+      "--store", storePath,
+      "--worker", "codex",
+      "--codex-model", "gpt-test",
+    ], {
+      createModel: (() => {
+        apiProviderConstructions += 1;
+        throw new Error("API provider must not be constructed");
+      }) as never,
+      createCodexRuntime: ((options: Record<string, unknown>) => {
+        codexOptions = options;
+        const model = {
+          id: "gpt-test",
+          provider: "codex-cli",
+          contextWindow: 256_000,
+          maxTokens: 32_768,
+        };
+        const streamFn = () => {
+          throw new Error("stream is not used by this wiring test");
+        };
+        return { model, streamFn };
+      }) as never,
+      runBook: (async (options: unknown) => {
+        received = options as Record<string, unknown>;
+        return { artifacts: null } as never;
+      }) as never,
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.equal(apiProviderConstructions, 0);
+  assert.equal(codexOptions?.modelId, "gpt-test");
+  assert.equal(received?.maxConcurrency, 1);
+  const runtimeSet = received?.runtimeSet as {
+    primary?: { effort?: string; thinkingLevel?: string; model?: { id?: string } };
+    escalation?: unknown;
+  };
+  assert.equal(runtimeSet.primary?.model?.id, "gpt-test");
+  assert.equal(runtimeSet.primary?.effort, "high");
+  assert.equal(runtimeSet.primary?.thinkingLevel, "high");
+  assert.equal(runtimeSet.primary, runtimeSet.escalation);
+  const runMeta = received?.runMeta as { modelId?: string; metadata?: Record<string, unknown> };
+  assert.equal(runMeta.modelId, "gpt-test");
+  assert.equal(runMeta.metadata?.executionBackend, "codex-exec");
 });
 
 test("legacy quality mode maps to balanced when no profile is supplied", () => {

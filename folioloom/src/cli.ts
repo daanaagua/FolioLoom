@@ -9,6 +9,10 @@ import {
   createDeepSeekStreamFn,
   PiRuntime,
 } from "./agents/pi-runtime.js";
+import {
+  createCodexExecRuntime,
+  type CodexExecRuntimeOptions,
+} from "./agents/codex-exec-stream.js";
 import { RecoveryAgent } from "./agents/recovery-agent.js";
 import {
   loadOpenCodeApiKey,
@@ -118,6 +122,11 @@ export interface CliOptions {
   schedulerMode?: SchedulerMode;
   runtimeProfileStore?: string;
   maxInFlightTokens?: number;
+  worker?: "codex";
+  codexModel?: string;
+  codexContextWindow?: number;
+  codexMaxOutputTokens?: number;
+  codexExecutable?: string;
 }
 
 export interface BookDoctorReport {
@@ -141,6 +150,9 @@ type RuntimeAwareBookRunOptions = LosslessBookRunOptions & {
 export interface CliRuntimeDependencies {
   createModel: typeof createDeepSeekModel;
   createStreamFn: typeof createDeepSeekStreamFn;
+  createCodexRuntime?: (
+    options: CodexExecRuntimeOptions,
+  ) => ReturnType<typeof createCodexExecRuntime>;
   createRuntimeProfileStore?: (path: string) => RuntimeProfileStore;
   runBook?: (options: RuntimeAwareBookRunOptions) => Promise<LosslessBookRunResult>;
 }
@@ -557,6 +569,27 @@ function runMetadataForScheduler(
   };
 }
 
+export type TranslationExecutionBackend = "provider-api" | "codex-exec";
+
+export function runMetadataForExecutionBackend(
+  metadata: unknown,
+  backend: TranslationExecutionBackend,
+  resuming: boolean,
+): unknown {
+  const existing = metadataRecord(metadata);
+  const stored = existing.executionBackend;
+  if (backend === "codex-exec") {
+    if (resuming && stored !== "codex-exec") {
+      throw new Error("cannot resume a provider run with the Codex worker");
+    }
+    return { ...existing, executionBackend: "codex-exec" };
+  }
+  if (stored === "codex-exec") {
+    throw new Error("a Codex worker run requires --worker codex");
+  }
+  return metadata;
+}
+
 export function parseArgs(argv: readonly string[]): CliOptions {
   if (argv[0] === "preview") {
     const { values, booleans } = parseFlags(
@@ -709,6 +742,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--glossary", "--run-mode", "--max-in-flight-tokens",
         "--optimization-profile", "--scheduler-mode",
         "--runtime-profile-store",
+        "--worker", "--codex-model", "--codex-context-window",
+        "--codex-max-output-tokens", "--codex-executable",
       ],
     );
     const explicitProfile = optimizationProfileFlag(
@@ -729,17 +764,52 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         `optimization profile ${explicitProfile} conflicts with run mode ${runMode}`,
       );
     }
+    const rawWorker = identifierValue(values, "--worker");
+    if (rawWorker !== undefined && rawWorker !== "codex") {
+      throw new Error("--worker must be codex");
+    }
+    const worker = rawWorker as "codex" | undefined;
+    const config = pathValue(values, "--config", worker === undefined);
+    const openCodeAuth = pathValue(values, "--opencode-auth", false);
+    const codexModel = identifierValue(values, "--codex-model");
+    const codexContextWindow = positiveFlag(values, "--codex-context-window");
+    const codexMaxOutputTokens = positiveFlag(values, "--codex-max-output-tokens");
+    const codexExecutable = pathValue(values, "--codex-executable", false);
+    const requestedConcurrency = positiveFlag(values, "--max-concurrency");
+    const hasCodexOnlyOption = codexModel !== undefined
+      || codexContextWindow !== undefined
+      || codexMaxOutputTokens !== undefined
+      || codexExecutable !== undefined;
+    if (worker === "codex") {
+      if (config !== undefined) {
+        throw new Error("--worker codex cannot be combined with --config");
+      }
+      if (openCodeAuth !== undefined) {
+        throw new Error("--worker codex cannot be combined with --opencode-auth");
+      }
+      if (codexModel === undefined) {
+        throw new Error("--codex-model is required with --worker codex");
+      }
+      if (requestedConcurrency !== undefined && requestedConcurrency !== 1) {
+        throw new Error("Codex worker requires --max-concurrency 1");
+      }
+      if (runMode !== "quality") {
+        throw new Error("Codex worker currently supports only quality run mode");
+      }
+    } else if (hasCodexOnlyOption) {
+      throw new Error("--codex-model requires --worker codex");
+    }
     return {
       command: "book-run",
       manifest: pathValue(values, "--manifest"),
       legacyV4Db: pathValue(values, "--v4-db", false),
       store: pathValue(values, "--store"),
-      config: pathValue(values, "--config"),
+      ...(config === undefined ? {} : { config }),
       output: pathValue(values, "--output", false),
-      openCodeAuth: pathValue(values, "--opencode-auth", false),
+      ...(openCodeAuth === undefined ? {} : { openCodeAuth }),
       runId: identifierValue(values, "--run"),
       maxWindows: positiveFlag(values, "--max-windows"),
-      maxConcurrency: positiveFlag(values, "--max-concurrency"),
+      maxConcurrency: worker === "codex" ? 1 : requestedConcurrency,
       runMode,
       optimizationProfile: explicitProfile ?? legacyProfile,
       schedulerMode: schedulerModeFlag(values, "--scheduler-mode"),
@@ -756,6 +826,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       styleProfile: pathValue(values, "--style-profile", false),
       prompt: identifierValue(values, "--prompt"),
       glossary: pathValue(values, "--glossary", false),
+      ...(worker === undefined ? {} : { worker }),
+      ...(codexModel === undefined ? {} : { codexModel }),
+      ...(codexContextWindow === undefined ? {} : { codexContextWindow }),
+      ...(codexMaxOutputTokens === undefined ? {} : { codexMaxOutputTokens }),
+      ...(codexExecutable === undefined ? {} : { codexExecutable }),
     };
   }
   if (action === "status") {
@@ -856,6 +931,27 @@ export function buildTranslationRuntimeSet(
     primary,
     escalation,
     variants: validateRuntimeVariants([...variantsByEffort.values()]),
+  };
+}
+
+export function buildCodexTranslationRuntimeSet(
+  options: CodexExecRuntimeOptions,
+  factory: (
+    runtimeOptions: CodexExecRuntimeOptions,
+  ) => ReturnType<typeof createCodexExecRuntime> = createCodexExecRuntime,
+): TranslationRuntimeSet {
+  const created = factory({ ...options, reasoningEffort: "high" });
+  const runtime = {
+    effort: "high" as const,
+    thinkingLevel: "high" as const,
+    model: created.model,
+    streamFn: created.streamFn,
+  };
+  return {
+    mode: "quality",
+    primary: runtime,
+    escalation: runtime,
+    variants: validateRuntimeVariants([runtime]),
   };
 }
 
@@ -1061,18 +1157,35 @@ export async function main(
     const optimizationProfile = options.optimizationProfile
       ?? profileFromLegacyRunMode(options.runMode ?? "quality");
     const schedulerMode = options.schedulerMode ?? "off";
-    const runMetadata = runMetadataForScheduler(
+    const schedulerMetadata = runMetadataForScheduler(
       baseRunMetadata,
       optimizationProfile,
       schedulerMode,
       selectedRun !== undefined,
     );
-    const config = loadRuntimeConfig(options);
-    const runtimeSet = buildTranslationRuntimeSet(
-      config,
-      options.runMode ?? "quality",
-      runtime,
+    const runMetadata = runMetadataForExecutionBackend(
+      schedulerMetadata,
+      options.worker === "codex" ? "codex-exec" : "provider-api",
+      selectedRun !== undefined,
     );
+    const runtimeSet = options.worker === "codex"
+      ? buildCodexTranslationRuntimeSet({
+        modelId: requireOption(options, "codexModel"),
+        ...(options.codexContextWindow === undefined
+          ? {}
+          : { contextWindow: options.codexContextWindow }),
+        ...(options.codexMaxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: options.codexMaxOutputTokens }),
+        ...(options.codexExecutable === undefined
+          ? {}
+          : { executable: options.codexExecutable }),
+      }, dependencyOverrides.createCodexRuntime ?? createCodexExecRuntime)
+      : buildTranslationRuntimeSet(
+        loadRuntimeConfig(options),
+        options.runMode ?? "quality",
+        runtime,
+      );
     const bookRunner = dependencyOverrides.runBook
       ?? ((runOptions: RuntimeAwareBookRunOptions) => runBook(runOptions));
     const runId = selectedRunId ?? randomUUID();
@@ -1092,7 +1205,7 @@ export async function main(
           ? {
               runId,
               protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
-              modelId: config.model,
+              modelId: runtimeSet.primary.model.id,
               metadata: runMetadata,
             }
           : {
