@@ -1191,3 +1191,43 @@ test("CLI parses full-book preflight, run, status, and export commands", () => {
     "--allow-incomplete",
   ]).command, "book-export");
 });
+
+test("CLI parses live terminology and audited retrofit control commands", () => {
+  assert.deepEqual(parseArgs([
+    "book", "knowledge", "term-upsert",
+    "--store", "book.db", "--run", "run-a", "--input", "rule.json",
+  ]), {
+    command: "book-knowledge-term-upsert",
+    store: resolve("book.db"),
+    runId: "run-a",
+    input: resolve("rule.json"),
+  });
+  assert.deepEqual(parseArgs([
+    "book", "knowledge", "queue-status",
+    "--store", "book.db", "--run", "run-a",
+  ]), {
+    command: "book-knowledge-queue-status",
+    store: resolve("book.db"),
+    runId: "run-a",
+  });
+  assert.deepEqual(parseArgs([
+    "book", "retrofit", "plan", "--store", "book.db", "--run", "run-a",
+    "--revision", "revision-a", "--request", "request-a",
+  ]), {
+    command: "book-retrofit-plan",
+    store: resolve("book.db"),
+    runId: "run-a",
+    revisionId: "revision-a",
+    requestId: "request-a",
+  });
+  assert.deepEqual(parseArgs([
+    "book", "retrofit", "apply", "--store", "book.db", "--run", "run-a",
+    "--job", "job-a", "--plan-hash", "a".repeat(64),
+  ]), {
+    command: "book-retrofit-apply",
+    store: resolve("book.db"),
+    runId: "run-a",
+    jobId: "job-a",
+    planHash: "a".repeat(64),
+  });
+});

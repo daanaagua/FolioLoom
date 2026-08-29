@@ -301,6 +301,102 @@ test("knowledge convergence blocks strict export without hiding structural compl
   }
 });
 
+test("queued knowledge edits and unfinished retrofit items block strict export", () => {
+  const fixture = completeRun();
+  const database = new DatabaseSync(fixture.storePath);
+  const translation = database.prepare(`
+    SELECT translation_id, block_id, source_version
+    FROM translations WHERE run_id=? AND active=1 LIMIT 1
+  `).get(fixture.runId) as {
+    translation_id: number;
+    block_id: string;
+    source_version: string;
+  };
+  database.prepare(`
+    INSERT INTO knowledge_change_queue(
+      request_id, run_id, request_hash, base_generation, base_snapshot_id,
+      object_keys_json, commands_json, status
+    ) VALUES('queued-audit', ?, ?, 0, 'snapshot-audit', '[]', '{}', 'queued')
+  `).run(fixture.runId, "a".repeat(64));
+  database.prepare(`
+    INSERT INTO term_retrofit_jobs(
+      job_id, run_id, request_id, rule_revision_id, base_generation,
+      base_snapshot_id, plan_hash, status, plan_json
+    ) VALUES(
+      'retrofit-audit', ?, 'retrofit-audit-request', 'rule-audit', 0,
+      'snapshot-audit', ?, 'planned', '{}'
+    )
+  `).run(fixture.runId, "b".repeat(64));
+  database.prepare(`
+    INSERT INTO term_retrofit_items(
+      job_id, ordinal, source_version, block_id, old_translation_id,
+      classification, status
+    ) VALUES('retrofit-audit', 0, ?, ?, ?, 'model_retranslate', 'pending')
+  `).run(
+    translation.source_version,
+    translation.block_id,
+    translation.translation_id,
+  );
+  database.close();
+
+  const store = new LosslessBookStore(fixture.storePath);
+  try {
+    const report = auditLosslessBookStore(store, fixture.runId);
+    assert.equal(report.structurallyComplete, true);
+    assert.equal(report.knowledgeConverged, false);
+    assert.deepEqual(report.controlPlane, {
+      queuedKnowledgeChanges: 1,
+      pendingActiveTermImpacts: 0,
+      openRetrofitItems: 1,
+      attentionRetrofitItems: 0,
+    });
+    assert.ok(report.incidentCodes.includes("PENDING_KNOWLEDGE_CHANGE"));
+    assert.ok(report.incidentCodes.includes("TERM_RETROFIT_INCOMPLETE"));
+    assert.throws(
+      () => writeLosslessBookArtifacts(
+        store,
+        fixture.runId,
+        mkdtempSync(join(tmpdir(), "folioloom-control-plane-export-")),
+      ),
+      /knowledge convergence/u,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("an unapplied active term impact blocks strict export", () => {
+  const fixture = completeRun();
+  const database = new DatabaseSync(fixture.storePath);
+  const translation = database.prepare(`
+    SELECT block_id, source_version
+    FROM translations WHERE run_id=? AND active=1 LIMIT 1
+  `).get(fixture.runId) as { block_id: string; source_version: string };
+  database.prepare(`
+    INSERT INTO knowledge_records(
+      run_id, record_id, revision_id, revision, normalized_subject,
+      kind, payload_json, status, active, origin, scope
+    ) VALUES(?, 'term-impact-record', 'term-impact-revision', 1, 'alpha',
+      'term_rendering_rule:alpha', '{}', 'active', 1, 'manual', 'book')
+  `).run(fixture.runId);
+  database.prepare(`
+    INSERT INTO knowledge_block_impacts(
+      run_id, revision_id, source_version, block_id, reason, status
+    ) VALUES(?, 'term-impact-revision', ?, ?, 'test', 'pending')
+  `).run(fixture.runId, translation.source_version, translation.block_id);
+  database.close();
+
+  const store = new LosslessBookStore(fixture.storePath);
+  try {
+    const report = auditLosslessBookStore(store, fixture.runId);
+    assert.equal(report.knowledgeConverged, false);
+    assert.equal(report.controlPlane.pendingActiveTermImpacts, 1);
+    assert.ok(report.incidentCodes.includes("PENDING_TERM_IMPACT"));
+  } finally {
+    store.close();
+  }
+});
+
 test("audit rejects an active translation whose concept occurrence has no binding", () => {
   const fixture = completeRun();
   const store = new LosslessBookStore(fixture.storePath);

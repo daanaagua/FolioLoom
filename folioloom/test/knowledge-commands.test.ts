@@ -35,6 +35,21 @@ interface KnowledgeCommitResult {
 interface KnowledgeCommandCapableStore {
   knowledgeState(runId: string): KnowledgeStateView;
   commitKnowledgeCommands(input: unknown): KnowledgeCommitResult;
+  submitKnowledgeCommands(input: unknown): {
+    readonly requestId: string;
+    readonly status: "applied" | "queued" | "rejected" | "cancelled";
+    readonly generation?: number;
+    readonly snapshotId?: string;
+  };
+  queuedKnowledgeChanges(runId: string): readonly {
+    readonly requestId: string;
+    readonly status: string;
+  }[];
+  applyQueuedKnowledgeChanges(runId: string): {
+    readonly applied: number;
+    readonly rejected: number;
+    readonly remaining: number;
+  };
   syncScopedKnowledge(runId: string): {
     readonly changed: boolean;
     readonly generation: number;
@@ -196,7 +211,7 @@ function requestForCommands(
   store: KnowledgeCommandCapableStore,
   runId: string,
   commands: readonly unknown[],
-  requestId = randomUUID(),
+  requestId: string = randomUUID(),
 ): unknown {
   const state = store.knowledgeState(runId);
   return {
@@ -212,7 +227,7 @@ function commitRequest(
   store: KnowledgeCommandCapableStore,
   runId: string,
   target: string,
-  requestId = randomUUID(),
+  requestId: string = randomUUID(),
 ): unknown {
   const state = store.knowledgeState(runId);
   return {
@@ -315,6 +330,68 @@ test("rejects edits while a translation window is running", () => {
       () => store.commitKnowledgeCommands(commitRequest(store, fixture.runId, "阁下")),
       /KNOWLEDGE_EDIT_BUSY/u,
     );
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("queues an edit durably and applies it once at the next safe boundary", () => {
+  const fixture = initializedStore(true);
+  try {
+    fixture.store.claimWindow(fixture.runId, "window-0");
+    const store = commandStore(fixture.store);
+    const request = commitRequest(store, fixture.runId, "阁下", "queued-request");
+
+    const submitted = store.submitKnowledgeCommands(request);
+    assert.deepEqual(submitted, {
+      requestId: "queued-request",
+      status: "queued",
+    });
+    assert.equal(fixture.store.knowledgeRevisions(fixture.runId).length, 0);
+    assert.deepEqual(store.queuedKnowledgeChanges(fixture.runId).map((item) => ({
+      requestId: item.requestId,
+      status: item.status,
+    })), [{ requestId: "queued-request", status: "queued" }]);
+
+    fixture.store.recoverInterruptedWindows(fixture.runId);
+    assert.deepEqual(store.applyQueuedKnowledgeChanges(fixture.runId), {
+      applied: 1,
+      rejected: 0,
+      remaining: 0,
+    });
+    assert.equal(
+      (fixture.store.knowledgeRevisions(fixture.runId).at(-1)?.payload as {
+        target: string;
+      }).target,
+      "阁下",
+    );
+    assert.deepEqual(store.applyQueuedKnowledgeChanges(fixture.runId), {
+      applied: 0,
+      rejected: 0,
+      remaining: 0,
+    });
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("rejects a second queued edit for the same knowledge object", () => {
+  const fixture = initializedStore(true);
+  try {
+    fixture.store.claimWindow(fixture.runId, "window-0");
+    const store = commandStore(fixture.store);
+    store.submitKnowledgeCommands(commitRequest(
+      store,
+      fixture.runId,
+      "阁下",
+      "queued-first",
+    ));
+    assert.throws(() => store.submitKnowledgeCommands({
+      ...commitRequest(store, fixture.runId, "执政官", "queued-second") as Record<
+        string,
+        unknown
+      >,
+    }), /KNOWLEDGE_QUEUE_OBJECT_CONFLICT/u);
   } finally {
     fixture.store.close();
   }
@@ -477,6 +554,59 @@ test("rejects unknown semantic fields instead of silently dropping them", () => 
   } finally {
     fixture.store.close();
   }
+});
+
+test("validates a scoped rendering rule as typed term knowledge", () => {
+  const command = {
+    type: "upsert",
+    objectType: "term",
+    normalizedSubject: "severian",
+    kind: "term_rendering_rule:concealed-name",
+    expectedRevision: null,
+    expectedScopeRevision: null,
+    fieldPatch: {
+      ruleId: "concealed-name",
+      conceptId: "entity-severian",
+      entityId: "entity-severian",
+      sourceForms: ["Severian"],
+      target: "灰袍人",
+      allowedTargets: ["灰袍人"],
+      policy: "locked",
+      locked: true,
+      selector: {
+        kind: "block_range",
+        sourceVersion: "source-v1",
+        startBlockId: "block-2",
+        endBlockId: "block-5",
+        startGlobalIndex: 2,
+        endGlobalIndex: 5,
+      },
+      priority: 3,
+    },
+    ownedFields: [
+      "/target",
+      "/allowedTargets",
+      "/selector",
+      "/priority",
+    ],
+    scope: "book",
+    evidence: [],
+    origin: "manual",
+  };
+
+  assert.equal((validateKnowledgeCommand(command) as {
+    fieldPatch: Readonly<Record<string, unknown>>;
+  }).fieldPatch.target, "灰袍人");
+  assert.throws(() => validateKnowledgeCommand({
+    ...command,
+    fieldPatch: {
+      ...command.fieldPatch,
+      selector: {
+        ...command.fieldPatch.selector,
+        startGlobalIndex: 6,
+      },
+    },
+  }), /startGlobalIndex/u);
 });
 
 test("rejects semantically invalid fields for every knowledge object type", () => {

@@ -7,6 +7,7 @@ import {
 } from "../src/knowledge/lexical-concept.js";
 import {
   completeTermUsagesFromTarget,
+  conceptsFromStableTerms,
   expectedTermOccurrences,
   termReceiptSurfaceAccepted,
   termSurfaceAllowed,
@@ -30,6 +31,51 @@ const blocks = [{
   id: "block-1",
   sourceText: "Gregor antwortete dem Prokurist.",
 }];
+
+test("scoped stable terms create receipts only for their resolved blocks", () => {
+  const concepts = conceptsFromStableTerms([{
+    conceptId: "term-default",
+    lexemeId: "term-default-form",
+    sourceForm: "Prokurist",
+    canonicalSource: "Prokurist",
+    target: "主事",
+    locked: true,
+    policy: "locked",
+    semanticClass: "role",
+    allowedTargets: ["主事"],
+    revisionId: "a".repeat(64),
+    renderFingerprint: "b".repeat(64),
+    applicableBlockIds: ["block-0"],
+  }, {
+    conceptId: "term-late",
+    lexemeId: "term-late-form",
+    sourceForm: "Prokurist",
+    canonicalSource: "Prokurist",
+    target: "公司代表",
+    locked: true,
+    policy: "locked",
+    semanticClass: "role",
+    allowedTargets: ["公司代表"],
+    revisionId: "c".repeat(64),
+    renderFingerprint: "d".repeat(64),
+    applicableBlockIds: ["block-1"],
+  }]);
+  const expected = expectedTermOccurrences(
+    blocks,
+    concepts,
+    getSourceLanguageProfile("de"),
+  );
+
+  assert.deepEqual(expected.map((item) => ({
+    blockId: item.blockId,
+    conceptId: item.conceptId,
+    target: item.canonicalTarget,
+  })), [
+    { blockId: "block-0", conceptId: "term-default", target: "主事" },
+    { blockId: "block-0", conceptId: "term-default", target: "主事" },
+    { blockId: "block-1", conceptId: "term-late", target: "公司代表" },
+  ]);
+});
 
 test("nonlocked term receipts record compact actual surfaces without creating a hard lock", () => {
   assert.equal(termReceiptSurfaceAccepted({

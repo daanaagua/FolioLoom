@@ -17,6 +17,7 @@ import {
   type KnowledgeQueryRecord,
 } from "../knowledge/knowledge-query.js";
 import { canonicalClone, canonicalJson } from "../knowledge/knowledge-store.js";
+import { TerminologyControlService } from "../knowledge/terminology-control-service.js";
 import { LOSSLESS_BOOK_SCHEMA_VERSION } from "../storage/book-schema-v3.js";
 import { LosslessBookStore } from "../storage/lossless-book-store.js";
 import type {
@@ -30,6 +31,11 @@ import type {
   DesktopKnowledgeMutationRequest,
   DesktopKnowledgeMutationResult,
   DesktopKnowledgePage,
+  DesktopTerminologyControlState,
+  DesktopPlanTermRetrofitRequest,
+  DesktopApplyTermRetrofitRequest,
+  DesktopTermRetrofitPlan,
+  DesktopTermRetrofitJob,
   DesktopProjectRequest,
   DesktopPromoteKnowledgeRequest,
   DesktopResult,
@@ -183,6 +189,57 @@ function detailForSubject(
   return desktopDetail(detail, records);
 }
 
+function queuedMutationDetail(
+  store: LosslessBookStore,
+  runId: string,
+  request: DesktopKnowledgeMutationRequest,
+): DesktopKnowledgeDetail {
+  try {
+    return detailForSubject(
+      store,
+      runId,
+      request.command.normalizedSubject,
+      request.command.kind,
+    );
+  } catch (error) {
+    if (request.command.type !== "upsert"
+      || !(error instanceof Error)
+      || error.message !== "KNOWLEDGE_NOT_FOUND") {
+      throw error;
+    }
+    const fields = canonicalClone(
+      request.command.fieldPatch,
+    ) as Readonly<Record<string, JsonValue>>;
+    const displayName = [
+      fields.target,
+      fields.canonicalName,
+      fields.targetName,
+      fields.summary,
+      request.command.normalizedSubject,
+    ].find((value): value is string =>
+      typeof value === "string" && value.trim().length > 0)!;
+    return {
+      item: {
+        id: `queued:${request.command.normalizedSubject}:${request.command.kind}`,
+        normalizedSubject: request.command.normalizedSubject,
+        displayName,
+        objectType: request.command.objectType,
+        kind: request.command.kind,
+        revision: (request.command.expectedRevision ?? 0) + 1,
+        scopeRevision: request.command.expectedScopeRevision,
+        status: "active",
+        origin: request.command.origin,
+        scope: request.command.scope,
+      },
+      fields,
+      evidence: desktopEvidence(request.command.evidence),
+      history: [],
+      impacts: [],
+      relations: [],
+    };
+  }
+}
+
 function mutationResult(
   store: LosslessBookStore,
   runId: string,
@@ -191,6 +248,7 @@ function mutationResult(
   kind: string,
 ): DesktopKnowledgeMutationResult {
   return {
+    disposition: "applied",
     generation: commit.generation,
     snapshotId: commit.snapshotId,
     detail: detailForSubject(store, runId, normalizedSubject, kind),
@@ -300,21 +358,92 @@ export class DesktopKnowledgeService {
     request: DesktopKnowledgeMutationRequest,
   ): DesktopResult<DesktopKnowledgeMutationResult> {
     return this.#withCurrentStore("read-write", (store, target) => {
-      const commit = store.commitKnowledgeCommands({
+      const result = new TerminologyControlService(store, target.runId).submit({
         requestId: request.requestId,
-        runId: target.runId,
         expectedGeneration: request.expectedGeneration,
         expectedSnapshotId: request.expectedSnapshotId,
         commands: [request.command],
       });
+      if (result.status === "queued") {
+        const state = store.knowledgeState(target.runId);
+        return {
+          disposition: "queued",
+          generation: state.generation,
+          snapshotId: state.snapshotId,
+          detail: queuedMutationDetail(store, target.runId, request),
+          queueRequestId: result.requestId,
+        };
+      }
+      if (result.status !== "applied"
+        || result.generation === undefined
+        || result.snapshotId === undefined) {
+        throw new Error(result.error ?? `KNOWLEDGE_SUBMISSION_${result.status.toUpperCase()}`);
+      }
       return mutationResult(
         store,
         target.runId,
-        commit,
+        {
+          requestId: result.requestId,
+          generation: result.generation,
+          snapshotId: result.snapshotId,
+          revisionIds: [],
+          bookGeneration: store.knowledgeState(target.runId).appliedBookGeneration,
+          projectGeneration: store.knowledgeState(target.runId).appliedProjectGeneration,
+        },
         request.command.normalizedSubject,
         request.command.kind,
       );
     });
+  }
+
+  terminologyControlState(): DesktopResult<DesktopTerminologyControlState> {
+    return this.#withCurrentStore("read-write", (store, target) => {
+      const control = new TerminologyControlService(store, target.runId);
+      return {
+        queuedChanges: control.queue(),
+        retrofitJobs: control.retrofits(),
+      };
+    });
+  }
+
+  cancelQueuedTerminologyChange(
+    requestId: string,
+  ): DesktopResult<DesktopTerminologyControlState> {
+    return this.#withCurrentStore("read-write", (store, target) => {
+      const control = new TerminologyControlService(store, target.runId);
+      control.cancelQueued(requestId);
+      return {
+        queuedChanges: control.queue(),
+        retrofitJobs: control.retrofits(),
+      };
+    });
+  }
+
+  planTermRetrofit(
+    request: DesktopPlanTermRetrofitRequest,
+  ): DesktopResult<DesktopTermRetrofitPlan> {
+    return this.#withCurrentStore("read-write", (store, target) =>
+      new TerminologyControlService(store, target.runId).planRetrofit(request));
+  }
+
+  applyTermRetrofit(
+    request: DesktopApplyTermRetrofitRequest,
+  ): DesktopResult<DesktopTermRetrofitJob> {
+    return this.#withCurrentStore("read-write", (store, target) =>
+      new TerminologyControlService(store, target.runId).applyRetrofit(
+        request.jobId,
+        request.planHash,
+      ));
+  }
+
+  cancelTermRetrofit(jobId: string): DesktopResult<DesktopTermRetrofitJob> {
+    return this.#withCurrentStore("read-write", (store, target) =>
+      new TerminologyControlService(store, target.runId).cancelRetrofit(jobId));
+  }
+
+  rollbackTermRetrofit(jobId: string): DesktopResult<DesktopTermRetrofitJob> {
+    return this.#withCurrentStore("read-write", (store, target) =>
+      new TerminologyControlService(store, target.runId).rollbackRetrofit(jobId));
   }
 
   promoteGlobal(
@@ -347,6 +476,7 @@ export class DesktopKnowledgeService {
         || state.snapshotId !== request.expectedSnapshotId) {
         if (recordHasGlobalContent(record, global)) {
           return {
+            disposition: "applied",
             generation: state.generation,
             snapshotId: state.snapshotId,
             detail: detailForId(store, target.runId, record.id),
@@ -355,6 +485,7 @@ export class DesktopKnowledgeService {
         throw new Error("KNOWLEDGE_GENERATION_CONFLICT");
       }
       return {
+        disposition: "applied",
         generation: state.generation,
         snapshotId: state.snapshotId,
         detail: detailForId(store, target.runId, record.id),

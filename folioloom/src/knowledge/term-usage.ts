@@ -63,7 +63,9 @@ export type TermConceptProjection = Pick<
   | "canonicalTarget"
   | "allowedRealizations"
   | "policy"
->;
+> & {
+  readonly applicableBlockIds?: readonly string[];
+};
 
 export function conceptsFromStableTerms(
   terms: readonly StableTerm[],
@@ -90,6 +92,15 @@ export function conceptsFromStableTerms(
       grouped.set(term.conceptId, {
         ...previous,
         sourceForms: [...new Set([...previous.sourceForms, term.sourceForm])],
+        ...((previous.applicableBlockIds === undefined
+          && term.applicableBlockIds === undefined)
+          ? {}
+          : {
+            applicableBlockIds: [...new Set([
+              ...(previous.applicableBlockIds ?? []),
+              ...(term.applicableBlockIds ?? []),
+            ])],
+          }),
       });
       continue;
     }
@@ -101,6 +112,9 @@ export function conceptsFromStableTerms(
       canonicalTarget: term.target,
       allowedRealizations: [...term.allowedTargets],
       policy: term.policy,
+      ...(term.applicableBlockIds === undefined
+        ? {}
+        : { applicableBlockIds: [...term.applicableBlockIds] }),
     });
   }
   return [...grouped.values()];

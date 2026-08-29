@@ -24,6 +24,11 @@ import type {
   DesktopKnowledgeMutationRequest,
   DesktopKnowledgeMutationResult,
   DesktopKnowledgePage,
+  DesktopTerminologyControlState,
+  DesktopPlanTermRetrofitRequest,
+  DesktopApplyTermRetrofitRequest,
+  DesktopTermRetrofitPlan,
+  DesktopTermRetrofitJob,
   DesktopPromoteKnowledgeRequest,
   DesktopSuggestKnowledgeImportRequest,
   PendingKnowledgeImport,
@@ -101,6 +106,12 @@ export const DESKTOP_IPC_CHANNELS = [
   "folioloom:knowledge-list",
   "folioloom:knowledge-detail",
   "folioloom:knowledge-mutate",
+  "folioloom:terminology-state",
+  "folioloom:terminology-queue-cancel",
+  "folioloom:terminology-retrofit-plan",
+  "folioloom:terminology-retrofit-apply",
+  "folioloom:terminology-retrofit-cancel",
+  "folioloom:terminology-retrofit-rollback",
   "folioloom:knowledge-promote-global",
   "folioloom:knowledge-global-list",
   "folioloom:knowledge-global-attach",
@@ -236,6 +247,12 @@ export interface DesktopIpcKnowledgeService {
   listGlobal(request: DesktopGlobalKnowledgeListRequest): DesktopResult<DesktopGlobalKnowledgePage>;
   attachGlobal(request: DesktopAttachGlobalKnowledgeRequest): DesktopResult<DesktopKnowledgeMutationResult>;
   diagnostics(): DesktopResult<DesktopKnowledgeDiagnostics>;
+  terminologyControlState(): DesktopResult<DesktopTerminologyControlState>;
+  cancelQueuedTerminologyChange(requestId: string): DesktopResult<DesktopTerminologyControlState>;
+  planTermRetrofit(request: DesktopPlanTermRetrofitRequest): DesktopResult<DesktopTermRetrofitPlan>;
+  applyTermRetrofit(request: DesktopApplyTermRetrofitRequest): DesktopResult<DesktopTermRetrofitJob>;
+  cancelTermRetrofit(jobId: string): DesktopResult<DesktopTermRetrofitJob>;
+  rollbackTermRetrofit(jobId: string): DesktopResult<DesktopTermRetrofitJob>;
 }
 
 export interface DesktopIpcKnowledgeImportService {
@@ -557,6 +574,37 @@ function knowledgeMutationRequest(
     ),
     expectedSnapshotId: snapshotId(input.expectedSnapshotId),
     command: validateKnowledgeCommand(input.command),
+  };
+}
+
+function planTermRetrofitRequest(value: unknown): DesktopPlanTermRetrofitRequest {
+  const input = exactRecord(value, "terminology-retrofit-plan payload", [
+    "requestId",
+    "ruleRevisionId",
+    "expectedGeneration",
+    "expectedSnapshotId",
+  ]);
+  return {
+    requestId: requestId(input.requestId),
+    ruleRevisionId: requiredText(input.ruleRevisionId, "ruleRevisionId"),
+    expectedGeneration: nonnegativeInteger(
+      input.expectedGeneration,
+      "expectedGeneration",
+    ),
+    expectedSnapshotId: snapshotId(input.expectedSnapshotId),
+  };
+}
+
+function applyTermRetrofitRequest(value: unknown): DesktopApplyTermRetrofitRequest {
+  const input = exactRecord(value, "terminology-retrofit-apply payload", [
+    "jobId",
+    "planHash",
+  ]);
+  const planHash = requiredText(input.planHash, "planHash");
+  if (!HASH_ID.test(planHash)) return inputError("planHash is invalid");
+  return {
+    jobId: requiredText(input.jobId, "jobId"),
+    planHash,
   };
 }
 
@@ -1506,6 +1554,36 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   handleTrusted("folioloom:knowledge-mutate", async (_event, ...args) => resultFrom(() =>
     dependencies.knowledgeService.mutate(
       knowledgeMutationRequest(oneArgument(args, "knowledge-mutate")),
+    )));
+
+  handleTrusted("folioloom:terminology-state", async (_event, ...args) => resultFrom(() => {
+    noArguments(args, "terminology-state");
+    return dependencies.knowledgeService.terminologyControlState();
+  }));
+
+  handleTrusted("folioloom:terminology-queue-cancel", async (_event, ...args) => resultFrom(() =>
+    dependencies.knowledgeService.cancelQueuedTerminologyChange(
+      requestId(oneArgument(args, "terminology-queue-cancel")),
+    )));
+
+  handleTrusted("folioloom:terminology-retrofit-plan", async (_event, ...args) => resultFrom(() =>
+    dependencies.knowledgeService.planTermRetrofit(
+      planTermRetrofitRequest(oneArgument(args, "terminology-retrofit-plan")),
+    )));
+
+  handleTrusted("folioloom:terminology-retrofit-apply", async (_event, ...args) => resultFrom(() =>
+    dependencies.knowledgeService.applyTermRetrofit(
+      applyTermRetrofitRequest(oneArgument(args, "terminology-retrofit-apply")),
+    )));
+
+  handleTrusted("folioloom:terminology-retrofit-cancel", async (_event, ...args) => resultFrom(() =>
+    dependencies.knowledgeService.cancelTermRetrofit(
+      requiredText(oneArgument(args, "terminology-retrofit-cancel"), "jobId"),
+    )));
+
+  handleTrusted("folioloom:terminology-retrofit-rollback", async (_event, ...args) => resultFrom(() =>
+    dependencies.knowledgeService.rollbackTermRetrofit(
+      requiredText(oneArgument(args, "terminology-retrofit-rollback"), "jobId"),
     )));
 
   handleTrusted("folioloom:knowledge-promote-global", async (_event, ...args) => resultFrom(() =>

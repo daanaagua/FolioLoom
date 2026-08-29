@@ -121,6 +121,20 @@ import {
   type TermConceptProjection,
   type TermUsageSubmission,
 } from "../knowledge/term-usage.js";
+import { stableTermsFromKnowledge } from "../knowledge/stable-terms-from-knowledge.js";
+import {
+  planTermRetrofit,
+  type TermRetrofitPlan,
+  type TermRetrofitPlanItem,
+  type TermRetrofitSourceBlock,
+} from "../knowledge/term-retrofit.js";
+import {
+  createTermRenderingRule,
+  resolveTermRenderingRule,
+  ruleAppliesToBlock,
+  validateTermRuleSelector,
+  type TermRenderingRule,
+} from "../knowledge/term-rendering-rule.js";
 /*
  * Keep the runtime validators above in the storage commit gate.  A durable
  * replacement must not trust that its caller used the same request harness.
@@ -157,13 +171,21 @@ import {
   LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V3_VERSION,
 } from "./book-schema-v3.js";
 import {
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT as LOSSLESS_BOOK_SCHEMA_V4_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER as LOSSLESS_BOOK_SCHEMA_V4_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES as LOSSLESS_BOOK_SCHEMA_V4_TABLES,
+  LOSSLESS_BOOK_SCHEMA_V4,
+  LOSSLESS_BOOK_SCHEMA_V4_EXTENSION,
+  LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V4_VERSION,
+} from "./book-schema-v4.js";
+import {
   LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
   LOSSLESS_BOOK_SCHEMA_MARKER,
   LOSSLESS_BOOK_SCHEMA_TABLES,
-  LOSSLESS_BOOK_SCHEMA_V4,
-  LOSSLESS_BOOK_SCHEMA_V4_EXTENSION,
+  LOSSLESS_BOOK_SCHEMA_V5,
+  LOSSLESS_BOOK_SCHEMA_V5_EXTENSION,
   LOSSLESS_BOOK_SCHEMA_VERSION,
-} from "./book-schema-v4.js";
+} from "./book-schema-v5.js";
 
 export interface CertifiedSourceRange {
   rangeId: string;
@@ -300,6 +322,93 @@ export interface LexicalConceptChange {
   readonly renderChanged: boolean;
 }
 
+export type KnowledgeChangeQueueStatus =
+  | "queued"
+  | "applying"
+  | "applied"
+  | "rejected"
+  | "cancelled";
+
+export interface KnowledgeChangeQueueRecord {
+  readonly requestId: string;
+  readonly runId: string;
+  readonly baseGeneration: number;
+  readonly baseSnapshotId: string;
+  readonly objectKeys: readonly string[];
+  readonly status: KnowledgeChangeQueueStatus;
+  readonly result: Readonly<Record<string, unknown>>;
+  readonly createdAt: string;
+  readonly appliedAt: string | null;
+}
+
+export interface KnowledgeSubmissionResult {
+  readonly requestId: string;
+  readonly status: "applied" | "queued" | "rejected" | "cancelled";
+  readonly generation?: number;
+  readonly snapshotId?: string;
+  readonly error?: string;
+}
+
+export interface ApplyQueuedKnowledgeChangesReport {
+  readonly applied: number;
+  readonly rejected: number;
+  readonly remaining: number;
+}
+
+export type TermRetrofitJobStatus =
+  | "planned"
+  | "running"
+  | "completed"
+  | "needs_attention"
+  | "failed"
+  | "cancelled"
+  | "rolled_back";
+
+export type TermRetrofitItemStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "needs_attention"
+  | "failed"
+  | "cancelled"
+  | "rolled_back";
+
+export interface PlanStoredTermRetrofitInput {
+  readonly requestId: string;
+  readonly runId: string;
+  readonly ruleRevisionId: string;
+  readonly expectedGeneration: number;
+  readonly expectedSnapshotId: string;
+}
+
+export interface StoredTermRetrofitItem extends TermRetrofitPlanItem {
+  readonly status: TermRetrofitItemStatus;
+  readonly oldTranslationId: number;
+  readonly newTranslationId: number | null;
+  readonly result: Readonly<Record<string, unknown>>;
+}
+
+export interface StoredTermRetrofitJob {
+  readonly jobId: string;
+  readonly requestId: string;
+  readonly runId: string;
+  readonly ruleRevisionId: string;
+  readonly baseGeneration: number;
+  readonly baseSnapshotId: string;
+  readonly planHash: string;
+  readonly status: TermRetrofitJobStatus;
+  readonly summary: TermRetrofitPlan["summary"];
+  readonly items: readonly StoredTermRetrofitItem[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly completedAt: string | null;
+}
+
+export interface StoredTermRetrofitPlan extends TermRetrofitPlan {
+  readonly jobId: string;
+  readonly requestId: string;
+}
+
 export interface StoredLexicalConcept extends LexicalConcept {
   readonly revision: number;
 }
@@ -410,6 +519,7 @@ export type FaultCheckpoint =
   | "knowledge_import_stage_before_commit"
   | "knowledge_import_before_commit"
   | "knowledge_import_rollback_before_commit"
+  | "schema_v5_before_commit"
   | "schema_v3_before_commit"
   | "schema_v4_before_commit";
 
@@ -581,6 +691,10 @@ export interface LosslessAuditState {
   conceptBindings: LosslessAuditConceptBinding[];
   missingConceptBindings: LosslessAuditMissingConceptBinding[];
   revalidationTasks: KnowledgeRevalidationTask[];
+  queuedKnowledgeChangeCount: number;
+  pendingActiveTermImpactCount: number;
+  openTermRetrofitItemCount: number;
+  attentionTermRetrofitItemCount: number;
 }
 
 type LosslessStoreOpenMode = "read-write" | "read-only";
@@ -867,6 +981,10 @@ interface LexicalConceptRow {
   confidence: number;
   render_fingerprint: string;
   active: number;
+  rule_id: string | null;
+  base_concept_id: string | null;
+  authority_rank: number;
+  applicability_json: string;
 }
 
 interface TranslationConceptBindingRow {
@@ -892,6 +1010,43 @@ interface KnowledgeRevalidationTaskRow {
   attempts: number;
   result_json: string;
   replacement_translation_id: number | null;
+}
+
+interface TermRetrofitJobRow {
+  job_id: string;
+  run_id: string;
+  request_id: string;
+  rule_revision_id: string;
+  base_generation: number;
+  base_snapshot_id: string;
+  plan_hash: string;
+  status: TermRetrofitJobStatus;
+  plan_json: string;
+  error_json: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+interface TermRetrofitItemRow {
+  job_id: string;
+  ordinal: number;
+  source_version: string;
+  block_id: string;
+  old_translation_id: number;
+  classification: TermRetrofitPlanItem["classification"];
+  status: TermRetrofitItemStatus;
+  new_translation_id: number | null;
+  result_json: string;
+  updated_at: string;
+}
+
+interface PersistedTermRetrofitPlanEnvelope {
+  readonly schema: "folioloom-term-retrofit-job-plan-1";
+  readonly rule: TermRenderingRule;
+  readonly plan: Omit<TermRetrofitPlan, "items"> & {
+    readonly items: readonly Omit<TermRetrofitPlanItem, "replacementText">[];
+  };
 }
 
 function all<T>(statement: StatementSync, ...values: any[]): T[] {
@@ -941,6 +1096,73 @@ function jsonText(value: unknown, label: string): string {
 
 function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function termRuleProjectionFromRevision(
+  revision: KnowledgeRevision,
+): { rule: TermRenderingRule; concept: LexicalConcept } {
+  const terms = stableTermsFromKnowledge([revision]).filter((term) =>
+    term.ruleId !== undefined && term.baseConceptId !== undefined);
+  const first = terms[0];
+  if (first === undefined
+    || first.ruleId === undefined
+    || first.baseConceptId === undefined
+    || first.revisionId === undefined
+    || first.renderFingerprint === undefined
+    || first.applicability === undefined
+    || first.authorityRank === undefined) {
+    throw new Error(
+      `TERM_RULE_REVISION_INVALID: ${revision.revisionId}`,
+    );
+  }
+  if (terms.some((term) =>
+    term.conceptId !== first.conceptId
+    || term.revisionId !== first.revisionId
+    || term.renderFingerprint !== first.renderFingerprint
+    || term.target !== first.target)) {
+    throw new Error(
+      `TERM_RULE_REVISION_INCONSISTENT: ${revision.revisionId}`,
+    );
+  }
+  const sourceForms = [...new Set(terms.map((term) => term.sourceForm))];
+  const rule = createTermRenderingRule({
+    ruleId: first.ruleId,
+    conceptId: first.baseConceptId,
+    ...(first.entityId === undefined ? {} : { entityId: first.entityId }),
+    sourceForms,
+    target: first.target,
+    allowedTargets: first.allowedTargets ?? [first.target],
+    policy: first.policy ?? (first.locked ? "locked" : "preferred"),
+    selector: first.applicability,
+    priority: first.priority ?? 0,
+    authorityRank: first.authorityRank,
+  });
+  return {
+    rule,
+    concept: Object.freeze({
+      conceptId: first.conceptId,
+      revisionId: first.revisionId,
+      normalizedSubject: revision.normalizedSubject,
+      sourceForms: Object.freeze(sourceForms),
+      semanticClass: first.semanticClass ?? "technical_term",
+      canonicalTarget: first.target,
+      policy: rule.policy,
+      allowedRealizations: Object.freeze([...rule.allowedTargets]),
+      confidence: 1,
+      visibility: "translator_global",
+      renderFingerprint: first.renderFingerprint,
+    }),
+  };
+}
+
+function sanitizedTermRetrofitPlan(
+  plan: TermRetrofitPlan,
+): PersistedTermRetrofitPlanEnvelope["plan"] {
+  return {
+    ...plan,
+    items: plan.items.map(({ replacementText: _replacementText, ...item }) =>
+      Object.freeze(item)),
+  };
 }
 
 function knowledgeRecordId(normalizedSubject: string, kind: string): string {
@@ -1464,6 +1686,7 @@ export class LosslessBookStore {
         if (mode === "read-write") {
           this.#migrateV2ToV3();
           this.#migrateV3ToV4();
+          this.#migrateV4ToV5();
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
         } else {
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V2_VERSION;
@@ -1472,12 +1695,21 @@ export class LosslessBookStore {
         this.#verifyV3Schema(userVersion, tables);
         if (mode === "read-write") {
           this.#migrateV3ToV4();
+          this.#migrateV4ToV5();
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
         } else {
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V3_VERSION;
         }
-      } else {
+      } else if (userVersion === LOSSLESS_BOOK_SCHEMA_V4_VERSION) {
         this.#verifyV4Schema(userVersion, tables);
+        if (mode === "read-write") {
+          this.#migrateV4ToV5();
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
+        } else {
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V4_VERSION;
+        }
+      } else {
+        this.#verifyV5Schema(userVersion, tables);
         this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
       }
       if (mode === "read-write") {
@@ -2876,11 +3108,11 @@ export class LosslessBookStore {
       throw new Error(`unknown knowledge snapshot ${runId}/${toSnapshotId}`);
     }
     return this.#transaction(() => {
-      const concepts = all<LexicalConceptRow>(this.#database.prepare(`
+      const conceptRows = all<LexicalConceptRow>(this.#database.prepare(`
         SELECT * FROM lexical_concepts
         WHERE run_id=? AND active=1
         ORDER BY concept_id
-      `), runId).map(lexicalConceptFromRow);
+      `), runId);
       const sourcePayload = JSON.parse(
         this.#source(run.source_version).source_payload_json,
       ) as { sourceLanguage?: unknown };
@@ -2889,16 +3121,35 @@ export class LosslessBookStore {
           ? sourcePayload.sourceLanguage
           : undefined,
       );
-      const blocks = all<{ block_id: string; source_text: string }>(
+      const storedBlocks = all<{
+        block_id: string;
+        source_text: string;
+        global_index: number;
+      }>(
         this.#database.prepare(`
-          SELECT block_id, source_text FROM logical_blocks
+          SELECT block_id, source_text, global_index FROM logical_blocks
           WHERE source_version=? ORDER BY global_index
         `),
         run.source_version,
-      ).map((block) => ({
+      );
+      const blocks = storedBlocks.map((block) => ({
         blockId: block.block_id,
         sourceText: block.source_text,
       }));
+      const concepts = conceptRows.map((row) => {
+        const concept = lexicalConceptFromRow(row);
+        if (row.rule_id === null) return concept;
+        const selector = validateTermRuleSelector(
+          JSON.parse(row.applicability_json) as unknown,
+        );
+        const applicableBlockIds = storedBlocks.filter((block) =>
+          selector.kind === "whole_book"
+          || (selector.sourceVersion === run.source_version
+            && block.global_index >= selector.startGlobalIndex
+            && block.global_index <= selector.endGlobalIndex))
+          .map((block) => block.block_id);
+        return { ...concept, applicableBlockIds };
+      });
       const occurrences = buildConceptOccurrenceIndex(
         blocks,
         concepts,
@@ -4779,6 +5030,731 @@ export class LosslessBookStore {
     });
   }
 
+  submitKnowledgeCommands(
+    input: CommitKnowledgeCommandsRequest | unknown,
+  ): KnowledgeSubmissionResult {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v5 write upgrade required");
+    }
+    const request = validateCommitKnowledgeCommandsRequest(input);
+    const requestHash = knowledgeCommandRequestHash(request);
+    const existing = one<{
+      request_hash: string;
+      status: KnowledgeChangeQueueStatus;
+      result_json: string;
+    }>(this.#database.prepare(`
+      SELECT request_hash, status, result_json
+      FROM knowledge_change_queue
+      WHERE run_id=? AND request_id=?
+    `), request.runId, request.requestId);
+    if (existing !== undefined) {
+      if (existing.request_hash !== requestHash) {
+        throw new Error("KNOWLEDGE_REQUEST_REUSE_CONFLICT");
+      }
+      const result = JSON.parse(existing.result_json) as {
+        commit?: KnowledgeCommitResult;
+        error?: string;
+      };
+      return {
+        requestId: request.requestId,
+        status: existing.status === "applying" ? "queued" : existing.status,
+        ...(result.commit === undefined
+          ? {}
+          : {
+            generation: result.commit.generation,
+            snapshotId: result.commit.snapshotId,
+          }),
+        ...(result.error === undefined ? {} : { error: result.error }),
+      };
+    }
+    try {
+      const commit = this.commitKnowledgeCommands(request);
+      return {
+        requestId: request.requestId,
+        status: "applied",
+        generation: commit.generation,
+        snapshotId: commit.snapshotId,
+      };
+    } catch (error) {
+      if (!(error instanceof Error)
+        || !error.message.startsWith("KNOWLEDGE_EDIT_BUSY")) {
+        throw error;
+      }
+    }
+
+    return this.#transaction(() => {
+      const state = this.knowledgeState(request.runId);
+      if (state.generation !== request.expectedGeneration
+        || state.snapshotId !== request.expectedSnapshotId) {
+        throw new Error(
+          "KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed; reload before saving",
+        );
+      }
+      const objectKeys = [...new Set(request.commands.map((command) =>
+        knowledgeKey(command.normalizedSubject, command.kind)))].sort(compareText);
+      const active = all<{ object_keys_json: string }>(this.#database.prepare(`
+        SELECT object_keys_json FROM knowledge_change_queue
+        WHERE run_id=? AND status IN ('queued','applying')
+      `), request.runId).flatMap((row) => {
+        const parsed = JSON.parse(row.object_keys_json) as unknown;
+        return Array.isArray(parsed)
+          ? parsed.filter((value): value is string => typeof value === "string")
+          : [];
+      });
+      if (objectKeys.some((key) => active.includes(key))) {
+        throw new Error(
+          "KNOWLEDGE_QUEUE_OBJECT_CONFLICT: cancel or wait for the earlier edit",
+        );
+      }
+      this.#database.prepare(`
+        INSERT INTO knowledge_change_queue(
+          request_id, run_id, request_hash, base_generation,
+          base_snapshot_id, object_keys_json, commands_json, status
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'queued')
+      `).run(
+        request.requestId,
+        request.runId,
+        requestHash,
+        request.expectedGeneration,
+        request.expectedSnapshotId,
+        jsonText(objectKeys, "knowledge queue object keys"),
+        jsonText(request, "knowledge queue request"),
+      );
+      this.#appendEvent(request.runId, "knowledge_change_queued", {
+        requestId: request.requestId,
+        requestHash,
+        objectKeys,
+        baseGeneration: request.expectedGeneration,
+        baseSnapshotId: request.expectedSnapshotId,
+      });
+      return { requestId: request.requestId, status: "queued" };
+    });
+  }
+
+  queuedKnowledgeChanges(runId: string): KnowledgeChangeQueueRecord[] {
+    this.#run(runId);
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    return all<{
+      request_id: string;
+      run_id: string;
+      base_generation: number;
+      base_snapshot_id: string;
+      object_keys_json: string;
+      status: KnowledgeChangeQueueStatus;
+      result_json: string;
+      created_at: string;
+      applied_at: string | null;
+    }>(this.#database.prepare(`
+      SELECT request_id, run_id, base_generation, base_snapshot_id,
+             object_keys_json, status, result_json, created_at, applied_at
+      FROM knowledge_change_queue
+      WHERE run_id=? AND status IN ('queued','applying')
+      ORDER BY created_at, request_id
+    `), runId).map((row) => ({
+      requestId: row.request_id,
+      runId: row.run_id,
+      baseGeneration: row.base_generation,
+      baseSnapshotId: row.base_snapshot_id,
+      objectKeys: JSON.parse(row.object_keys_json) as string[],
+      status: row.status,
+      result: JSON.parse(row.result_json) as Record<string, unknown>,
+      createdAt: row.created_at,
+      appliedAt: row.applied_at,
+    }));
+  }
+
+  applyQueuedKnowledgeChanges(
+    runId: string,
+  ): ApplyQueuedKnowledgeChangesReport {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v5 write upgrade required");
+    }
+    this.#run(runId);
+    const busy = one<{ count: number }>(this.#database.prepare(`
+      SELECT COUNT(*) AS count FROM window_plans
+      WHERE run_id=? AND status IN ('running','staged')
+    `), runId)?.count ?? 0;
+    if (busy > 0) {
+      return {
+        applied: 0,
+        rejected: 0,
+        remaining: this.queuedKnowledgeChanges(runId).length,
+      };
+    }
+
+    const requestIds = all<{ request_id: string }>(this.#database.prepare(`
+      SELECT request_id FROM knowledge_change_queue
+      WHERE run_id=? AND status IN ('queued','applying')
+      ORDER BY created_at, request_id
+    `), runId).map((row) => row.request_id);
+    let applied = 0;
+    let rejected = 0;
+    for (const requestId of requestIds) {
+      let effective = this.#transaction(() => {
+        const row = one<{
+          status: KnowledgeChangeQueueStatus;
+          commands_json: string;
+          result_json: string;
+        }>(this.#database.prepare(`
+          SELECT status, commands_json, result_json
+          FROM knowledge_change_queue
+          WHERE run_id=? AND request_id=?
+        `), runId, requestId);
+        if (row === undefined
+          || row.status === "applied"
+          || row.status === "rejected"
+          || row.status === "cancelled") {
+          return undefined;
+        }
+        if (row.status === "applying") {
+          const result = JSON.parse(row.result_json) as {
+            effectiveRequest?: CommitKnowledgeCommandsRequest;
+          };
+          if (result.effectiveRequest === undefined) {
+            throw new Error("corrupt applying knowledge queue request");
+          }
+          return validateCommitKnowledgeCommandsRequest(result.effectiveRequest);
+        }
+        const original = validateCommitKnowledgeCommandsRequest(
+          JSON.parse(row.commands_json),
+        );
+        const state = this.knowledgeState(runId);
+        const rebased = validateCommitKnowledgeCommandsRequest({
+          ...original,
+          expectedGeneration: state.generation,
+          expectedSnapshotId: state.snapshotId,
+        });
+        const changed = this.#database.prepare(`
+          UPDATE knowledge_change_queue
+          SET status='applying', result_json=?
+          WHERE run_id=? AND request_id=? AND status='queued'
+        `).run(
+          jsonText(
+            { effectiveRequest: rebased },
+            "applying knowledge queue request",
+          ),
+          runId,
+          requestId,
+        );
+        if (Number(changed.changes) !== 1) {
+          throw new Error("KNOWLEDGE_QUEUE_STATE_CONFLICT");
+        }
+        return rebased;
+      });
+      if (effective === undefined) continue;
+      try {
+        const commit = this.commitKnowledgeCommands(effective);
+        this.#transaction(() => {
+          this.#database.prepare(`
+            UPDATE knowledge_change_queue
+            SET status='applied', result_json=?, applied_at=datetime('now')
+            WHERE run_id=? AND request_id=? AND status='applying'
+          `).run(
+            jsonText({ commit }, "applied knowledge queue result"),
+            runId,
+            requestId,
+          );
+          this.#appendEvent(runId, "knowledge_change_applied", {
+            requestId,
+            generation: commit.generation,
+            snapshotId: commit.snapshotId,
+          });
+        });
+        applied += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.startsWith("KNOWLEDGE_EDIT_BUSY")) {
+          this.#database.prepare(`
+            UPDATE knowledge_change_queue
+            SET status='queued', result_json='{}'
+            WHERE run_id=? AND request_id=? AND status='applying'
+          `).run(runId, requestId);
+          break;
+        }
+        this.#transaction(() => {
+          this.#database.prepare(`
+            UPDATE knowledge_change_queue
+            SET status='rejected', result_json=?, applied_at=datetime('now')
+            WHERE run_id=? AND request_id=? AND status='applying'
+          `).run(
+            jsonText({ error: message.slice(0, 1_000) }, "rejected knowledge queue result"),
+            runId,
+            requestId,
+          );
+          this.#appendEvent(runId, "knowledge_change_rejected", {
+            requestId,
+            error: message.slice(0, 1_000),
+          });
+        });
+        rejected += 1;
+      } finally {
+        effective = undefined;
+      }
+    }
+    return {
+      applied,
+      rejected,
+      remaining: this.queuedKnowledgeChanges(runId).length,
+    };
+  }
+
+  cancelQueuedKnowledgeChange(runId: string, requestId: string): boolean {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v5 write upgrade required");
+    }
+    this.#run(runId);
+    requireNonempty(requestId, "requestId");
+    return this.#transaction(() => {
+      const changed = this.#database.prepare(`
+        UPDATE knowledge_change_queue
+        SET status='cancelled', applied_at=datetime('now')
+        WHERE run_id=? AND request_id=? AND status='queued'
+      `).run(runId, requestId);
+      if (Number(changed.changes) === 1) {
+        this.#appendEvent(runId, "knowledge_change_cancelled", { requestId });
+        return true;
+      }
+      return false;
+    });
+  }
+
+  planTermRetrofitJob(
+    input: PlanStoredTermRetrofitInput,
+  ): StoredTermRetrofitPlan {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v5 write upgrade required");
+    }
+    const requestId = requireNonempty(input.requestId, "retrofit requestId");
+    const runId = requireNonempty(input.runId, "retrofit runId");
+    const ruleRevisionId = requireNonempty(
+      input.ruleRevisionId,
+      "retrofit ruleRevisionId",
+    );
+    requireSafeInteger(
+      input.expectedGeneration,
+      "retrofit expectedGeneration",
+    );
+    const expectedSnapshotId = requireNonempty(
+      input.expectedSnapshotId,
+      "retrofit expectedSnapshotId",
+    );
+    return this.#transaction(() => {
+      const existing = one<TermRetrofitJobRow>(this.#database.prepare(`
+        SELECT * FROM term_retrofit_jobs WHERE run_id=? AND request_id=?
+      `), runId, requestId);
+      if (existing !== undefined) {
+        if (existing.rule_revision_id !== ruleRevisionId
+          || existing.base_generation !== input.expectedGeneration
+          || existing.base_snapshot_id !== expectedSnapshotId) {
+          throw new Error("TERM_RETROFIT_REQUEST_REUSE_CONFLICT");
+        }
+        const envelope = this.#termRetrofitPlanEnvelope(existing);
+        return Object.freeze({
+          ...envelope.plan,
+          jobId: existing.job_id,
+          requestId: existing.request_id,
+        });
+      }
+      const state = this.knowledgeState(runId);
+      if (state.generation !== input.expectedGeneration
+        || state.snapshotId !== expectedSnapshotId) {
+        throw new Error(
+          "TERM_RETROFIT_PLAN_STALE: knowledge state changed before planning",
+        );
+      }
+      const { rule } = this.#activeTermRuleProjection(
+        runId,
+        ruleRevisionId,
+      );
+      this.#validateTermRuleRange(runId, rule);
+      const plan = this.#calculateTermRetrofitPlan(
+        runId,
+        ruleRevisionId,
+        state.generation,
+        state.snapshotId,
+        rule,
+      );
+      const jobId = `retrofit-${hashText([
+        runId,
+        requestId,
+        plan.planHash,
+      ].join("\0")).slice(0, 32)}`;
+      const envelope: PersistedTermRetrofitPlanEnvelope = {
+        schema: "folioloom-term-retrofit-job-plan-1",
+        rule,
+        plan: sanitizedTermRetrofitPlan(plan),
+      };
+      this.#database.prepare(`
+        INSERT INTO term_retrofit_jobs(
+          job_id, run_id, request_id, rule_revision_id, base_generation,
+          base_snapshot_id, plan_hash, status, plan_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'planned', ?)
+      `).run(
+        jobId,
+        runId,
+        requestId,
+        ruleRevisionId,
+        state.generation,
+        state.snapshotId,
+        plan.planHash,
+        jsonText(envelope, "term retrofit plan envelope"),
+      );
+      const insertItem = this.#database.prepare(`
+        INSERT INTO term_retrofit_items(
+          job_id, ordinal, source_version, block_id, old_translation_id,
+          classification, status
+        ) VALUES(?, ?, ?, ?, ?, ?, 'pending')
+      `);
+      for (const item of plan.items) {
+        insertItem.run(
+          jobId,
+          item.ordinal,
+          item.sourceVersion,
+          item.blockId,
+          item.translationId,
+          item.classification,
+        );
+      }
+      this.#appendEvent(runId, "term_retrofit_planned", {
+        jobId,
+        requestId,
+        ruleRevisionId,
+        planHash: plan.planHash,
+        summary: plan.summary,
+      });
+      return Object.freeze({ ...plan, jobId, requestId });
+    });
+  }
+
+  applyTermRetrofitJob(
+    runId: string,
+    jobId: string,
+    expectedPlanHash: string,
+  ): StoredTermRetrofitJob {
+    requireNonempty(runId, "runId");
+    requireNonempty(jobId, "retrofit jobId");
+    requireNonempty(expectedPlanHash, "retrofit expectedPlanHash");
+    const current = this.termRetrofitJob(runId, jobId);
+    if (current.planHash !== expectedPlanHash) {
+      throw new Error("TERM_RETROFIT_PLAN_HASH_MISMATCH");
+    }
+    if (current.status === "completed" || current.status === "running") {
+      return current;
+    }
+    if (current.status !== "planned") {
+      throw new Error(`TERM_RETROFIT_JOB_NOT_APPLICABLE: ${current.status}`);
+    }
+    this.#transaction(() => {
+      const row = this.#termRetrofitJobRow(runId, jobId);
+      const envelope = this.#termRetrofitPlanEnvelope(row);
+      const state = this.knowledgeState(runId);
+      if (state.generation !== row.base_generation
+        || state.snapshotId !== row.base_snapshot_id) {
+        throw new Error(
+          "TERM_RETROFIT_PLAN_STALE: knowledge state changed before apply",
+        );
+      }
+      const projection = this.#activeTermRuleProjection(
+        runId,
+        row.rule_revision_id,
+      );
+      if (canonicalJson(projection.rule) !== canonicalJson(envelope.rule)) {
+        throw new Error("TERM_RETROFIT_RULE_CHANGED");
+      }
+      const recomputed = this.#calculateTermRetrofitPlan(
+        runId,
+        row.rule_revision_id,
+        row.base_generation,
+        row.base_snapshot_id,
+        projection.rule,
+      );
+      if (recomputed.planHash !== row.plan_hash
+        || recomputed.planHash !== expectedPlanHash) {
+        throw new Error(
+          "TERM_RETROFIT_PLAN_STALE: active translations changed before apply",
+        );
+      }
+      this.#database.prepare(`
+        UPDATE term_retrofit_jobs
+        SET status='running', updated_at=datetime('now')
+        WHERE run_id=? AND job_id=? AND status='planned'
+      `).run(runId, jobId);
+      this.#projectTermRetrofitConcept(
+        runId,
+        projection.rule,
+        projection.concept,
+      );
+
+      const modelItems: TermRetrofitPlanItem[] = [];
+      for (const item of recomputed.items) {
+        if (item.classification === "noop") {
+          this.#attachTermRetrofitBinding(
+            runId,
+            item,
+            projection.rule,
+            projection.concept,
+            item.translationId,
+            undefined,
+          );
+          this.#finishTermRetrofitItem(
+            jobId,
+            item.ordinal,
+            "completed",
+            null,
+            { reason: item.reason },
+          );
+          this.#setKnowledgeImpactStatus(
+            runId,
+            row.rule_revision_id,
+            item.blockId,
+            "acknowledged",
+          );
+          continue;
+        }
+        if (item.classification === "local_repair") {
+          const replacementText = item.replacementText;
+          if (replacementText === undefined) {
+            throw new Error("TERM_RETROFIT_REPLACEMENT_MISSING");
+          }
+          const replacementTranslationId = this.#replaceTermRetrofitTranslation(
+            runId,
+            item,
+            replacementText,
+            projection.rule,
+            projection.concept,
+          );
+          this.#finishTermRetrofitItem(
+            jobId,
+            item.ordinal,
+            "completed",
+            replacementTranslationId,
+            {
+              reason: item.reason,
+              replacementHash: hashText(replacementText),
+            },
+          );
+          this.#setKnowledgeImpactStatus(
+            runId,
+            row.rule_revision_id,
+            item.blockId,
+            "acknowledged",
+          );
+          continue;
+        }
+        if (item.classification === "model_retranslate") {
+          modelItems.push(item);
+          continue;
+        }
+        this.#finishTermRetrofitItem(
+          jobId,
+          item.ordinal,
+          "needs_attention",
+          null,
+          { reason: item.reason },
+        );
+      }
+
+      if (modelItems.length > 0) {
+        this.#scheduleTermRetrofitRevalidation(
+          runId,
+          jobId,
+          row.base_snapshot_id,
+          projection.concept,
+          modelItems,
+        );
+      }
+      const unresolved = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM term_retrofit_items
+        WHERE job_id=? AND status IN ('pending','running')
+      `), jobId)?.count ?? 0;
+      const attention = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM term_retrofit_items
+        WHERE job_id=? AND status IN ('needs_attention','failed')
+      `), jobId)?.count ?? 0;
+      const status: TermRetrofitJobStatus = attention > 0
+        ? "needs_attention"
+        : unresolved > 0
+          ? "running"
+          : "completed";
+      this.#database.prepare(`
+        UPDATE term_retrofit_jobs
+        SET status=?, updated_at=datetime('now'),
+            completed_at=CASE WHEN ?='completed' THEN datetime('now') ELSE NULL END
+        WHERE run_id=? AND job_id=?
+      `).run(status, status, runId, jobId);
+      this.#appendEvent(runId, "term_retrofit_started", {
+        jobId,
+        planHash: row.plan_hash,
+        status,
+      });
+    });
+    return this.termRetrofitJob(runId, jobId);
+  }
+
+  termRetrofitJob(runId: string, jobId: string): StoredTermRetrofitJob {
+    requireNonempty(runId, "runId");
+    requireNonempty(jobId, "retrofit jobId");
+    this.#refreshTermRetrofitJob(runId, jobId);
+    const row = this.#termRetrofitJobRow(runId, jobId);
+    const envelope = this.#termRetrofitPlanEnvelope(row);
+    const itemByOrdinal = new Map(envelope.plan.items.map((item) => [
+      item.ordinal,
+      item,
+    ]));
+    const items = all<TermRetrofitItemRow>(this.#database.prepare(`
+      SELECT * FROM term_retrofit_items
+      WHERE job_id=? ORDER BY ordinal
+    `), jobId).map((item): StoredTermRetrofitItem => {
+      const planned = itemByOrdinal.get(item.ordinal);
+      if (planned === undefined
+        || planned.blockId !== item.block_id
+        || planned.translationId !== item.old_translation_id
+        || planned.classification !== item.classification) {
+        throw new Error(`corrupt term retrofit item ${jobId}/${item.ordinal}`);
+      }
+      return Object.freeze({
+        ...planned,
+        status: item.status,
+        oldTranslationId: item.old_translation_id,
+        newTranslationId: item.new_translation_id,
+        result: JSON.parse(item.result_json) as Record<string, unknown>,
+      });
+    });
+    return Object.freeze({
+      jobId: row.job_id,
+      requestId: row.request_id,
+      runId: row.run_id,
+      ruleRevisionId: row.rule_revision_id,
+      baseGeneration: row.base_generation,
+      baseSnapshotId: row.base_snapshot_id,
+      planHash: row.plan_hash,
+      status: row.status,
+      summary: envelope.plan.summary,
+      items: Object.freeze(items),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at,
+    });
+  }
+
+  termRetrofitJobs(runId: string): StoredTermRetrofitJob[] {
+    this.#run(runId);
+    return all<{ job_id: string }>(this.#database.prepare(`
+      SELECT job_id FROM term_retrofit_jobs
+      WHERE run_id=? ORDER BY created_at, job_id
+    `), runId).map((row) => this.termRetrofitJob(runId, row.job_id));
+  }
+
+  refreshTermRetrofitJobs(runId: string): StoredTermRetrofitJob[] {
+    return this.termRetrofitJobs(runId);
+  }
+
+  cancelTermRetrofitJob(runId: string, jobId: string): StoredTermRetrofitJob {
+    const current = this.termRetrofitJob(runId, jobId);
+    if (current.status === "cancelled") return current;
+    if (current.status !== "planned") {
+      throw new Error(`TERM_RETROFIT_JOB_NOT_CANCELLABLE: ${current.status}`);
+    }
+    this.#transaction(() => {
+      const cancelled = this.#database.prepare(`
+        UPDATE term_retrofit_jobs
+        SET status='cancelled', updated_at=datetime('now'),
+            completed_at=datetime('now')
+        WHERE run_id=? AND job_id=? AND status='planned'
+      `).run(runId, jobId);
+      if (Number(cancelled.changes) !== 1) {
+        throw new Error("TERM_RETROFIT_JOB_STATE_CONFLICT");
+      }
+      this.#database.prepare(`
+        UPDATE term_retrofit_items
+        SET status='cancelled', updated_at=datetime('now')
+        WHERE job_id=? AND status='pending'
+      `).run(jobId);
+      this.#appendEvent(runId, "term_retrofit_cancelled", { jobId });
+    });
+    return this.termRetrofitJob(runId, jobId);
+  }
+
+  rollbackTermRetrofitJob(
+    runId: string,
+    jobId: string,
+  ): StoredTermRetrofitJob {
+    const current = this.termRetrofitJob(runId, jobId);
+    if (current.status === "rolled_back") return current;
+    if (current.status !== "completed"
+      && current.status !== "needs_attention") {
+      throw new Error(`TERM_RETROFIT_JOB_NOT_ROLLBACKABLE: ${current.status}`);
+    }
+    this.#transaction(() => {
+      const row = this.#termRetrofitJobRow(runId, jobId);
+      const rolledBackRuleRevisionId = this.#rollbackTermRuleForRetrofit(
+        runId,
+        row.rule_revision_id,
+      );
+      for (const item of all<TermRetrofitItemRow>(this.#database.prepare(`
+        SELECT * FROM term_retrofit_items
+        WHERE job_id=? ORDER BY ordinal DESC
+      `), jobId)) {
+        if (item.new_translation_id !== null) {
+          const replacement = one<{ active: number }>(this.#database.prepare(`
+            SELECT active FROM translations
+            WHERE run_id=? AND translation_id=?
+          `), runId, item.new_translation_id);
+          if (replacement?.active !== 1) {
+            throw new Error(
+              `TERM_RETROFIT_ROLLBACK_STALE: block ${item.block_id} changed later`,
+            );
+          }
+          this.#database.prepare(`
+            UPDATE translations SET active=0
+            WHERE run_id=? AND translation_id=? AND active=1
+          `).run(runId, item.new_translation_id);
+          const restored = this.#database.prepare(`
+            UPDATE translations SET active=1
+            WHERE run_id=? AND translation_id=? AND active=0
+          `).run(runId, item.old_translation_id);
+          if (Number(restored.changes) !== 1) {
+            throw new Error(
+              `TERM_RETROFIT_ROLLBACK_FAILED: ${item.block_id}`,
+            );
+          }
+        } else {
+          const envelope = this.#termRetrofitPlanEnvelope(row);
+          const conceptId = termRuleProjectionFromRevision(
+            this.#knowledgeRevisionById(runId, row.rule_revision_id),
+          ).concept.conceptId;
+          this.#database.prepare(`
+            DELETE FROM translation_concept_bindings
+            WHERE translation_id=? AND concept_id=?
+          `).run(item.old_translation_id, conceptId);
+        }
+        this.#database.prepare(`
+          UPDATE term_retrofit_items
+          SET status='rolled_back', updated_at=datetime('now')
+          WHERE job_id=? AND ordinal=?
+        `).run(jobId, item.ordinal);
+        this.#setKnowledgeImpactStatus(
+          runId,
+          row.rule_revision_id,
+          item.block_id,
+          "acknowledged",
+        );
+      }
+      this.#database.prepare(`
+        UPDATE term_retrofit_jobs
+        SET status='rolled_back', updated_at=datetime('now'),
+            completed_at=datetime('now')
+        WHERE run_id=? AND job_id=?
+      `).run(runId, jobId);
+      this.#appendEvent(runId, "term_retrofit_rolled_back", {
+        jobId,
+        ruleRevisionId: row.rule_revision_id,
+        rolledBackRuleRevisionId,
+      });
+    });
+    return this.termRetrofitJob(runId, jobId);
+  }
+
   commitKnowledgeCommands(
     input: CommitKnowledgeCommandsRequest | unknown,
   ): KnowledgeCommitResult {
@@ -4841,11 +5817,22 @@ export class LosslessBookStore {
       let projectChanged = false;
       for (const command of request.commands) {
         const result = this.#applyKnowledgeCommand(run, domain, command);
+        if (result.revision.status === "active"
+          && result.revision.kind.startsWith("term_rendering_rule:")) {
+          this.#validateTermRuleRange(
+            request.runId,
+            termRuleProjectionFromRevision(result.revision).rule,
+          );
+        }
         revisionIds.push(result.revision.revisionId);
         this.#insertKnowledgeImpactsForRevision(run, result.revision);
         bookChanged ||= result.bookChanged;
         projectChanged ||= result.projectChanged;
       }
+      this.#validateActiveTermRuleConflicts(
+        request.runId,
+        domain.projectableRevisions(),
+      );
 
       const parentSnapshot = this.latestKnowledgeSnapshot(request.runId);
       const snapshot = createKnowledgeSnapshot(
@@ -5729,6 +6716,46 @@ export class LosslessBookStore {
           conceptId: row.concept_id,
         }))
       : [];
+    const queuedKnowledgeChangeCount = this.#schemaVersion
+      === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? one<{ count: number }>(this.#database.prepare(`
+          SELECT COUNT(*) AS count FROM knowledge_change_queue
+          WHERE run_id=? AND status IN ('queued','applying')
+        `), runId)?.count ?? 0
+      : 0;
+    const pendingActiveTermImpactCount = this.#schemaVersion
+      === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? one<{ count: number }>(this.#database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM knowledge_block_impacts AS impact
+          JOIN knowledge_records AS record
+            ON record.run_id=impact.run_id
+           AND record.revision_id=impact.revision_id
+           AND record.active=1
+          WHERE impact.run_id=? AND impact.status='pending'
+            AND record.kind LIKE 'term_rendering_rule:%'
+        `), runId)?.count ?? 0
+      : 0;
+    const openTermRetrofitItemCount = this.#schemaVersion
+      === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? one<{ count: number }>(this.#database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM term_retrofit_items AS item
+          JOIN term_retrofit_jobs AS job ON job.job_id=item.job_id
+          WHERE job.run_id=? AND job.status NOT IN ('cancelled','rolled_back')
+            AND item.status IN ('pending','running')
+        `), runId)?.count ?? 0
+      : 0;
+    const attentionTermRetrofitItemCount = this.#schemaVersion
+      === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? one<{ count: number }>(this.#database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM term_retrofit_items AS item
+          JOIN term_retrofit_jobs AS job ON job.job_id=item.job_id
+          WHERE job.run_id=? AND job.status NOT IN ('cancelled','rolled_back')
+            AND item.status IN ('needs_attention','failed')
+        `), runId)?.count ?? 0
+      : 0;
     return {
       runId: run.run_id,
       sourceVersion: run.source_version,
@@ -5747,6 +6774,10 @@ export class LosslessBookStore {
       conceptBindings,
       missingConceptBindings,
       revalidationTasks: this.revalidationTasks(runId),
+      queuedKnowledgeChangeCount,
+      pendingActiveTermImpactCount,
+      openTermRetrofitItemCount,
+      attentionTermRetrofitItemCount,
     };
   }
 
@@ -5993,7 +7024,7 @@ export class LosslessBookStore {
   #initializeSchema(): void {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
-      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V4);
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V5);
       this.#database.prepare(`
         INSERT INTO project_knowledge_state(singleton, generation) VALUES(1, 0)
       `).run();
@@ -6064,12 +7095,12 @@ export class LosslessBookStore {
 
   #verifyV4Schema(userVersion: number, tables: readonly string[]): void {
     this.#verifyNoLegacySchema(tables);
-    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_V4_VERSION) {
       throw new Error(
-        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_V4_VERSION}`,
       );
     }
-    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    const expected = [...LOSSLESS_BOOK_SCHEMA_V4_TABLES];
     if (tables.length !== expected.length
       || tables.some((table, index) => table !== expected[index])) {
       throw new Error("schema v4 table set is incomplete or contains unknown tables");
@@ -6080,9 +7111,33 @@ export class LosslessBookStore {
         WHERE key IN ('marker', 'fingerprint')
       `),
     ).map((row) => [row.key, row.value]));
+    if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_V4_MARKER
+      || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_V4_FINGERPRINT) {
+      throw new Error("schema v4 marker or fingerprint mismatch");
+    }
+  }
+
+  #verifyV5Schema(userVersion: number, tables: readonly string[]): void {
+    this.#verifyNoLegacySchema(tables);
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error(
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+      );
+    }
+    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    if (tables.length !== expected.length
+      || tables.some((table, index) => table !== expected[index])) {
+      throw new Error("schema v5 table set is incomplete or contains unknown tables");
+    }
+    const markers = new Map(all<{ key: string; value: string }>(
+      this.#database.prepare(`
+        SELECT key, value FROM lossless_schema_meta
+        WHERE key IN ('marker', 'fingerprint')
+      `),
+    ).map((row) => [row.key, row.value]));
     if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_MARKER
       || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_FINGERPRINT) {
-      throw new Error("schema v4 marker or fingerprint mismatch");
+      throw new Error("schema v5 marker or fingerprint mismatch");
     }
   }
 
@@ -6136,10 +7191,28 @@ export class LosslessBookStore {
       const updateMarker = this.#database.prepare(`
         UPDATE lossless_schema_meta SET value=? WHERE key=?
       `);
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_V4_MARKER, "marker");
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_V4_FINGERPRINT, "fingerprint");
+      this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_V4_VERSION}`);
+      this.#faultInjector?.checkpoint("schema_v4_before_commit");
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #migrateV4ToV5(): void {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V5_EXTENSION);
+      const updateMarker = this.#database.prepare(`
+        UPDATE lossless_schema_meta SET value=? WHERE key=?
+      `);
       updateMarker.run(LOSSLESS_BOOK_SCHEMA_MARKER, "marker");
       updateMarker.run(LOSSLESS_BOOK_SCHEMA_FINGERPRINT, "fingerprint");
       this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_VERSION}`);
-      this.#faultInjector?.checkpoint("schema_v4_before_commit");
+      this.#faultInjector?.checkpoint("schema_v5_before_commit");
       this.#database.exec("COMMIT");
     } catch (error) {
       this.#database.exec("ROLLBACK");
@@ -6536,6 +7609,836 @@ export class LosslessBookStore {
       );
     }
     return decision;
+  }
+
+  #knowledgeRevisionById(
+    runId: string,
+    revisionId: string,
+  ): KnowledgeRevision {
+    const revision = this.knowledgeRevisions(runId).find((candidate) =>
+      candidate.revisionId === revisionId);
+    if (revision === undefined) {
+      throw new Error(`unknown knowledge revision ${runId}/${revisionId}`);
+    }
+    return revision;
+  }
+
+  #rollbackTermRuleForRetrofit(
+    runId: string,
+    revisionId: string,
+  ): string {
+    const run = this.#run(runId);
+    const state = this.knowledgeState(runId);
+    const domain = new KnowledgeStore(this.knowledgeRevisions(runId));
+    const current = domain.projectableRevisions().find((revision) =>
+      revision.revisionId === revisionId);
+    if (current === undefined
+      || !current.kind.startsWith("term_rendering_rule:")) {
+      throw new Error(`TERM_RETROFIT_RULE_NOT_CURRENT: ${revisionId}`);
+    }
+    const entries = this.#activeCatalogEntries(
+      run,
+      current.normalizedSubject,
+      current.kind,
+    );
+    if (entries.length !== 1) {
+      throw new Error("TERM_RETROFIT_RULE_CATALOG_CONFLICT");
+    }
+    const entry = entries[0]!;
+    const previous = domain.listRevisions()
+      .filter((candidate) =>
+        candidate.normalizedSubject === current.normalizedSubject
+        && candidate.kind === current.kind
+        && candidate.revision < current.revision)
+      .sort((left, right) => right.revision - left.revision)[0];
+    let result: AppliedKnowledgeCommand;
+    if (previous !== undefined) {
+      result = this.#applyRollbackKnowledgeCommand(run, domain, {
+        type: "rollback",
+        normalizedSubject: current.normalizedSubject,
+        kind: current.kind,
+        expectedRevision: current.revision,
+        expectedScopeRevision: {
+          scope: entry.document.authority.scope,
+          revision: entry.row.revision,
+        },
+        targetRevision: previous.revision,
+      });
+    } else {
+      const authority = normalizeKnowledgeAuthority({
+        origin: "rollback",
+        scope: entry.document.authority.scope,
+        ownedFields: entry.document.authority.ownedFields,
+      });
+      const catalog = this.#appendCatalogRevision(
+        run,
+        {
+          ...entry.document,
+          status: "superseded",
+          authority,
+        },
+        false,
+      );
+      const retired = domain.appendRevision({
+        normalizedSubject: current.normalizedSubject,
+        kind: current.kind,
+        payload: current.payload,
+        alternatives: current.alternatives,
+        status: "superseded",
+        candidateIds: current.candidateIds,
+        sourceWindowIds: current.sourceWindowIds,
+        authority: normalizeKnowledgeAuthority({
+          ...authority,
+          provenance: {
+            catalog: authority.scope === "project" ? "project" : "book",
+            catalogRevisionId: catalog.revision_id,
+          },
+        }),
+      });
+      this.#insertRunKnowledgeRevision(
+        runId,
+        retired,
+        null,
+        entry.document.evidence,
+        undefined,
+      );
+      result = {
+        revision: retired,
+        bookChanged: authority.scope !== "project",
+        projectChanged: authority.scope === "project",
+      };
+    }
+
+    const parent = this.latestKnowledgeSnapshot(runId);
+    const snapshot = createKnowledgeSnapshot(
+      runId,
+      domain.projectableRevisions(),
+      parent.id,
+    );
+    this.#database.prepare(`
+      INSERT INTO knowledge_snapshots(
+        run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+        content_hash, payload_json
+      ) VALUES(?, ?, ?, NULL, ?, ?)
+    `).run(
+      runId,
+      snapshot.id,
+      parent.id,
+      snapshot.contentHash,
+      jsonText(snapshot, "term retrofit rollback snapshot"),
+    );
+    let bookGeneration = state.appliedBookGeneration;
+    if (result.bookChanged) {
+      this.#database.prepare(`
+        UPDATE book_knowledge_state
+        SET generation=generation+1, updated_at=datetime('now')
+        WHERE source_version=?
+      `).run(run.source_version);
+      bookGeneration += 1;
+    }
+    let projectGeneration = state.appliedProjectGeneration;
+    if (result.projectChanged) {
+      this.#database.prepare(`
+        UPDATE project_knowledge_state
+        SET generation=generation+1, updated_at=datetime('now')
+        WHERE singleton=1
+      `).run();
+      projectGeneration += 1;
+    }
+    const updated = this.#database.prepare(`
+      UPDATE knowledge_state
+      SET generation=?, applied_book_generation=?,
+          applied_project_generation=?, updated_at=datetime('now')
+      WHERE run_id=? AND generation=?
+    `).run(
+      state.generation + 1,
+      bookGeneration,
+      projectGeneration,
+      runId,
+      state.generation,
+    );
+    if (Number(updated.changes) !== 1) {
+      throw new Error("KNOWLEDGE_GENERATION_CONFLICT");
+    }
+    const currentProjection = termRuleProjectionFromRevision(current);
+    if (result.revision.status === "active") {
+      const previousProjection = termRuleProjectionFromRevision(result.revision);
+      this.#projectTermRetrofitConcept(
+        runId,
+        previousProjection.rule,
+        previousProjection.concept,
+      );
+    } else {
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=? AND concept_id=?
+      `).run(runId, currentProjection.concept.conceptId);
+      this.#database.prepare(`
+        UPDATE lexical_concepts SET active=0
+        WHERE run_id=? AND concept_id=? AND active=1
+      `).run(runId, currentProjection.concept.conceptId);
+      this.#database.prepare(`
+        DELETE FROM translation_concept_bindings
+        WHERE concept_id=? AND translation_id IN (
+          SELECT translation_id FROM translations WHERE run_id=? AND active=1
+        )
+      `).run(currentProjection.concept.conceptId, runId);
+    }
+    return result.revision.revisionId;
+  }
+
+  #activeTermRuleProjection(
+    runId: string,
+    revisionId: string,
+  ): { rule: TermRenderingRule; concept: LexicalConcept } {
+    const revision = this.#knowledgeRevisionById(runId, revisionId);
+    if (revision.status !== "active"
+      || !revision.kind.startsWith("term_rendering_rule:")) {
+      throw new Error(`TERM_RULE_REVISION_NOT_ACTIVE: ${revisionId}`);
+    }
+    return termRuleProjectionFromRevision(revision);
+  }
+
+  #validateTermRuleRange(runId: string, rule: TermRenderingRule): void {
+    if (rule.selector.kind === "whole_book") return;
+    const selector = rule.selector;
+    const run = this.#run(runId);
+    if (selector.sourceVersion !== run.source_version) {
+      throw new Error("TERM_RULE_SOURCE_VERSION_MISMATCH");
+    }
+    const endpoints = all<{
+      block_id: string;
+      global_index: number;
+    }>(this.#database.prepare(`
+      SELECT block_id, global_index FROM logical_blocks
+      WHERE source_version=? AND block_id IN (?, ?)
+      ORDER BY global_index, block_id
+    `),
+    selector.sourceVersion,
+    selector.startBlockId,
+    selector.endBlockId);
+    const start = endpoints.find((endpoint) =>
+      endpoint.block_id === selector.startBlockId);
+    const end = endpoints.find((endpoint) =>
+      endpoint.block_id === selector.endBlockId);
+    if (start === undefined || end === undefined
+      || start.global_index !== selector.startGlobalIndex
+      || end.global_index !== selector.endGlobalIndex
+      || start.global_index > end.global_index) {
+      throw new Error("TERM_RULE_BLOCK_RANGE_INVALID");
+    }
+  }
+
+  #validateActiveTermRuleConflicts(
+    runId: string,
+    revisions: readonly KnowledgeRevision[],
+  ): void {
+    const rules = revisions
+      .filter((revision) =>
+        revision.status === "active"
+        && revision.kind.startsWith("term_rendering_rule:"))
+      .map((revision) => termRuleProjectionFromRevision(revision).rule);
+    if (rules.length < 2) return;
+    for (const rule of rules) this.#validateTermRuleRange(runId, rule);
+    const run = this.#run(runId);
+    const payload = JSON.parse(
+      this.#source(run.source_version).source_payload_json,
+    ) as { sourceLanguage?: unknown };
+    const profile = getSourceLanguageProfile(
+      typeof payload.sourceLanguage === "string"
+        ? payload.sourceLanguage
+        : undefined,
+    );
+    const blocks = all<{
+      block_id: string;
+      global_index: number;
+    }>(this.#database.prepare(`
+      SELECT block_id, global_index FROM logical_blocks
+      WHERE source_version=? ORDER BY global_index, block_id
+    `), run.source_version);
+    const forms = [...new Set(rules.flatMap((rule) => rule.sourceForms)
+      .map((form) => profile.normalizeSourceForm(form)))];
+    for (const block of blocks) {
+      for (const form of forms) {
+        resolveTermRenderingRule(rules, form, {
+          sourceVersion: run.source_version,
+          blockId: block.block_id,
+          globalIndex: block.global_index,
+        });
+      }
+    }
+  }
+
+  #termRetrofitSourceBlocks(runId: string): TermRetrofitSourceBlock[] {
+    const rows = all<{
+      translation_id: number;
+      block_id: string;
+      source_version: string;
+      global_index: number;
+      source_text: string;
+      text: string;
+    }>(this.#database.prepare(`
+      SELECT t.translation_id, t.block_id, t.source_version, b.global_index,
+             b.source_text, t.text
+      FROM translations AS t
+      JOIN logical_blocks AS b
+        ON b.source_version=t.source_version AND b.block_id=t.block_id
+      WHERE t.run_id=? AND t.active=1
+      ORDER BY b.global_index, t.block_id
+    `), runId);
+    const usageRows = all<{
+      translation_id: number;
+      term_usages_json: string;
+    }>(this.#database.prepare(`
+      SELECT binding.translation_id, binding.term_usages_json
+      FROM translation_concept_bindings AS binding
+      JOIN translations AS translation
+        ON translation.translation_id=binding.translation_id
+      WHERE translation.run_id=? AND translation.active=1
+      ORDER BY binding.translation_id, binding.concept_id
+    `), runId);
+    const usagesByTranslation = new Map<number, TermUsageSubmission[]>();
+    for (const row of usageRows) {
+      const usages = usagesByTranslation.get(row.translation_id) ?? [];
+      usages.push(...termUsagesFromJson(row.term_usages_json));
+      usagesByTranslation.set(row.translation_id, usages);
+    }
+    return rows.map((row) => ({
+      blockId: row.block_id,
+      sourceVersion: row.source_version,
+      globalIndex: row.global_index,
+      sourceText: row.source_text,
+      translationId: row.translation_id,
+      translationText: row.text,
+      termUsages: usagesByTranslation.get(row.translation_id) ?? [],
+    }));
+  }
+
+  #calculateTermRetrofitPlan(
+    runId: string,
+    ruleRevisionId: string,
+    baseGeneration: number,
+    baseSnapshotId: string,
+    rule: TermRenderingRule,
+  ): TermRetrofitPlan {
+    const run = this.#run(runId);
+    const sourcePayload = JSON.parse(
+      this.#source(run.source_version).source_payload_json,
+    ) as { sourceLanguage?: unknown };
+    return planTermRetrofit({
+      runId,
+      ruleRevisionId,
+      baseGeneration,
+      baseSnapshotId,
+      rule,
+      blocks: this.#termRetrofitSourceBlocks(runId),
+      profile: getSourceLanguageProfile(
+        typeof sourcePayload.sourceLanguage === "string"
+          ? sourcePayload.sourceLanguage
+          : undefined,
+      ),
+    });
+  }
+
+  #termRetrofitJobRow(runId: string, jobId: string): TermRetrofitJobRow {
+    const row = one<TermRetrofitJobRow>(this.#database.prepare(`
+      SELECT * FROM term_retrofit_jobs WHERE run_id=? AND job_id=?
+    `), runId, jobId);
+    if (row === undefined) {
+      throw new Error(`unknown term retrofit job ${runId}/${jobId}`);
+    }
+    return row;
+  }
+
+  #termRetrofitPlanEnvelope(
+    row: TermRetrofitJobRow,
+  ): PersistedTermRetrofitPlanEnvelope {
+    const parsed = JSON.parse(row.plan_json) as PersistedTermRetrofitPlanEnvelope;
+    if (parsed.schema !== "folioloom-term-retrofit-job-plan-1"
+      || parsed.plan.runId !== row.run_id
+      || parsed.plan.ruleRevisionId !== row.rule_revision_id
+      || parsed.plan.planHash !== row.plan_hash
+      || parsed.plan.baseGeneration !== row.base_generation
+      || parsed.plan.baseSnapshotId !== row.base_snapshot_id
+      || !Array.isArray(parsed.plan.items)) {
+      throw new Error(`corrupt term retrofit plan ${row.job_id}`);
+    }
+    return parsed;
+  }
+
+  #projectTermRetrofitConcept(
+    runId: string,
+    rule: TermRenderingRule,
+    concept: LexicalConcept,
+  ): ConceptOccurrence[] {
+    this.#upsertLexicalConceptRows(runId, [concept]);
+    this.#database.prepare(`
+      UPDATE lexical_concepts
+      SET rule_id=?, base_concept_id=?, authority_rank=?, applicability_json=?
+      WHERE run_id=? AND concept_id=? AND revision_id=?
+    `).run(
+      rule.ruleId,
+      rule.conceptId,
+      rule.authorityRank,
+      jsonText(rule.selector, "term rule applicability"),
+      runId,
+      concept.conceptId,
+      concept.revisionId,
+    );
+    const run = this.#run(runId);
+    const source = this.#source(run.source_version);
+    const sourcePayload = JSON.parse(source.source_payload_json) as {
+      sourceLanguage?: unknown;
+    };
+    const blocks = all<{
+      block_id: string;
+      source_text: string;
+      global_index: number;
+    }>(this.#database.prepare(`
+      SELECT block_id, source_text, global_index FROM logical_blocks
+      WHERE source_version=? ORDER BY global_index, block_id
+    `), run.source_version);
+    const applicableBlockIds = blocks.filter((block) =>
+      ruleAppliesToBlock(rule, {
+        sourceVersion: run.source_version,
+        blockId: block.block_id,
+        globalIndex: block.global_index,
+      })).map((block) => block.block_id);
+    const occurrences = buildConceptOccurrenceIndex(
+      blocks.map((block) => ({
+        blockId: block.block_id,
+        sourceText: block.source_text,
+      })),
+      [{
+        conceptId: concept.conceptId,
+        sourceForms: concept.sourceForms,
+        applicableBlockIds,
+      }],
+      getSourceLanguageProfile(
+        typeof sourcePayload.sourceLanguage === "string"
+          ? sourcePayload.sourceLanguage
+          : undefined,
+      ),
+    );
+    this.#database.prepare(`
+      DELETE FROM concept_occurrences WHERE run_id=? AND concept_id=?
+    `).run(runId, concept.conceptId);
+    const insert = this.#database.prepare(`
+      INSERT INTO concept_occurrences(
+        run_id, concept_id, source_version, block_id,
+        occurrence_count, source_spans_json
+      ) VALUES(?, ?, ?, ?, ?, ?)
+    `);
+    for (const occurrence of occurrences) {
+      insert.run(
+        runId,
+        occurrence.conceptId,
+        run.source_version,
+        occurrence.blockId,
+        occurrence.sourceSpans.length,
+        jsonText(occurrence.sourceSpans, "term retrofit occurrence spans"),
+      );
+    }
+    return occurrences;
+  }
+
+  #termRetrofitUsages(
+    runId: string,
+    item: TermRetrofitPlanItem,
+    rule: TermRenderingRule,
+    concept: LexicalConcept,
+    translationId: number,
+    forcedTarget: string | undefined,
+  ): TermUsageSubmission[] {
+    const row = one<{ source_text: string; text: string }>(
+      this.#database.prepare(`
+        SELECT block.source_text, translation.text
+        FROM translations AS translation
+        JOIN logical_blocks AS block
+          ON block.source_version=translation.source_version
+         AND block.block_id=translation.block_id
+        WHERE translation.run_id=? AND translation.translation_id=?
+          AND translation.block_id=?
+      `),
+      runId,
+      translationId,
+      item.blockId,
+    );
+    if (row === undefined) {
+      throw new Error(`missing retrofit translation ${translationId}`);
+    }
+    const profile = getSourceLanguageProfile((() => {
+      const run = this.#run(runId);
+      const payload = JSON.parse(
+        this.#source(run.source_version).source_payload_json,
+      ) as { sourceLanguage?: unknown };
+      return typeof payload.sourceLanguage === "string"
+        ? payload.sourceLanguage
+        : undefined;
+    })());
+    const oldUsages = all<{ term_usages_json: string }>(this.#database.prepare(`
+      SELECT term_usages_json FROM translation_concept_bindings
+      WHERE translation_id=? ORDER BY concept_id
+    `), item.translationId).flatMap((binding) =>
+      termUsagesFromJson(binding.term_usages_json));
+    const normalizedForms = new Set(rule.sourceForms.map((form) =>
+      profile.normalizeSourceForm(form)));
+    const expected = expectedTermOccurrences(
+      [{ id: item.blockId, sourceText: row.source_text }],
+      [concept],
+      profile,
+    );
+    const usages = expected.map((occurrence): TermUsageSubmission => {
+      const previous = oldUsages.find((usage) =>
+        usage.blockId === item.blockId
+        && (item.receiptConceptId === undefined
+          || usage.conceptId === item.receiptConceptId)
+        && usage.sourceStart === occurrence.sourceStart
+        && usage.sourceEnd === occurrence.sourceEnd
+        && normalizedForms.has(profile.normalizeSourceForm(usage.sourceForm)));
+      const targetSurface = forcedTarget
+        ?? (previous !== undefined
+          && rule.allowedTargets.includes(previous.targetSurface)
+          && row.text.includes(previous.targetSurface)
+            ? previous.targetSurface
+            : rule.target);
+      return {
+        occurrenceId: occurrence.occurrenceId,
+        blockId: occurrence.blockId,
+        conceptId: occurrence.conceptId,
+        sourceForm: occurrence.sourceForm,
+        sourceStart: occurrence.sourceStart,
+        sourceEnd: occurrence.sourceEnd,
+        discourseRole: previous?.discourseRole ?? "other",
+        targetSurface,
+      };
+    });
+    const failures = validateTermUsages(
+      expected,
+      usages,
+      new Map([[item.blockId, row.text]]),
+    );
+    if (failures.length > 0) {
+      throw new Error(
+        `TERM_RETROFIT_USAGE_INVALID: ${failures
+          .map((failure) => failure.code)
+          .join(",")}`,
+      );
+    }
+    return usages;
+  }
+
+  #attachTermRetrofitBinding(
+    runId: string,
+    item: TermRetrofitPlanItem,
+    rule: TermRenderingRule,
+    concept: LexicalConcept,
+    translationId: number,
+    forcedTarget: string | undefined,
+  ): void {
+    const usages = this.#termRetrofitUsages(
+      runId,
+      item,
+      rule,
+      concept,
+      translationId,
+      forcedTarget,
+    );
+    this.#database.prepare(`
+      INSERT OR REPLACE INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json, validation_status,
+        validated_revision_id, updated_at
+      ) VALUES(?, ?, ?, ?, ?, 'clean', ?, datetime('now'))
+    `).run(
+      translationId,
+      concept.conceptId,
+      concept.revisionId,
+      concept.renderFingerprint,
+      jsonText(usages, "term retrofit usages"),
+      concept.revisionId,
+    );
+  }
+
+  #replaceTermRetrofitTranslation(
+    runId: string,
+    item: TermRetrofitPlanItem,
+    replacementText: string,
+    rule: TermRenderingRule,
+    concept: LexicalConcept,
+  ): number {
+    const current = one<{
+      translation_id: number;
+      window_id: string;
+      source_version: string;
+      source_hash: string;
+      text: string;
+      result_status: string;
+      snapshot_id: string;
+      version: number;
+    }>(this.#database.prepare(`
+      SELECT translation_id, window_id, source_version, source_hash, text,
+             result_status, snapshot_id, version
+      FROM translations
+      WHERE run_id=? AND block_id=? AND active=1 AND stage_state='promoted'
+    `), runId, item.blockId);
+    if (current === undefined || current.translation_id !== item.translationId) {
+      throw new Error(`TERM_RETROFIT_PLAN_STALE: ${item.blockId}`);
+    }
+    const nextVersion = one<{ version: number }>(this.#database.prepare(`
+      SELECT COALESCE(MAX(version), 0) + 1 AS version
+      FROM translations WHERE run_id=? AND block_id=?
+    `), runId, item.blockId)?.version;
+    if (nextVersion === undefined) {
+      throw new Error(`failed to allocate retrofit version for ${item.blockId}`);
+    }
+    const inserted = this.#database.prepare(`
+      INSERT INTO translations(
+        run_id, window_id, source_version, block_id, version, source_hash,
+        text, result_status, stage_state, active, snapshot_id
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'promoted', 0, ?)
+    `).run(
+      runId,
+      current.window_id,
+      current.source_version,
+      item.blockId,
+      nextVersion,
+      current.source_hash,
+      replacementText,
+      current.result_status,
+      this.knowledgeState(runId).snapshotId,
+    );
+    const replacementTranslationId = Number(inserted.lastInsertRowid);
+    if (!Number.isSafeInteger(replacementTranslationId)
+      || replacementTranslationId < 1) {
+      throw new Error(`failed to create retrofit version for ${item.blockId}`);
+    }
+    const profile = getSourceLanguageProfile((() => {
+      const payload = JSON.parse(
+        this.#source(current.source_version).source_payload_json,
+      ) as { sourceLanguage?: unknown };
+      return typeof payload.sourceLanguage === "string"
+        ? payload.sourceLanguage
+        : undefined;
+    })());
+    const normalizedForms = new Set(rule.sourceForms.map((form) =>
+      profile.normalizeSourceForm(form)));
+    const oldBindings = all<TranslationConceptBindingRow>(this.#database.prepare(`
+      SELECT * FROM translation_concept_bindings
+      WHERE translation_id=? ORDER BY concept_id
+    `), current.translation_id);
+    const copyBinding = this.#database.prepare(`
+      INSERT INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json, validation_status,
+        validated_revision_id
+      ) VALUES(?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const binding of oldBindings) {
+      if (binding.concept_id === concept.conceptId) continue;
+      const usages = termUsagesFromJson(binding.term_usages_json).map((usage) =>
+        usage.blockId === item.blockId
+        && usage.conceptId === item.receiptConceptId
+        && normalizedForms.has(profile.normalizeSourceForm(usage.sourceForm))
+          ? { ...usage, targetSurface: rule.target }
+          : usage);
+      copyBinding.run(
+        replacementTranslationId,
+        binding.concept_id,
+        binding.applied_revision_id,
+        binding.applied_render_fingerprint,
+        jsonText(usages, "copied term retrofit usages"),
+        binding.validation_status,
+        binding.validated_revision_id,
+      );
+    }
+    this.#attachTermRetrofitBinding(
+      runId,
+      item,
+      rule,
+      concept,
+      replacementTranslationId,
+      rule.target,
+    );
+    const deactivated = this.#database.prepare(`
+      UPDATE translations SET active=0
+      WHERE run_id=? AND translation_id=? AND active=1
+    `).run(runId, current.translation_id);
+    const activated = this.#database.prepare(`
+      UPDATE translations SET active=1
+      WHERE run_id=? AND translation_id=? AND active=0
+    `).run(runId, replacementTranslationId);
+    if (Number(deactivated.changes) !== 1 || Number(activated.changes) !== 1) {
+      throw new Error(`failed to activate retrofit version for ${item.blockId}`);
+    }
+    this.#appendEvent(runId, "term_retrofit_local_repair", {
+      blockId: item.blockId,
+      oldTranslationId: current.translation_id,
+      replacementTranslationId,
+      oldTextHash: hashText(current.text),
+      newTextHash: hashText(replacementText),
+    });
+    return replacementTranslationId;
+  }
+
+  #scheduleTermRetrofitRevalidation(
+    runId: string,
+    jobId: string,
+    snapshotId: string,
+    concept: LexicalConcept,
+    items: readonly TermRetrofitPlanItem[],
+  ): void {
+    const blockIds = new Set(items.map((item) => item.blockId));
+    const occurrences = this.conceptOccurrences(runId, concept.conceptId)
+      .filter((occurrence) => blockIds.has(occurrence.blockId));
+    this.#createSparseRevalidationTasks(
+      runId,
+      [concept],
+      occurrences,
+      snapshotId,
+    );
+    for (const item of items) {
+      const task = all<KnowledgeRevalidationTaskRow>(this.#database.prepare(`
+        SELECT * FROM knowledge_revalidation_tasks
+        WHERE run_id=? AND translation_id=?
+          AND status IN ('pending','validating')
+        ORDER BY created_at DESC, task_id DESC
+      `), runId, item.translationId).map(revalidationTaskFromRow).find((candidate) =>
+        candidate.conceptIds.includes(concept.conceptId));
+      if (task === undefined) {
+        throw new Error(`failed to schedule retrofit revalidation ${item.blockId}`);
+      }
+      this.#finishTermRetrofitItem(
+        jobId,
+        item.ordinal,
+        "running",
+        null,
+        { reason: item.reason, revalidationTaskId: task.taskId },
+      );
+    }
+  }
+
+  #finishTermRetrofitItem(
+    jobId: string,
+    ordinal: number,
+    status: TermRetrofitItemStatus,
+    newTranslationId: number | null,
+    result: Readonly<Record<string, unknown>>,
+  ): void {
+    const updated = this.#database.prepare(`
+      UPDATE term_retrofit_items
+      SET status=?, new_translation_id=?, result_json=?,
+          updated_at=datetime('now')
+      WHERE job_id=? AND ordinal=? AND status IN ('pending','running')
+    `).run(
+      status,
+      newTranslationId,
+      jsonText(result, "term retrofit item result"),
+      jobId,
+      ordinal,
+    );
+    if (Number(updated.changes) !== 1) {
+      throw new Error(`TERM_RETROFIT_ITEM_STATE_CONFLICT: ${jobId}/${ordinal}`);
+    }
+  }
+
+  #setKnowledgeImpactStatus(
+    runId: string,
+    revisionId: string,
+    blockId: string,
+    status: "pending" | "acknowledged" | "retranslated",
+  ): void {
+    this.#database.prepare(`
+      UPDATE knowledge_block_impacts SET status=?
+      WHERE run_id=? AND revision_id=? AND block_id=?
+    `).run(status, runId, revisionId, blockId);
+  }
+
+  #refreshTermRetrofitJob(runId: string, jobId: string): void {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return;
+    const initial = one<TermRetrofitJobRow>(this.#database.prepare(`
+      SELECT * FROM term_retrofit_jobs WHERE run_id=? AND job_id=?
+    `), runId, jobId);
+    if (initial === undefined || initial.status !== "running") return;
+    this.#transaction(() => {
+      const row = this.#termRetrofitJobRow(runId, jobId);
+      if (row.status !== "running") return;
+      const items = all<TermRetrofitItemRow>(this.#database.prepare(`
+        SELECT * FROM term_retrofit_items
+        WHERE job_id=? AND status='running' ORDER BY ordinal
+      `), jobId);
+      for (const item of items) {
+        const result = JSON.parse(item.result_json) as {
+          revalidationTaskId?: unknown;
+        };
+        if (typeof result.revalidationTaskId !== "string") continue;
+        const task = one<KnowledgeRevalidationTaskRow>(this.#database.prepare(`
+          SELECT * FROM knowledge_revalidation_tasks
+          WHERE run_id=? AND task_id=?
+        `), runId, result.revalidationTaskId);
+        if (task === undefined) {
+          this.#finishTermRetrofitItem(
+            jobId,
+            item.ordinal,
+            "failed",
+            null,
+            { reason: "revalidation_task_missing" },
+          );
+          continue;
+        }
+        if ([
+          "resolved_noop",
+          "resolved_repair",
+          "resolved_retranslate",
+        ].includes(task.status)) {
+          this.#finishTermRetrofitItem(
+            jobId,
+            item.ordinal,
+            "completed",
+            task.replacement_translation_id,
+            {
+              revalidationTaskId: task.task_id,
+              revalidationStatus: task.status,
+            },
+          );
+          this.#setKnowledgeImpactStatus(
+            runId,
+            row.rule_revision_id,
+            item.block_id,
+            "retranslated",
+          );
+        } else if (task.status === "completed_with_warning") {
+          this.#finishTermRetrofitItem(
+            jobId,
+            item.ordinal,
+            "needs_attention",
+            task.replacement_translation_id,
+            {
+              revalidationTaskId: task.task_id,
+              revalidationStatus: task.status,
+            },
+          );
+        }
+      }
+      const active = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM term_retrofit_items
+        WHERE job_id=? AND status IN ('pending','running')
+      `), jobId)?.count ?? 0;
+      if (active > 0) return;
+      const attention = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM term_retrofit_items
+        WHERE job_id=? AND status IN ('needs_attention','failed')
+      `), jobId)?.count ?? 0;
+      const status = attention > 0 ? "needs_attention" : "completed";
+      this.#database.prepare(`
+        UPDATE term_retrofit_jobs
+        SET status=?, updated_at=datetime('now'), completed_at=datetime('now')
+        WHERE run_id=? AND job_id=? AND status='running'
+      `).run(status, runId, jobId);
+      this.#appendEvent(runId, "term_retrofit_finished", {
+        jobId,
+        status,
+      });
+    });
   }
 
   #projectLexicalConceptRevisions(

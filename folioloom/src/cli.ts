@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -77,6 +77,8 @@ import { importSource } from "./source/source-importer.js";
 import { annotateStructure } from "./source/structure-annotator.js";
 import { LosslessBookStore } from "./storage/lossless-book-store.js";
 import { RuntimeProfileStore } from "./storage/runtime-profile-store.js";
+import { validateCommitKnowledgeCommandsRequest } from "./knowledge/knowledge-commands.js";
+import { TerminologyControlService } from "./knowledge/terminology-control-service.js";
 import {
   loadStyleProfile,
   type LoadedStyleProfile,
@@ -93,7 +95,15 @@ export type CliCommand =
   | "book-migrate-v1"
   | "book-run"
   | "book-status"
-  | "book-export";
+  | "book-export"
+  | "book-knowledge-list"
+  | "book-knowledge-term-upsert"
+  | "book-knowledge-queue-status"
+  | "book-knowledge-queue-cancel"
+  | "book-retrofit-plan"
+  | "book-retrofit-apply"
+  | "book-retrofit-status"
+  | "book-retrofit-rollback";
 
 export interface CliOptions {
   command: CliCommand;
@@ -134,6 +144,11 @@ export interface CliOptions {
   codexContextWindow?: number;
   codexMaxOutputTokens?: number;
   codexExecutable?: string;
+  input?: string;
+  requestId?: string;
+  revisionId?: string;
+  jobId?: string;
+  planHash?: string;
 }
 
 export interface BookDoctorReport {
@@ -644,6 +659,108 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     );
   }
   const action = argv[1];
+  if (action === "knowledge") {
+    const operation = argv[2];
+    if (operation === "list" || operation === "queue-status") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        `book knowledge ${operation}`,
+        ["--store", "--run"],
+      );
+      return {
+        command: operation === "list"
+          ? "book-knowledge-list"
+          : "book-knowledge-queue-status",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+      };
+    }
+    if (operation === "term-upsert") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        "book knowledge term-upsert",
+        ["--store", "--run", "--input"],
+      );
+      return {
+        command: "book-knowledge-term-upsert",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+        input: pathValue(values, "--input"),
+      };
+    }
+    if (operation === "queue-cancel") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        "book knowledge queue-cancel",
+        ["--store", "--run", "--request"],
+      );
+      return {
+        command: "book-knowledge-queue-cancel",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+        requestId: identifierValue(values, "--request", true),
+      };
+    }
+    throw new Error(`unknown book knowledge action: ${String(operation)}`);
+  }
+  if (action === "retrofit") {
+    const operation = argv[2];
+    if (operation === "plan") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        "book retrofit plan",
+        ["--store", "--run", "--revision", "--request"],
+      );
+      return {
+        command: "book-retrofit-plan",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+        revisionId: identifierValue(values, "--revision", true),
+        requestId: identifierValue(values, "--request", true),
+      };
+    }
+    if (operation === "apply") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        "book retrofit apply",
+        ["--store", "--run", "--job", "--plan-hash"],
+      );
+      return {
+        command: "book-retrofit-apply",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+        jobId: identifierValue(values, "--job", true),
+        planHash: identifierValue(values, "--plan-hash", true),
+      };
+    }
+    if (operation === "status") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        "book retrofit status",
+        ["--store", "--run", "--job"],
+      );
+      return {
+        command: "book-retrofit-status",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+        jobId: identifierValue(values, "--job"),
+      };
+    }
+    if (operation === "rollback") {
+      const { values } = parseFlags(
+        argv.slice(3),
+        "book retrofit rollback",
+        ["--store", "--run", "--job"],
+      );
+      return {
+        command: "book-retrofit-rollback",
+        store: pathValue(values, "--store"),
+        runId: identifierValue(values, "--run", true),
+        jobId: identifierValue(values, "--job", true),
+      };
+    }
+    throw new Error(`unknown book retrofit action: ${String(operation)}`);
+  }
   if (action === "import") {
     const { values } = parseFlags(
       argv.slice(2),
@@ -1007,6 +1124,88 @@ export async function main(
   dependencyOverrides: Partial<CliRuntimeDependencies> = {},
 ): Promise<void> {
   const options = parseArgs(argv);
+  if (options.command.startsWith("book-knowledge-")
+    || options.command.startsWith("book-retrofit-")) {
+    const store = new LosslessBookStore(requireOption(options, "store"));
+    try {
+      const runId = requireOption(options, "runId");
+      const control = new TerminologyControlService(store, runId);
+      if (options.command === "book-knowledge-list") {
+        console.log(JSON.stringify({
+          schema: "folioloom-knowledge-list-1",
+          state: store.knowledgeState(runId),
+          records: store.knowledgeQuerySource(runId).listKnowledgeRecords(),
+        }, null, 2));
+        return;
+      }
+      if (options.command === "book-knowledge-term-upsert") {
+        const raw = JSON.parse(
+          readFileSync(requireOption(options, "input"), "utf8"),
+        ) as unknown;
+        if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+          throw new Error("term-upsert input must be a JSON object");
+        }
+        const request = validateCommitKnowledgeCommandsRequest({
+          ...(raw as Record<string, unknown>),
+          runId,
+        });
+        if (request.commands.some((command) =>
+          command.type !== "upsert" || command.objectType !== "term")) {
+          throw new Error("term-upsert input accepts only term upsert commands");
+        }
+        const { runId: _runId, ...localRequest } = request;
+        console.log(JSON.stringify(control.submit(localRequest), null, 2));
+        return;
+      }
+      if (options.command === "book-knowledge-queue-status") {
+        console.log(JSON.stringify({
+          schema: "folioloom-knowledge-queue-1",
+          items: control.queue(),
+        }, null, 2));
+        return;
+      }
+      if (options.command === "book-knowledge-queue-cancel") {
+        console.log(JSON.stringify({
+          requestId: requireOption(options, "requestId"),
+          cancelled: control.cancelQueued(requireOption(options, "requestId")),
+        }, null, 2));
+        return;
+      }
+      if (options.command === "book-retrofit-plan") {
+        const state = store.knowledgeState(runId);
+        console.log(JSON.stringify(control.planRetrofit({
+          requestId: requireOption(options, "requestId"),
+          ruleRevisionId: requireOption(options, "revisionId"),
+          expectedGeneration: state.generation,
+          expectedSnapshotId: state.snapshotId,
+        }), null, 2));
+        return;
+      }
+      if (options.command === "book-retrofit-apply") {
+        console.log(JSON.stringify(control.applyRetrofit(
+          requireOption(options, "jobId"),
+          requireOption(options, "planHash"),
+        ), null, 2));
+        return;
+      }
+      if (options.command === "book-retrofit-status") {
+        console.log(JSON.stringify(
+          options.jobId === undefined
+            ? { schema: "folioloom-term-retrofit-jobs-1", items: control.retrofits() }
+            : control.retrofit(options.jobId),
+          null,
+          2,
+        ));
+        return;
+      }
+      console.log(JSON.stringify(control.rollbackRetrofit(
+        requireOption(options, "jobId"),
+      ), null, 2));
+      return;
+    } finally {
+      store.close();
+    }
+  }
   if (options.command === "book-import") {
     const result = await importSource({
       sourcePath: requireOption(options, "source"),

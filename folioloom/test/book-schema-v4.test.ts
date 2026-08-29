@@ -14,7 +14,7 @@ import {
 import {
   LOSSLESS_BOOK_SCHEMA_TABLES,
   LOSSLESS_BOOK_SCHEMA_VERSION,
-} from "../src/storage/book-schema-v4.js";
+} from "../src/storage/book-schema-v5.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
 function fixturePath(): string {
@@ -165,7 +165,7 @@ test("schema v4 migrates a v3 store without changing active artifacts", () => {
   const store = new LosslessBookStore(path);
   store.close();
 
-  assert.equal(userVersion(path), 4);
+  assert.equal(userVersion(path), 5);
   assert.deepEqual(tableNames(path), [...LOSSLESS_BOOK_SCHEMA_TABLES]);
   assert.equal(activeTranslationText(path), "原有译文");
   const database = new DatabaseSync(path);

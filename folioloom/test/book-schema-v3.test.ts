@@ -144,7 +144,7 @@ test("creates a fresh current store with every v3 knowledge table", () => {
   const store = new LosslessBookStore(path);
   store.close();
 
-  assert.equal(userVersion(path), 4);
+  assert.equal(userVersion(path), 5);
   assert.deepEqual(requiredTables(path), [
     "book_knowledge_revisions",
     "book_knowledge_state",
@@ -179,7 +179,7 @@ test("opens a v2 store at the current schema without changing knowledge identiti
   const store = new LosslessBookStore(path);
   store.close();
 
-  assert.equal(userVersion(path), 4);
+  assert.equal(userVersion(path), 5);
   assert.deepEqual(readKnowledgeRows(path), before);
   assert.deepEqual(requiredTables(path), [
     "book_knowledge_revisions",

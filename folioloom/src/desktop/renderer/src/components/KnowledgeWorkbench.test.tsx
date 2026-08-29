@@ -156,6 +156,7 @@ function api(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi 
         }))
         : ok(detail())),
     mutateKnowledge: vi.fn().mockResolvedValue(ok({
+      disposition: "applied",
       generation: 8,
       snapshotId: "snapshot-8",
       detail: detail({ ...archon, revision: 4 }, {
@@ -164,6 +165,7 @@ function api(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi 
       }),
     })),
     promoteKnowledgeToGlobal: vi.fn().mockResolvedValue(ok({
+      disposition: "applied",
       generation: 8,
       snapshotId: "snapshot-8",
       detail: detail(),
@@ -180,6 +182,7 @@ function api(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi 
       ],
     })),
     attachGlobalKnowledge: vi.fn().mockResolvedValue(ok({
+      disposition: "applied",
       generation: 8,
       snapshotId: "snapshot-8",
       detail: detail(),
@@ -197,6 +200,12 @@ function api(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi 
         integrityCheck: "ok",
       },
     })),
+    getTerminologyControlState: vi.fn().mockResolvedValue(ok({ queuedChanges: [], retrofitJobs: [] })),
+    cancelQueuedTerminologyChange: vi.fn().mockResolvedValue(ok({ queuedChanges: [], retrofitJobs: [] })),
+    planTermRetrofit: vi.fn().mockResolvedValue(fail("TERM_RETROFIT_NOT_FOUND", "没有修词计划")),
+    applyTermRetrofit: vi.fn().mockResolvedValue(fail("TERM_RETROFIT_NOT_FOUND", "没有修词计划")),
+    cancelTermRetrofit: vi.fn().mockResolvedValue(fail("TERM_RETROFIT_NOT_FOUND", "没有修词计划")),
+    rollbackTermRetrofit: vi.fn().mockResolvedValue(fail("TERM_RETROFIT_NOT_FOUND", "没有修词计划")),
     chooseKnowledgeImport: vi.fn().mockResolvedValue(fail("DESKTOP_SELECTION_CANCELLED", "已取消选择")),
     inspectKnowledgeImport: vi.fn().mockResolvedValue(fail("KNOWLEDGE_IMPORT_NOT_FOUND", "没有待导入文件")),
     confirmKnowledgeImportEncoding: vi.fn().mockResolvedValue(fail("KNOWLEDGE_IMPORT_NOT_FOUND", "没有待导入文件")),

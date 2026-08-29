@@ -9,6 +9,10 @@ import {
   type KnowledgeScope,
 } from "./knowledge-authority.js";
 import {
+  createTermRenderingRule,
+  validateTermRuleSelector,
+} from "./term-rendering-rule.js";
+import {
   canonicalClone,
   canonicalJson,
   type KnowledgeRevision,
@@ -135,6 +139,12 @@ const FIELD_RULES: Readonly<Record<KnowledgeObjectType, {
       "locked",
       "contexts",
       "register",
+      "ruleId",
+      "conceptId",
+      "entityId",
+      "allowedTargets",
+      "selector",
+      "priority",
     ]),
     requiredForNew: new Set(["target"]),
   },
@@ -299,8 +309,17 @@ function validateTermField(field: string, value: unknown): void {
     || field === "subjectForms"
     || field === "normalizedForms"
     || field === "alternatives"
-    || field === "contexts") {
+    || field === "contexts"
+    || field === "allowedTargets") {
     requireSemanticStringList(value, `term.${field}`);
+    return;
+  }
+  if (field === "selector") {
+    validateTermRuleSelector(value);
+    return;
+  }
+  if (field === "priority") {
+    requireNonnegativeInteger(value, "term.priority");
     return;
   }
   const text = requireSemanticText(value, `term.${field}`);
@@ -424,6 +443,33 @@ export function validateKnowledgePayload(
       && payload.locked !== undefined
       && payload.locked !== true) {
       throw new TypeError("term.policy=locked requires locked=true");
+    }
+    const ruleFields = [
+      "ruleId",
+      "conceptId",
+      "entityId",
+      "allowedTargets",
+      "selector",
+      "priority",
+    ];
+    if (ruleFields.some((field) => Object.hasOwn(payload, field))) {
+      const sourceForms = Array.isArray(payload.sourceForms)
+        ? payload.sourceForms
+        : typeof payload.sourceForm === "string"
+          ? [payload.sourceForm]
+          : [];
+      createTermRenderingRule({
+        ruleId: payload.ruleId,
+        conceptId: payload.conceptId,
+        ...(payload.entityId === undefined ? {} : { entityId: payload.entityId }),
+        sourceForms,
+        target: payload.target,
+        allowedTargets: payload.allowedTargets,
+        policy: payload.policy ?? (payload.locked === true ? "locked" : "preferred"),
+        selector: payload.selector,
+        priority: payload.priority,
+        authorityRank: 0,
+      } as unknown as Parameters<typeof createTermRenderingRule>[0]);
     }
   }
   const result: Record<string, JsonValue> = Object.create(null) as Record<

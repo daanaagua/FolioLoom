@@ -23,6 +23,7 @@ import { KnowledgeDetailDrawer } from "./KnowledgeDetailDrawer.js";
 import { KnowledgeDiagnostics } from "./KnowledgeDiagnostics.js";
 import { KnowledgeImportWizard } from "./KnowledgeImportWizard.js";
 import { KnowledgeTable } from "./KnowledgeTable.js";
+import { TerminologyControlPanel } from "./TerminologyControlPanel.js";
 
 interface KnowledgeWorkbenchProps {
   api: FolioLoomDesktopApi;
@@ -129,6 +130,7 @@ export function KnowledgeWorkbench({
 }: KnowledgeWorkbenchProps): JSX.Element {
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [view, setView] = useState<KnowledgeViewState>({ status: "loading" });
+  const [showTerminologyControl, setShowTerminologyControl] = useState(false);
   const [detailState, setDetailState] = useState<KnowledgeDetailState>({ status: "closed" });
   const [loadingMore, setLoadingMore] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -266,6 +268,12 @@ export function KnowledgeWorkbench({
   }
 
   function applyMutation(result: DesktopKnowledgeMutationResult, message: string): void {
+    if (result.disposition === "queued") {
+      setConflict(undefined);
+      setOperationError(undefined);
+      setFeedback("修改已排队，将在下一翻译批次边界生效");
+      return;
+    }
     setView((current) => current.status === "ready"
       ? { status: "ready", page: updatePageWithMutation(current.page, result) }
       : current);
@@ -410,6 +418,9 @@ export function KnowledgeWorkbench({
           <p className="knowledge-workbench-lead">查阅这本书已经确认的译名、人物身份、关系、叙事记忆与文风约束。</p>
         </div>
         <div className="knowledge-header-actions">
+          <button className="quiet-button" type="button" onClick={() => setShowTerminologyControl(true)}>
+            运行中术语 / 一键修词
+          </button>
           <button className="quiet-button" type="button" onClick={() => setShowDiagnostics(true)}>
             只读诊断
           </button>
@@ -428,6 +439,16 @@ export function KnowledgeWorkbench({
           </button>
         </div>
       </header>
+
+      {showTerminologyControl && view.status === "ready" ? (
+        <TerminologyControlPanel
+          api={api}
+          generation={view.page.generation}
+          snapshotId={view.page.snapshotId}
+          selected={detailState.status === "ready" ? detailState.detail : undefined}
+          onClose={() => setShowTerminologyControl(false)}
+        />
+      ) : null}
 
       <section className="knowledge-filter-bar" aria-label="筛选知识">
         <label className="knowledge-search">
