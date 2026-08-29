@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
 import type { StableTerm } from "../domain/types.js";
 import type { LexicalSemanticClass } from "./lexical-concept.js";
-import type { KnowledgeRevision } from "./knowledge-store.js";
+import {
+  canonicalJson,
+  type KnowledgeRevision,
+} from "./knowledge-store.js";
+import { createTermRenderingRule } from "./term-rendering-rule.js";
 
 function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -24,6 +28,25 @@ function modelSafeTerm(term: StableTerm): StableTerm {
   };
 }
 
+function authorityRank(revision: Partial<KnowledgeRevision>): number {
+  const scope = revision.authority?.scope === "book"
+    ? 40
+    : revision.authority?.scope === "project"
+      ? 20
+      : 10;
+  const origin = revision.authority?.origin === "manual"
+    || revision.authority?.origin === "rollback"
+    ? 20
+    : revision.authority?.origin === "import"
+      ? 10
+      : 0;
+  return scope + origin;
+}
+
+function renderingFingerprint(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
 /**
  * Convert active durable lexical knowledge into the stable-term wire protocol.
  * User/import policy remains authoritative; single-pass model anchors are
@@ -40,6 +63,65 @@ export function stableTermsFromKnowledge(
     const revision = raw as Partial<KnowledgeRevision>;
     if (revision.status !== "active") continue;
     const payload = record(revision.payload);
+    if (typeof revision.kind === "string"
+      && revision.kind.startsWith("term_rendering_rule:")
+      && payload !== undefined
+      && typeof revision.revisionId === "string") {
+      const sourceForms = Array.isArray(payload.sourceForms)
+        ? payload.sourceForms
+        : typeof payload.sourceForm === "string"
+          ? [payload.sourceForm]
+          : [];
+      const rule = createTermRenderingRule({
+        ruleId: payload.ruleId,
+        conceptId: payload.conceptId,
+        ...(payload.entityId === undefined ? {} : { entityId: payload.entityId }),
+        sourceForms: sourceForms as string[],
+        target: payload.target,
+        allowedTargets: payload.allowedTargets as string[] | undefined,
+        policy: payload.policy,
+        selector: payload.selector,
+        priority: payload.priority,
+        authorityRank: authorityRank(revision),
+      } as Parameters<typeof createTermRenderingRule>[0]);
+      const fingerprint = renderingFingerprint({
+        baseConceptId: rule.conceptId,
+        sourceForms: rule.sourceForms,
+        target: rule.target,
+        allowedTargets: rule.allowedTargets,
+        policy: rule.policy,
+        selector: rule.selector,
+        priority: rule.priority,
+        authorityRank: rule.authorityRank,
+      });
+      const bindingConceptId = `term-rule-${createHash("sha256")
+        .update(`${rule.conceptId}\0${rule.ruleId}`, "utf8")
+        .digest("hex")
+        .slice(0, 24)}`;
+      terms.push(...rule.sourceForms.map((sourceForm, index): StableTerm => ({
+        conceptId: bindingConceptId,
+        lexemeId: `${bindingConceptId}-lexeme-${index}`,
+        sourceForm,
+        canonicalSource: revision.normalizedSubject ?? sourceForm,
+        target: rule.target,
+        locked: rule.policy === "locked",
+        policy: rule.policy,
+        semanticClass: rule.entityId === undefined
+          ? "technical_term"
+          : "proper_name",
+        allowedTargets: [...rule.allowedTargets],
+        revisionId: revision.revisionId,
+        renderFingerprint: fingerprint,
+        origin: "knowledge",
+        ruleId: rule.ruleId,
+        baseConceptId: rule.conceptId,
+        ...(rule.entityId === undefined ? {} : { entityId: rule.entityId }),
+        applicability: rule.selector,
+        authorityRank: rule.authorityRank,
+        priority: rule.priority,
+      })));
+      continue;
+    }
     if (revision.kind === "lexical_concept" && payload !== undefined) {
       const sourceForms = payload.sourceForms;
       const semanticClass = payload.semanticClass;

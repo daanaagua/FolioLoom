@@ -27,7 +27,9 @@ interface EditorField {
 const EDITABLE_FIELDS: Readonly<Record<KnowledgeObjectType, readonly EditorField[]>> = {
   term: [
     { key: "sourceForm", label: "原文形式", kind: "text" },
+    { key: "sourceForms", label: "全部原文形式", kind: "list", placeholder: "每行一个原文形式" },
     { key: "target", label: "首选译法", kind: "text", required: true },
+    { key: "allowedTargets", label: "允许译法", kind: "list", placeholder: "每行一个允许译法" },
     { key: "alternatives", label: "备选译法", kind: "list", placeholder: "每行一个译法" },
     {
       key: "policy",
@@ -132,6 +134,13 @@ export function KnowledgeEditor({
     () => initialDraft(detail, fields),
   );
   const [scope, setScope] = useState<KnowledgeScope>(detail.item.scope);
+  const isRenderingRule = detail.item.kind.startsWith("term_rendering_rule:");
+  const initialSelector = JSON.stringify(
+    detail.fields.selector ?? { kind: "whole_book" },
+    null,
+    2,
+  );
+  const [selectorDraft, setSelectorDraft] = useState(initialSelector);
   const [copyFeedback, setCopyFeedback] = useState<string>();
 
   const fieldPatch = useMemo(() => {
@@ -144,8 +153,16 @@ export function KnowledgeEditor({
       );
       if (!jsonEqual(current, next)) patch[field.key] = next;
     }
+    if (isRenderingRule && selectorDraft !== initialSelector) {
+      try {
+        const selector = JSON.parse(selectorDraft) as JsonValue;
+        patch.selector = selector;
+      } catch {
+        // Validation below keeps the form disabled until the JSON is valid.
+      }
+    }
     return patch;
-  }, [detail.fields, draft, fields]);
+  }, [detail.fields, draft, fields, initialSelector, isRenderingRule, selectorDraft]);
   const changedFields = Object.keys(fieldPatch);
   const validationMessage = useMemo(() => {
     const missing = fields.find((field) =>
@@ -155,6 +172,16 @@ export function KnowledgeEditor({
       const hasStart = (draft.startBlockId ?? "").trim().length > 0;
       const hasEnd = (draft.endBlockId ?? "").trim().length > 0;
       if (hasStart !== hasEnd) return "生效起点和失效点必须同时填写";
+    }
+    if (isRenderingRule) {
+      try {
+        const selector = JSON.parse(selectorDraft) as unknown;
+        if (selector === null || typeof selector !== "object" || Array.isArray(selector)) {
+          return "文本范围必须是 JSON 对象";
+        }
+      } catch {
+        return "文本范围不是有效 JSON";
+      }
     }
     if (detail.item.objectType === "style"
       && fields.every((field) => (draft[field.key] ?? "").trim().length === 0)) {
@@ -167,7 +194,7 @@ export function KnowledgeEditor({
       return `${cleared.label}不能保存为空值`;
     }
     return undefined;
-  }, [detail.fields, detail.item.objectType, draft, fields]);
+  }, [detail.fields, detail.item.objectType, draft, fields, isRenderingRule, selectorDraft]);
   const dirty = changedFields.length > 0 || scope !== detail.item.scope;
   const canSave = changedFields.length > 0 && validationMessage === undefined && !saving;
 
@@ -265,6 +292,21 @@ export function KnowledgeEditor({
             {detail.item.scope === "global" ? <option value="global">通用副本</option> : null}
           </select>
         </label>
+        {isRenderingRule ? (
+          <label className="knowledge-field">
+            <span>文本范围</span>
+            <textarea
+              aria-label="文本范围"
+              rows={7}
+              value={selectorDraft}
+              disabled={saving}
+              onChange={(event) => setSelectorDraft(event.target.value)}
+            />
+            <small>
+              全书使用 {`{"kind":"whole_book"}`}；分段称呼使用含 sourceVersion、起止 block ID 与 global index 的 block_range。
+            </small>
+          </label>
+        ) : null}
       </div>
 
       {scope !== detail.item.scope && changedFields.length === 0 ? (

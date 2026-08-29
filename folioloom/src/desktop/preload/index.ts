@@ -77,6 +77,18 @@ const desktopApi: FolioLoomDesktopApi = {
     ipcRenderer.invoke("folioloom:knowledge-global-attach", request),
   getKnowledgeDiagnostics: () =>
     ipcRenderer.invoke("folioloom:knowledge-diagnostics"),
+  getTerminologyControlState: () =>
+    ipcRenderer.invoke("folioloom:terminology-state"),
+  cancelQueuedTerminologyChange: (requestId) =>
+    ipcRenderer.invoke("folioloom:terminology-queue-cancel", requestId),
+  planTermRetrofit: (request) =>
+    ipcRenderer.invoke("folioloom:terminology-retrofit-plan", request),
+  applyTermRetrofit: (request) =>
+    ipcRenderer.invoke("folioloom:terminology-retrofit-apply", request),
+  cancelTermRetrofit: (jobId) =>
+    ipcRenderer.invoke("folioloom:terminology-retrofit-cancel", jobId),
+  rollbackTermRetrofit: (jobId) =>
+    ipcRenderer.invoke("folioloom:terminology-retrofit-rollback", jobId),
   chooseKnowledgeImport: () =>
     ipcRenderer.invoke("folioloom:knowledge-import-choose"),
   inspectKnowledgeImport: (request) =>

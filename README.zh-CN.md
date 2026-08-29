@@ -6,9 +6,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.6.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.7.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.6.0 能做什么
+## V1.7.0 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -20,6 +20,9 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 对新导入的 EPUB 以原书为导出模板，保留脚注、返回链接、跨章节链接、外部 URL、OPF/spine/nav、样式及其他资源；结构槽或内部链接异常时拒绝发布损坏文件；
 - 通过 Electron 桌面端完成书稿导入、模型连接、试译、整本运行、暂停恢复、导出、术语与叙事记忆维护；
 - 导入 JSON、YAML、CSV 或 XLSX 术语数据，并在写入前处理字段映射和冲突；
+- 在整本翻译运行中审查和提交术语修改；在途请求继续使用旧快照，修改只在下一持久波次边界应用一次；
+- 按不可变原文块区间为同一实体或术语指定不同中文称呼，并以固定优先级解析、显式拒绝同级重叠冲突；
+- 预览并执行可审计的批量修词：回执唯一时生成本地新译文版本，存在歧义时复用稀疏模型重验证，作业可以续跑、回滚，并纳入严格导出门禁；
 - 针对英语、德语、法语、西班牙语、俄语、日语和韩语提供语言画像，并支持常见 Unicode、Windows-1252 及日韩传统编码；
 - 一键导出不含密钥、书稿、译文和完整私人路径的诊断 JSON，便于定位导入、连接、试译、校验或提交阶段的失败；
 - 在桌面端列出需要处理的文本块、失败类别、公开错误码和下一步；可恢复项只允许一次经过影子审计与原子晋升的安全重试；
@@ -30,7 +33,7 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 
 ## V4 Flash 100K 实测
 
-FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 增加 EPUB 结构保真，v1.5.3 增加桌面端处理与恢复工作流，v1.6.0 则新增独立的 Codex worker 路径，不改变这些历史实测数据：
+FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 增加 EPUB 结构保真，v1.5.3 增加桌面端处理与恢复工作流，v1.6.0 新增独立的 Codex worker 路径，v1.7.0 新增运行中术语控制与审计式修词，不改变这些历史实测数据：
 
 - 德语《变形记》：**10 分 55 秒**；
 - 英语《时间之子》第一部：**18 分 56 秒**。
@@ -42,7 +45,7 @@ FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调�
 - 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
 - V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是当前版本主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
-- 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复、需要处理中心和严格导出；逐段人工改译与批量审阅仍是后续工作；
+- 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复、运行中术语审查、审计式批量修词、需要处理中心和严格导出；逐段人工改译与一般批量审阅仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
 - Codex worker 当前只提供命令行/skill 工作流，需要本机安装并登录 Codex CLI，并有意限制为 `--max-concurrency 1`；它尚未接入桌面端。
 - EPUB 原模板保真只适用于由 v1.5.2 重新导入的项目；旧项目不会用模糊对齐猜测链接位置，需重新导入原 EPUB 后再翻译。
@@ -104,9 +107,30 @@ npm.cmd run folioloom -- book status `
 
 确认试译后，重复 `book run` 并移除 `--max-windows 1` 即可继续。运行器会跳过已经提交的窗口。
 
+## 运行中术语控制与审计式修词
+
+桌面端“术语与记忆”可以在整本翻译运行时保存术语。在途窗口尚未结束时，修改会先持久排队，并在下一波次边界生效。译名规则可以覆盖全书，也可以覆盖包含两端的不可变原文块区间；端点过期或同级规则重叠时会明确拒绝，不会猜测。
+
+保存规则后，在“术语控制”中预览精确影响。执行锁定计划时，回执唯一的安全替换会产生新译文版本；存在歧义的块进入既有稀疏模型重验证。未执行的计划可以取消，完成或需要处理的作业可以回滚。排队中的修改、尚未处理的活动术语影响和未收敛的修词 item 都会阻断严格导出。
+
+CLI 和私有 Codex skill 使用同一个控制面：
+
+```powershell
+npm.cmd run folioloom -- book knowledge queue-status --store <book.db> --run <run-id>
+npm.cmd run folioloom -- book retrofit plan --store <book.db> --run <run-id> `
+  --revision <rule-revision-id> --request <unique-request-id>
+npm.cmd run folioloom -- book retrofit apply --store <book.db> --run <run-id> `
+  --job <job-id> --plan-hash <plan-hash>
+npm.cmd run folioloom -- book retrofit status --store <book.db> --run <run-id>
+npm.cmd run folioloom -- book retrofit rollback --store <book.db> --run <run-id> `
+  --job <job-id>
+```
+
+类型化 term-upsert JSON 和完整安全流程见 [terminology-control 参考](.agents/skills/folioloom-translate/references/terminology-control.md)。CLI 与 skill 都不会直接改写 SQLite。
+
 ## 使用已登录的 Codex CLI 翻译
 
-FolioLoom v1.6.0 可以把隔离的 `codex exec` 子进程用作模型传输层。它复用本机 Codex 的交互式登录，因此不需要单独的模型 API Key。原文身份、有界请求、校验、恢复、SQLite 提交、审计与导出仍由 FolioLoom 负责；每个子进程只看到当前模型任务，且不能写入项目。
+FolioLoom v1.7.0 可以把隔离的 `codex exec` 子进程用作模型传输层。它复用本机 Codex 的交互式登录，因此不需要单独的模型 API Key。原文身份、有界请求、校验、恢复、SQLite 提交、审计与导出仍由 FolioLoom 负责；每个子进程只看到当前模型任务，且不能写入项目。
 
 安装 Codex CLI 并执行 `codex login` 后，从仓库根目录启动 Codex。Codex 会从 `.agents/skills/folioloom-translate` 发现仓库级 skill；直接传入待翻译文件，不要把整本书粘贴进对话：
 

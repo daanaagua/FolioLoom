@@ -18,6 +18,13 @@ export interface ConceptOccurrenceSourceBlock {
   readonly sourceText: string;
 }
 
+export type ConceptOccurrenceConcept = Pick<
+  LexicalConcept,
+  "conceptId" | "sourceForms"
+> & {
+  readonly applicableBlockIds?: readonly string[];
+};
+
 interface FormEntry {
   readonly normalizedScalars: readonly string[];
   readonly conceptIds: readonly string[];
@@ -34,7 +41,7 @@ function identifierCharacter(value: string | undefined): boolean {
 }
 
 function formEntries(
-  concepts: readonly Pick<LexicalConcept, "conceptId" | "sourceForms">[],
+  concepts: readonly ConceptOccurrenceConcept[],
   profile: SourceLanguageProfile,
 ): FormEntry[] {
   const conceptsByForm = new Map<string, Set<string>>();
@@ -142,7 +149,7 @@ function normalizedToOriginalScalarMap(
  */
 export function buildConceptOccurrenceIndex(
   blocks: readonly ConceptOccurrenceSourceBlock[],
-  concepts: readonly Pick<LexicalConcept, "conceptId" | "sourceForms">[],
+  concepts: readonly ConceptOccurrenceConcept[],
   profile: SourceLanguageProfile,
 ): ConceptOccurrence[] {
   const entries = formEntries(concepts, profile);
@@ -155,6 +162,12 @@ export function buildConceptOccurrenceIndex(
     blockId: string;
     spans: Map<string, ConceptOccurrenceSpan>;
   }>();
+  const applicableBlockIdsByConcept = new Map(concepts.map((concept) => [
+    concept.conceptId,
+    concept.applicableBlockIds === undefined
+      ? undefined
+      : new Set(concept.applicableBlockIds),
+  ]));
   for (const block of blocks) {
     const normalizedSource = profile.normalizeSourceLiteral(block.sourceText);
     const normalizedScalars = Array.from(normalizedSource);
@@ -204,6 +217,10 @@ export function buildConceptOccurrenceIndex(
         if (!hasBoundary) continue;
         const sourceForm = originalScalars.slice(originalStart, originalEnd).join("");
         for (const conceptId of entry.conceptIds) {
+          const applicable = applicableBlockIdsByConcept.get(conceptId);
+          if (applicable !== undefined && !applicable.has(block.blockId)) {
+            continue;
+          }
           const key = `${conceptId}\0${block.blockId}`;
           const item = grouped.get(key) ?? {
             conceptId,

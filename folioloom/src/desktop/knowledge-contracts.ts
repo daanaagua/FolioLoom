@@ -18,6 +18,11 @@ import type {
   ImportSelection,
   PendingKnowledgeImport,
 } from "../knowledge-import/types.js";
+import type {
+  KnowledgeChangeQueueRecord,
+  StoredTermRetrofitJob,
+  StoredTermRetrofitPlan,
+} from "../storage/lossless-book-store.js";
 
 export type {
   CancelImportOperationRequest,
@@ -138,10 +143,33 @@ export interface DesktopKnowledgeDetail {
 }
 
 export interface DesktopKnowledgeMutationResult {
+  readonly disposition: "applied" | "queued";
   readonly generation: number;
   readonly snapshotId: string;
   readonly detail: DesktopKnowledgeDetail;
+  readonly queueRequestId?: string;
 }
+
+export interface DesktopTerminologyControlState {
+  readonly queuedChanges: readonly KnowledgeChangeQueueRecord[];
+  readonly retrofitJobs: readonly StoredTermRetrofitJob[];
+}
+
+export interface DesktopPlanTermRetrofitRequest {
+  readonly requestId: string;
+  readonly ruleRevisionId: string;
+  readonly expectedGeneration: number;
+  readonly expectedSnapshotId: string;
+}
+
+export interface DesktopApplyTermRetrofitRequest {
+  readonly jobId: string;
+  readonly planHash: string;
+}
+
+export interface DesktopTermRetrofitPlan extends StoredTermRetrofitPlan {}
+
+export interface DesktopTermRetrofitJob extends StoredTermRetrofitJob {}
 
 export interface DesktopKnowledgeDiagnostics {
   readonly schemaVersion: number;

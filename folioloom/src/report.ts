@@ -177,12 +177,25 @@ export interface LosslessBookAuditReport {
     repaired: number;
     retranslated: number;
   };
+  controlPlane: {
+    queuedKnowledgeChanges: number;
+    pendingActiveTermImpacts: number;
+    openRetrofitItems: number;
+    attentionRetrofitItems: number;
+  };
   totalBlockCount: number;
   translatedBlockCount: number;
   missingBlockIds: string[];
   missingBlockCount: number;
   incidentCodes: string[];
 }
+
+const KNOWLEDGE_CONVERGENCE_INCIDENTS = new Set([
+  "STALE_KNOWLEDGE_BINDING",
+  "PENDING_KNOWLEDGE_CHANGE",
+  "PENDING_TERM_IMPACT",
+  "TERM_RETROFIT_INCOMPLETE",
+]);
 
 function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
@@ -505,13 +518,33 @@ export function auditLosslessBookStore(
     retranslated: state.revalidationTasks.filter((task) =>
       task.status === "resolved_retranslate").length,
   };
+  const controlPlane = {
+    queuedKnowledgeChanges: state.queuedKnowledgeChangeCount,
+    pendingActiveTermImpacts: state.pendingActiveTermImpactCount,
+    openRetrofitItems: state.openTermRetrofitItemCount,
+    attentionRetrofitItems: state.attentionTermRetrofitItemCount,
+  };
   const knowledgeConverged = revalidation.pending === 0
     && revalidation.validating === 0
     && revalidation.stale === 0
     && revalidation.warningStale === 0
     && revalidation.coverageMissing === 0
     && state.revalidationTasks.every((task) =>
-      task.status !== "completed_with_warning");
+      task.status !== "completed_with_warning")
+    && controlPlane.queuedKnowledgeChanges === 0
+    && controlPlane.pendingActiveTermImpacts === 0
+    && controlPlane.openRetrofitItems === 0
+    && controlPlane.attentionRetrofitItems === 0;
+  if (controlPlane.queuedKnowledgeChanges > 0) {
+    incidents.push("PENDING_KNOWLEDGE_CHANGE");
+  }
+  if (controlPlane.pendingActiveTermImpacts > 0) {
+    incidents.push("PENDING_TERM_IMPACT");
+  }
+  if (controlPlane.openRetrofitItems > 0
+    || controlPlane.attentionRetrofitItems > 0) {
+    incidents.push("TERM_RETROFIT_INCOMPLETE");
+  }
   if (!knowledgeConverged) {
     incidents.push("STALE_KNOWLEDGE_BINDING");
   }
@@ -530,6 +563,7 @@ export function auditLosslessBookStore(
     knowledgeConverged,
     strictExportable,
     revalidation,
+    controlPlane,
     totalBlockCount: blocks.length,
     translatedBlockCount: translatedBlockIds.size,
     missingBlockIds,
@@ -544,7 +578,7 @@ export function losslessBookLineage(
 ): LosslessBookLineage {
   const audit = auditLosslessBookStore(store, runId);
   const integrityIncidents = audit.incidentCodes.filter((code) =>
-    code !== "STALE_KNOWLEDGE_BINDING");
+    !KNOWLEDGE_CONVERGENCE_INCIDENTS.has(code));
   if (integrityIncidents.length > 0) {
     throw new Error(`lossless lineage audit failed: ${integrityIncidents.join(",")}`);
   }
@@ -850,7 +884,7 @@ export function writeLosslessBookArtifacts(
   );
   const audit = projection.audit;
   const integrityIncidents = audit.incidentCodes.filter((code) =>
-    code !== "STALE_KNOWLEDGE_BINDING"
+    !KNOWLEDGE_CONVERGENCE_INCIDENTS.has(code)
     && !TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
   if (integrityIncidents.length > 0) {
     throw new Error(`lossless export audit failed: ${integrityIncidents.join(",")}`);
@@ -865,7 +899,9 @@ export function writeLosslessBookArtifacts(
     }
     if (!audit.knowledgeConverged) {
       throw new Error(
-        "strict book export requires knowledge convergence: STALE_KNOWLEDGE_BINDING",
+        `strict book export requires knowledge convergence: ${audit.incidentCodes
+          .filter((code) => KNOWLEDGE_CONVERGENCE_INCIDENTS.has(code))
+          .join(",")}`,
       );
     }
     throw new Error(
@@ -893,6 +929,7 @@ export function writeLosslessBookArtifacts(
     knowledgeConverged: audit.knowledgeConverged,
     strictExportable: audit.strictExportable,
     revalidation: audit.revalidation,
+    controlPlane: audit.controlPlane,
     missingBlockIds: audit.missingBlockIds,
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),

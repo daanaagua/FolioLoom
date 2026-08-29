@@ -29,6 +29,17 @@ export interface V4Block {
 
 export type StableTermPolicy = "locked" | "preferred" | "contextual";
 
+export type TermApplicability =
+  | { readonly kind: "whole_book" }
+  | {
+    readonly kind: "block_range";
+    readonly sourceVersion: string;
+    readonly startBlockId: string;
+    readonly endBlockId: string;
+    readonly startGlobalIndex: number;
+    readonly endGlobalIndex: number;
+  };
+
 export interface StableTerm {
   conceptId: string;
   lexemeId: string;
@@ -43,6 +54,13 @@ export interface StableTerm {
   renderFingerprint?: string;
   note?: string;
   origin?: "legacy" | "knowledge" | "glossary";
+  ruleId?: string;
+  baseConceptId?: string;
+  entityId?: string;
+  applicability?: TermApplicability;
+  authorityRank?: number;
+  priority?: number;
+  applicableBlockIds?: readonly string[];
 }
 
 export interface EvidenceHit {

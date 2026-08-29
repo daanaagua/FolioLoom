@@ -13,6 +13,7 @@ import type {
   DesktopResult,
 } from "../src/desktop/contracts.js";
 import { BookContext } from "../src/fullbook/book-context.js";
+import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { GlobalKnowledgeStore } from "../src/knowledge/global-knowledge-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
@@ -189,6 +190,57 @@ test("persists an edit and returns the newer generation after reopening", () => 
     const next = unwrap(reopened.list({ limit: 20 }));
     assert.equal(next.generation, saved.generation);
     assert.equal(unwrap(reopened.detail(item.id)).fields.target, "阁下");
+  } finally {
+    cleanup(fixture);
+  }
+});
+
+test("queues a desktop terminology edit while a translation window is running", () => {
+  const fixture = createFixture();
+  try {
+    const context = BookContext.openLossless({ manifestPath: fixture.manifestPath });
+    const store = new LosslessBookStore(fixture.storePath);
+    const windows = planBookWindows(context.losslessBlocks, {
+      protocolVersion: "lossless-v5-test",
+    });
+    store.initializeWindowPlan(fixture.runId, windows);
+    store.claimWindow(fixture.runId, windows[0]!.windowId);
+    store.close();
+    context.close();
+
+    const service = new DesktopKnowledgeService(
+      new DesktopProjectService(),
+      fixture.globals,
+      () => fixture.request,
+    );
+    const page = unwrap(service.list({ limit: 20 }));
+    const item = page.items[0]!;
+    const queued = unwrap(service.mutate({
+      requestId: "desktop-live-term",
+      expectedGeneration: page.generation,
+      expectedSnapshotId: page.snapshotId,
+      command: {
+        type: "upsert",
+        objectType: "term",
+        normalizedSubject: item.normalizedSubject,
+        kind: item.kind,
+        expectedRevision: item.revision,
+        expectedScopeRevision: item.scopeRevision,
+        fieldPatch: { target: "大执政官" },
+        ownedFields: ["/target"],
+        scope: "book",
+        evidence: [],
+        origin: "manual",
+      },
+    }));
+    assert.equal(queued.disposition, "queued");
+    assert.equal(queued.queueRequestId, "desktop-live-term");
+    assert.equal(queued.generation, page.generation);
+    assert.equal(queued.detail.fields.target, "执政官");
+
+    const reopened = new LosslessBookStore(fixture.storePath);
+    assert.equal(reopened.queuedKnowledgeChanges(fixture.runId).length, 1);
+    reopened.close();
   } finally {
     cleanup(fixture);
   }

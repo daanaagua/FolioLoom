@@ -48,6 +48,7 @@ import {
   persistedStyleFromKnowledge,
 } from "../knowledge/persisted-style.js";
 import { stableTermsFromKnowledge } from "../knowledge/stable-terms-from-knowledge.js";
+import { resolveStableTermsForBlocks } from "../knowledge/stable-term-resolver.js";
 import {
   conceptFromAnchor,
   type LexicalSemanticClass,
@@ -987,28 +988,26 @@ function uniqueTerms(
   terms: readonly StableTerm[],
   context: BookContext,
 ): StableTerm[] {
-  const byForm = new Map<string, StableTerm>();
+  const byIdentity = new Map<string, StableTerm>();
   for (const sourceTerm of terms) {
     const safeSourceTerm = softenModelAnchorTerm(sourceTerm);
     const term = safeSourceTerm.origin === "knowledge"
       ? { ...safeSourceTerm, target: simplifyChineseTranslation(safeSourceTerm.target) }
       : safeSourceTerm;
     const normalized = context.languageProfile.normalizeSourceForm(term.sourceForm);
-    const previous = byForm.get(normalized);
-    const priority = (value: StableTerm): number => {
-      if (value.origin === "glossary") {
-        return 3;
-      }
-      if (value.origin === "legacy") {
-        return 2;
-      }
-      return 1;
-    };
-    if (previous === undefined || priority(term) >= priority(previous)) {
-      byForm.set(normalized, { ...term });
-    }
+    const identity = canonicalJson({
+      normalized,
+      conceptId: term.conceptId,
+      ruleId: term.ruleId ?? null,
+      target: term.target,
+      applicability: term.applicability ?? { kind: "whole_book" },
+      authorityRank: term.authorityRank ?? null,
+      priority: term.priority ?? 0,
+      origin: term.origin ?? null,
+    });
+    byIdentity.set(identity, { ...term });
   }
-  return [...byForm.values()].sort((left, right) =>
+  return [...byIdentity.values()].sort((left, right) =>
     left.sourceForm.localeCompare(right.sourceForm));
 }
 
@@ -1028,14 +1027,25 @@ function termsForWindows(
   glossary: LoadedGlossary | undefined,
 ): StableTerm[] {
   const nonGlossary = terms.filter((term) => term.origin !== "glossary");
-  if (glossary === undefined) {
-    return uniqueTerms(nonGlossary, context);
-  }
-  const glossaryRelevant = relevantGlossaryTerms(
-    glossary,
-    windows.flatMap((window) => window.globalIndexes),
+  const glossaryRelevant = glossary === undefined
+    ? []
+    : relevantGlossaryTerms(
+      glossary,
+      windows.flatMap((window) => window.globalIndexes),
+    );
+  const candidates = uniqueTerms([...nonGlossary, ...glossaryRelevant], context);
+  const requested = new Set(windows.flatMap((window) => window.blockIds));
+  return resolveStableTermsForBlocks(
+    candidates,
+    context.losslessBlocks
+      .filter((block) => requested.has(block.id))
+      .map((block) => ({
+        sourceVersion: block.sourceVersion,
+        blockId: block.id,
+        globalIndex: block.globalIndex,
+      })),
+    context.languageProfile,
   );
-  return uniqueTerms([...nonGlossary, ...glossaryRelevant], context);
 }
 
 function waveKnowledgeCandidates(
@@ -2670,6 +2680,7 @@ async function runLosslessBook(
     };
     let cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
+    store.applyQueuedKnowledgeChanges(runId);
     store.syncScopedKnowledge(runId);
     const coverageScan = store.ensureConceptCoverageRevalidationTasks(
       runId,
@@ -3074,6 +3085,7 @@ async function runLosslessBook(
       if (drainedRevalidation.modelCalls > 0) {
         flushSchedulerProjection?.();
       }
+      store.refreshTermRetrofitJobs(runId);
     };
 
     let paused = false;
@@ -3088,6 +3100,7 @@ async function runLosslessBook(
       // this run is paused. Synchronize only at the wave boundary, before any
       // window is claimed, so the next request sees the newest durable user
       // knowledge without ever changing a running/staged wave.
+      store.applyQueuedKnowledgeChanges(runId);
       store.syncScopedKnowledge(runId);
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
@@ -4255,6 +4268,7 @@ async function runLosslessBook(
       // every wave repeats expensive work against snapshots that are already
       // known to be provisional.  Pending tasks remain durable and stale
       // bindings continue to block strict export until this barrier is reached.
+      store.applyQueuedKnowledgeChanges(runId);
       store.syncScopedKnowledge(runId);
       if (firstUncommitted(store.allWindows(runId)) === undefined) {
         await drainRevalidationAtFinalBarrier();

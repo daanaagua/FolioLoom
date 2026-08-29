@@ -891,6 +891,187 @@ test("translation concept bindings follow the staged translation version", () =>
   store.close();
 });
 
+function commitAlphaRenderingRule(
+  store: LosslessBookStore,
+  runId: string,
+  target = "阿法",
+) {
+  const state = store.knowledgeState(runId);
+  return store.commitKnowledgeCommands({
+    requestId: `term-rule-${target}`,
+    runId,
+    expectedGeneration: state.generation,
+    expectedSnapshotId: state.snapshotId,
+    commands: [{
+      type: "upsert",
+      objectType: "term",
+      normalizedSubject: "alpha",
+      kind: "term_rendering_rule:alpha-name",
+      expectedRevision: null,
+      expectedScopeRevision: null,
+      fieldPatch: {
+        ruleId: "alpha-name",
+        conceptId: "entity-alpha",
+        sourceForms: ["Alpha"],
+        target,
+        allowedTargets: [target],
+        policy: "locked",
+        locked: true,
+        selector: { kind: "whole_book" },
+        priority: 10,
+      },
+      ownedFields: [
+        "/target",
+        "/allowedTargets",
+        "/selector",
+        "/priority",
+      ],
+      scope: "book",
+      evidence: [],
+      origin: "manual",
+    }],
+  });
+}
+
+test("retrofit job safely versions a receipt-backed term edit and can roll it back", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  const initialSnapshot = createKnowledgeSnapshot("run-a", []);
+  const runId = initialize(store, {
+    ...runMeta("model-a", "a"),
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+  });
+  const previous = alphaConcept();
+  const [first, second] = blocks();
+  store.upsertLexicalConcepts(runId, [previous]);
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(runId, "window-0", initialSnapshot.id),
+    translations: [
+      { blockId: first!.id, sourceHash: first!.sourceHash, text: "阿尔法。" },
+      { blockId: second!.id, sourceHash: second!.sourceHash, text: "贝塔。" },
+    ],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage("阿尔法", previous)],
+      concepts: [previous],
+    },
+  });
+  store.promoteStagedWindow(runId, "window-0");
+  const commit = commitAlphaRenderingRule(store, runId);
+  const state = store.knowledgeState(runId);
+  const plan = store.planTermRetrofitJob({
+    requestId: "retrofit-alpha",
+    runId,
+    ruleRevisionId: commit.revisionIds[0]!,
+    expectedGeneration: state.generation,
+    expectedSnapshotId: state.snapshotId,
+  });
+  assert.deepEqual(plan.summary, {
+    total: 1,
+    noop: 0,
+    localRepair: 1,
+    modelRetranslate: 0,
+    humanRequired: 0,
+  });
+  const disposablePlan = store.planTermRetrofitJob({
+    requestId: "retrofit-alpha-disposable",
+    runId,
+    ruleRevisionId: commit.revisionIds[0]!,
+    expectedGeneration: state.generation,
+    expectedSnapshotId: state.snapshotId,
+  });
+  const cancelled = store.cancelTermRetrofitJob(runId, disposablePlan.jobId);
+  assert.equal(cancelled.status, "cancelled");
+  assert.ok(cancelled.items.every((item) => item.status === "cancelled"));
+  assert.equal(
+    store.cancelTermRetrofitJob(runId, disposablePlan.jobId).status,
+    "cancelled",
+  );
+
+  const applied = store.applyTermRetrofitJob(
+    runId,
+    plan.jobId,
+    plan.planHash,
+  );
+  assert.equal(applied.status, "completed");
+  assert.equal(store.activeTranslations(runId)[0]?.text, "阿法。");
+  assert.equal(store.activeTranslations(runId)[0]?.version, 2);
+  assert.equal(
+    store.activeTranslationBindings(runId, first!.id)
+      .flatMap((binding) => binding.termUsages)
+      .some((usage) => usage.targetSurface === "阿法"),
+    true,
+  );
+  assert.equal(
+    store.applyTermRetrofitJob(runId, plan.jobId, plan.planHash).status,
+    "completed",
+  );
+
+  const database = new DatabaseSync(path);
+  const versions = database.prepare(`
+    SELECT version, active FROM translations
+    WHERE run_id=? AND block_id=? ORDER BY version
+  `).all(runId, first!.id) as unknown as Array<{
+    version: number;
+    active: number;
+  }>;
+  assert.deepEqual(versions.map((row) => ({ ...row })), [
+    { version: 1, active: 0 },
+    { version: 2, active: 1 },
+  ]);
+  database.close();
+
+  assert.equal(store.rollbackTermRetrofitJob(runId, plan.jobId).status, "rolled_back");
+  assert.equal(store.activeTranslations(runId)[0]?.text, "阿尔法。");
+  assert.equal(store.activeTranslations(runId)[0]?.version, 1);
+  assert.equal(
+    store.knowledgeRevisions(runId)
+      .filter((revision) => revision.kind === "term_rendering_rule:alpha-name")
+      .at(-1)?.status,
+    "superseded",
+  );
+  assert.deepEqual(store.auditState(runId).missingConceptBindings, []);
+  store.close();
+});
+
+test("retrofit job delegates missing-receipt blocks to durable model revalidation", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const initialSnapshot = createKnowledgeSnapshot("run-a", []);
+  const runId = initialize(store, {
+    ...runMeta("model-a", "a"),
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+  });
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(runId, "window-0", initialSnapshot.id),
+    knowledgeCandidates: [],
+  });
+  store.promoteStagedWindow(runId, "window-0");
+  const commit = commitAlphaRenderingRule(store, runId);
+  const state = store.knowledgeState(runId);
+  const plan = store.planTermRetrofitJob({
+    requestId: "retrofit-alpha-model",
+    runId,
+    ruleRevisionId: commit.revisionIds[0]!,
+    expectedGeneration: state.generation,
+    expectedSnapshotId: state.snapshotId,
+  });
+  assert.equal(plan.summary.modelRetranslate, 1);
+
+  const applied = store.applyTermRetrofitJob(
+    runId,
+    plan.jobId,
+    plan.planHash,
+  );
+  assert.equal(applied.status, "running");
+  assert.equal(store.revalidationTasks(runId).length, 1);
+  assert.equal(store.revalidationTasks(runId)[0]?.status, "pending");
+  store.close();
+});
+
 test("contextual occurrences keep clean coverage when the receipt is omitted", () => {
   const store = new LosslessBookStore(fixturePath());
   const runId = initialize(store);

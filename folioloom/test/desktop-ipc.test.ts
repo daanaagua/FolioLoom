@@ -490,6 +490,24 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
           latestMigration: "lossless-book-schema-v3",
         } satisfies DesktopKnowledgeDiagnostics);
       },
+      terminologyControlState() {
+        return ok({ queuedChanges: [], retrofitJobs: [] });
+      },
+      cancelQueuedTerminologyChange() {
+        return ok({ queuedChanges: [], retrofitJobs: [] });
+      },
+      planTermRetrofit() {
+        return fail("TERM_RETROFIT_NOT_FOUND", "not found");
+      },
+      applyTermRetrofit() {
+        return fail("TERM_RETROFIT_NOT_FOUND", "not found");
+      },
+      cancelTermRetrofit() {
+        return fail("TERM_RETROFIT_NOT_FOUND", "not found");
+      },
+      rollbackTermRetrofit() {
+        return fail("TERM_RETROFIT_NOT_FOUND", "not found");
+      },
     },
     knowledgeImportService: {
       registerPending(path) {
@@ -677,6 +695,12 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:start-fullbook",
       "folioloom:start-trial",
       "folioloom:cancel-trial",
+      "folioloom:terminology-state",
+      "folioloom:terminology-queue-cancel",
+      "folioloom:terminology-retrofit-plan",
+      "folioloom:terminology-retrofit-apply",
+      "folioloom:terminology-retrofit-cancel",
+      "folioloom:terminology-retrofit-rollback",
     ].sort());
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });

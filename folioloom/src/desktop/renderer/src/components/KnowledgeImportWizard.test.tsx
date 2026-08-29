@@ -162,6 +162,12 @@ function importApi(options: {
     listGlobalKnowledge: unavailable,
     attachGlobalKnowledge: unavailable,
     getKnowledgeDiagnostics: unavailable,
+    getTerminologyControlState: unavailable,
+    cancelQueuedTerminologyChange: unavailable,
+    planTermRetrofit: unavailable,
+    applyTermRetrofit: unavailable,
+    cancelTermRetrofit: unavailable,
+    rollbackTermRetrofit: unavailable,
     chooseKnowledgeImport: vi.fn().mockResolvedValue(ok(pending())),
     inspectKnowledgeImport: vi.fn().mockImplementation(() =>
       options.inspectResult ?? Promise.resolve(ok(inspection()))),

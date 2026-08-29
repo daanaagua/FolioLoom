@@ -6,9 +6,9 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current release is **FolioLoom v1.6.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.7.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-## What v1.6.0 can do
+## What v1.7.0 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
@@ -20,6 +20,9 @@ The current release is **FolioLoom v1.6.0**. The production TypeScript core live
 - Use newly imported EPUB files as export templates, preserving footnotes, backlinks, cross-chapter links, external URLs, OPF/spine/nav structure, styles, and other resources. FolioLoom refuses to publish an EPUB when structural slots or internal links are invalid.
 - Use the Electron desktop app to import books, connect models, run a trial translation, translate a full book, pause and resume, export results, and maintain terminology and narrative memory.
 - Import terminology from JSON, YAML, CSV, or XLSX files, with field mapping and conflict handling before data is written.
+- Review and submit terminology edits while a full-book run is active. In-flight requests keep their old snapshot; accepted edits are applied once at the next durable wave boundary.
+- Give one entity or term different Chinese renderings over immutable source-block ranges, with deterministic precedence and explicit overlap conflicts.
+- Preview and run audited terminology retrofits. Receipt-backed unambiguous changes use local versioned repair; uncertain cases reuse sparse model revalidation; every job is resumable, rollback-capable, and an explicit strict-export gate.
 - Apply language profiles for English, German, French, Spanish, Russian, Japanese, and Korean, with support for common Unicode encodings, Windows-1252, and legacy Japanese and Korean encodings.
 - Export privacy-safe diagnostic JSON without API keys, book text, translations, or complete private paths.
 - Show text blocks requiring attention, failure categories, public error codes, and next actions in the desktop app. Recoverable incidents receive at most one safe retry through shadow audit and atomic promotion.
@@ -30,7 +33,7 @@ The current release is **FolioLoom v1.6.0**. The production TypeScript core live
 
 ## V4 Flash 100K benchmark
 
-FolioLoom v1.5.1 was tested on fresh project databases with the current `deepseek-v4-flash` model, Active/Balanced scheduling, and three concurrent requests. v1.5.2 added EPUB structure preservation, v1.5.3 added desktop handling and recovery workflows, and v1.6.0 adds the separate Codex worker path without changing these historical measurements.
+FolioLoom v1.5.1 was tested on fresh project databases with the current `deepseek-v4-flash` model, Active/Balanced scheduling, and three concurrent requests. v1.5.2 added EPUB structure preservation, v1.5.3 added desktop handling and recovery workflows, v1.6.0 added the separate Codex worker path, and v1.7.0 adds live terminology control and audited retrofit jobs without changing these historical measurements.
 
 - German, *The Metamorphosis*: **10 minutes 55 seconds** for the first 100K characters.
 - English, Part One of *Children of Time*: **18 minutes 56 seconds** for the first 100K characters.
@@ -42,7 +45,7 @@ Both runs passed strict export and audit with no human-required or failed window
 - Releases currently include a Windows x64 single-file portable build and a portable ZIP, but they are not code-signed.
 - The local V4 adjudication page and legacy Streamlit page remain in the repository but are not the primary interface.
 - Offline regression tests and live-model one-window and three-window gates are complete; a full-book quality benchmark for the latest architecture has not yet been published.
-- The desktop app supports book import, model compatibility checks, single-fragment trials, full-book start/pause/resume, the attention center, and strict export. Paragraph-level manual rewriting and batch review are still planned.
+- The desktop app supports book import, model compatibility checks, single-fragment trials, full-book start/pause/resume, live terminology review, audited batch term correction, the attention center, and strict export. Paragraph-level manual rewriting and general batch review are still planned.
 - The desktop app includes DeepSeek, Kimi, Alibaba Cloud Model Studio, Volcano Ark, OpenAI, SiliconFlow, and custom OpenAI-compatible endpoints. DeepSeek accepts only V4 Flash/Pro, and every model must pass a live compatibility check.
 - The Codex worker is currently a CLI/skill workflow, requires a locally installed and signed-in Codex CLI, and intentionally runs with `--max-concurrency 1`. It is not yet exposed in the desktop app.
 - Original-template EPUB preservation applies only to projects re-imported with v1.5.2 or later. Older projects are not fuzzily aligned to guessed link positions; re-import the original EPUB before translating.
@@ -104,9 +107,30 @@ npm.cmd run folioloom -- book status `
 
 After reviewing the trial translation, repeat `book run` without `--max-windows 1` to continue. The runner skips windows that have already been committed.
 
+## Live terminology and audited correction
+
+The desktop “Terminology & Memory” workbench can save terminology while translation is active. Changes made during an in-flight window are durably queued and become visible at the next wave boundary. A rendering rule may cover the whole book or an inclusive immutable source-block range; FolioLoom rejects stale endpoints and equal-precedence overlaps instead of guessing.
+
+After saving a rule, open “Terminology Control” to preview its exact impact. Applying the locked plan creates new translation versions for receipt-backed local repairs and schedules the existing sparse model-revalidation path for ambiguous blocks. Planned jobs can be cancelled; completed or attention-required jobs can be rolled back. Queued edits, pending active term impacts, and unfinished retrofit items block strict export.
+
+The same control plane is available to CLI and the private Codex skill:
+
+```powershell
+npm.cmd run folioloom -- book knowledge queue-status --store <book.db> --run <run-id>
+npm.cmd run folioloom -- book retrofit plan --store <book.db> --run <run-id> `
+  --revision <rule-revision-id> --request <unique-request-id>
+npm.cmd run folioloom -- book retrofit apply --store <book.db> --run <run-id> `
+  --job <job-id> --plan-hash <plan-hash>
+npm.cmd run folioloom -- book retrofit status --store <book.db> --run <run-id>
+npm.cmd run folioloom -- book retrofit rollback --store <book.db> --run <run-id> `
+  --job <job-id>
+```
+
+Typed term-upsert JSON and the complete safe workflow are documented in [the terminology-control reference](.agents/skills/folioloom-translate/references/terminology-control.md). The CLI and skill never edit SQLite directly.
+
 ## Translate with a signed-in Codex CLI
 
-FolioLoom v1.6.0 can use an isolated `codex exec` subprocess as its model transport. This path reuses your local interactive Codex login, so it does not require a separate model API key. FolioLoom still owns source identity, bounded requests, validation, recovery, SQLite commits, audit, and export; each subprocess sees only its current model job and cannot write to the project.
+FolioLoom v1.7.0 can use an isolated `codex exec` subprocess as its model transport. This path reuses your local interactive Codex login, so it does not require a separate model API key. FolioLoom still owns source identity, bounded requests, validation, recovery, SQLite commits, audit, and export; each subprocess sees only its current model job and cannot write to the project.
 
 Install the Codex CLI, run `codex login`, then start Codex from the repository root. The repository-scoped skill is discovered from `.agents/skills/folioloom-translate`; invoke it directly with a file rather than pasting the book into chat:
 

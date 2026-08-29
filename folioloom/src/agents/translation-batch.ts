@@ -441,14 +441,19 @@ async function validateAndRepair(
     block.id,
     losslessAsV4(block),
   ]));
-  const validationPolicy = {
-    allowedLatinTokens: input.stableTerms.flatMap((term) => [
+  const validationPolicy = (blockIds: ReadonlySet<string>) => {
+    const terms = input.stableTerms.filter((term) =>
+      term.applicableBlockIds === undefined
+      || term.applicableBlockIds.some((blockId) => blockIds.has(blockId)));
+    return {
+    allowedLatinTokens: terms.flatMap((term) => [
       term.sourceForm,
       term.canonicalSource,
     ]),
-    requiredTerms: input.stableTerms.filter((term) => term.locked)
+    requiredTerms: terms.filter((term) => term.locked)
       .map((term) => ({ sourceForm: term.sourceForm, target: term.target })),
     sourceLanguageProfile: input.sourceLanguageProfile,
+    };
   };
   type InvalidWindow = {
     window: TranslationBatchWindowResult;
@@ -486,7 +491,11 @@ async function validateAndRepair(
       continue;
     }
     const blocks = blocksByWindowId.get(window.windowId) ?? [];
-    const validation = validator.validate(blocks, candidateFor(window), validationPolicy);
+    const validation = validator.validate(
+      blocks,
+      candidateFor(window),
+      validationPolicy(new Set(blocks.map((block) => block.id))),
+    );
     addFailures(window, [
       ...validation.failures,
       ...termFailuresForWindow(window, expectedOccurrences),
@@ -667,7 +676,7 @@ async function validateAndRepair(
     const validation = validator.validate(
       item.blocks,
       candidateFor(window),
-      validationPolicy,
+      validationPolicy(new Set(item.blocks.map((block) => block.id))),
     );
     const termFailures = termFailuresForWindow(window, expectedOccurrences);
     const additionalFailures =

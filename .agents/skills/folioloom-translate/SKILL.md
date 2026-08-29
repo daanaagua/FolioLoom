@@ -134,6 +134,21 @@ polling logs repeatedly. Give the user a concise progress update at least once p
 On cancellation or connection loss, let the process terminate, then inspect `book status` and
 resume the same run from its durable boundary. Do not delete or hand-edit `book.db`.
 
+## Review terminology during a run
+
+The knowledge workbench remains readable while translation is running. Use the typed CLI
+control plane for live edits and post-translation correction; never open or modify SQLite
+directly. A valid edit may return `queued` while a window is in flight. That means it is
+durable but not yet effective: the current request keeps its old snapshot and FolioLoom
+applies the edit once at the next safe wave boundary.
+
+Read [references/terminology-control.md](references/terminology-control.md) when the user asks
+to inspect or change a term, apply different names to different parts of the book, bulk-fix
+an existing translation, inspect a queued edit, or roll such a change back. Always dry-run a
+retrofit first and report its `noop`, `localRepair`, `modelRetranslate`, and `humanRequired`
+counts before applying it. Do not treat a local Chinese string match as proof that replacement
+is safe; FolioLoom permits local repair only from exact source occurrence receipts.
+
 ## Audit and strictly export
 
 Do not equate "all model calls returned" with completion. Once status has no pending,
@@ -151,6 +166,7 @@ Do not pass `--allow-incomplete` for final delivery. Add the reported EPUB path 
 - every planned window and block is complete;
 - usage is complete and the token ledger is reconciled;
 - knowledge is converged and concept coverage has no missing/stale binding;
+- no queued/applying knowledge command or unfinished/attention retrofit item remains;
 - strict export is true and verify-export returns `ok: true`;
 - no human-required, failed, pending revalidation, or integrity incident remains.
 

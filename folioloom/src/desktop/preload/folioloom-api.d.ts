@@ -22,6 +22,11 @@ import type {
   DesktopKnowledgeMutationRequest,
   DesktopKnowledgeMutationResult,
   DesktopKnowledgePage,
+  DesktopTerminologyControlState,
+  DesktopPlanTermRetrofitRequest,
+  DesktopApplyTermRetrofitRequest,
+  DesktopTermRetrofitPlan,
+  DesktopTermRetrofitJob,
   DesktopPromoteKnowledgeRequest,
   DesktopSuggestKnowledgeImportRequest,
   DesktopModelOption,
@@ -85,6 +90,12 @@ export interface FolioLoomDesktopApi {
   listGlobalKnowledge(request: DesktopGlobalKnowledgeListRequest): Promise<DesktopResult<DesktopGlobalKnowledgePage>>;
   attachGlobalKnowledge(request: DesktopAttachGlobalKnowledgeRequest): Promise<DesktopResult<DesktopKnowledgeMutationResult>>;
   getKnowledgeDiagnostics(): Promise<DesktopResult<DesktopKnowledgeDiagnostics>>;
+  getTerminologyControlState(): Promise<DesktopResult<DesktopTerminologyControlState>>;
+  cancelQueuedTerminologyChange(requestId: string): Promise<DesktopResult<DesktopTerminologyControlState>>;
+  planTermRetrofit(request: DesktopPlanTermRetrofitRequest): Promise<DesktopResult<DesktopTermRetrofitPlan>>;
+  applyTermRetrofit(request: DesktopApplyTermRetrofitRequest): Promise<DesktopResult<DesktopTermRetrofitJob>>;
+  cancelTermRetrofit(jobId: string): Promise<DesktopResult<DesktopTermRetrofitJob>>;
+  rollbackTermRetrofit(jobId: string): Promise<DesktopResult<DesktopTermRetrofitJob>>;
   chooseKnowledgeImport(): Promise<DesktopResult<PendingKnowledgeImport>>;
   inspectKnowledgeImport(request: InspectImportRequest): Promise<DesktopResult<ImportInspectionResult>>;
   confirmKnowledgeImportEncoding(request: ConfirmImportEncodingRequest): Promise<DesktopResult<ImportInspectionResult>>;
