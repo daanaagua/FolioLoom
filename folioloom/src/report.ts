@@ -195,6 +195,7 @@ const KNOWLEDGE_CONVERGENCE_INCIDENTS = new Set([
   "PENDING_KNOWLEDGE_CHANGE",
   "PENDING_TERM_IMPACT",
   "TERM_RETROFIT_INCOMPLETE",
+  "TERM_RETROFIT_INTEGRITY_INVALID",
 ]);
 
 function sha256(text: string): string {
@@ -534,7 +535,11 @@ export function auditLosslessBookStore(
     && controlPlane.queuedKnowledgeChanges === 0
     && controlPlane.pendingActiveTermImpacts === 0
     && controlPlane.openRetrofitItems === 0
-    && controlPlane.attentionRetrofitItems === 0;
+    && controlPlane.attentionRetrofitItems === 0
+    && state.invalidTermRetrofitBlockIds.length === 0;
+  if (state.invalidTermRetrofitBlockIds.length > 0) {
+    incidents.push("TERM_RETROFIT_INTEGRITY_INVALID");
+  }
   if (controlPlane.queuedKnowledgeChanges > 0) {
     incidents.push("PENDING_KNOWLEDGE_CHANGE");
   }

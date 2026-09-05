@@ -6,9 +6,11 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.7.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.7.1**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-## What v1.7.0 can do
+v1.7.1 fixes cascading terminology replacements, audits persisted local edits before strict export, supports multi-form rules, detects every highest-precedence conflict, and safely recovers confirmed dead-owner run locks. Indexed terminology resolution removes a quadratic hot path. See the [patch notes](docs/releases/v1.7.1.md) for upgrade boundaries and validation.
+
+## What v1.7.1 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
@@ -130,7 +132,7 @@ Typed term-upsert JSON and the complete safe workflow are documented in [the ter
 
 ## Translate with a signed-in Codex CLI
 
-FolioLoom v1.7.0 can use an isolated `codex exec` subprocess as its model transport. This path reuses your local interactive Codex login, so it does not require a separate model API key. FolioLoom still owns source identity, bounded requests, validation, recovery, SQLite commits, audit, and export; each subprocess sees only its current model job and cannot write to the project.
+FolioLoom v1.7.1 can use an isolated `codex exec` subprocess as its model transport. This path reuses your local interactive Codex login, so it does not require a separate model API key. FolioLoom still owns source identity, bounded requests, validation, recovery, SQLite commits, audit, and export; each subprocess sees only its current model job and cannot write to the project.
 
 Install the Codex CLI, run `codex login`, then start Codex from the repository root. The repository-scoped skill is discovered from `.agents/skills/folioloom-translate`; invoke it directly with a file rather than pasting the book into chat:
 

@@ -130,7 +130,7 @@ import {
 } from "../knowledge/term-retrofit.js";
 import {
   createTermRenderingRule,
-  resolveTermRenderingRule,
+  compileTermRenderingRules,
   ruleAppliesToBlock,
   validateTermRuleSelector,
   type TermRenderingRule,
@@ -695,6 +695,7 @@ export interface LosslessAuditState {
   pendingActiveTermImpactCount: number;
   openTermRetrofitItemCount: number;
   attentionTermRetrofitItemCount: number;
+  invalidTermRetrofitBlockIds: string[];
 }
 
 type LosslessStoreOpenMode = "read-write" | "read-only";
@@ -6778,6 +6779,8 @@ export class LosslessBookStore {
       pendingActiveTermImpactCount,
       openTermRetrofitItemCount,
       attentionTermRetrofitItemCount,
+      invalidTermRetrofitBlockIds: this.#schemaVersion === LOSSLESS_BOOK_SCHEMA_VERSION
+        ? this.#invalidTermRetrofitBlockIds(runId) : [],
     };
   }
 
@@ -7857,15 +7860,98 @@ export class LosslessBookStore {
     `), run.source_version);
     const forms = [...new Set(rules.flatMap((rule) => rule.sourceForms)
       .map((form) => profile.normalizeSourceForm(form)))];
+    const resolver = compileTermRenderingRules(rules,
+      (form) => profile.normalizeSourceForm(form));
     for (const block of blocks) {
       for (const form of forms) {
-        resolveTermRenderingRule(rules, form, {
+        resolver.resolve(form, {
           sourceVersion: run.source_version,
           blockId: block.block_id,
           globalIndex: block.global_index,
         });
       }
     }
+  }
+
+  /** Replay local edits from their original text/receipts, including ancestors
+   * of a current local edit. Do not trust persisted plan hashes or `clean`
+   * bindings alone: older versions could create a self-consistent bad edit. */
+  #invalidTermRetrofitBlockIds(runId: string): string[] {
+    const rows = all<{
+      job_id: string; ordinal: number; block_id: string; source_version: string;
+      old_translation_id: number; new_translation_id: number;
+      old_text: string | null; new_text: string | null; active: number;
+      global_index: number; source_text: string;
+    }>(this.#database.prepare(`
+      SELECT item.job_id, item.ordinal, item.block_id, item.source_version,
+             item.old_translation_id, item.new_translation_id,
+             old.text AS old_text, next.text AS new_text, next.active,
+             block.global_index, block.source_text
+      FROM term_retrofit_items AS item
+      JOIN term_retrofit_jobs AS job ON job.job_id=item.job_id
+      LEFT JOIN translations AS old ON old.translation_id=item.old_translation_id
+      LEFT JOIN translations AS next ON next.translation_id=item.new_translation_id
+      JOIN logical_blocks AS block
+        ON block.block_id=item.block_id AND block.source_version=item.source_version
+      WHERE job.run_id=? AND job.status NOT IN ('cancelled','rolled_back')
+        AND item.classification='local_repair' AND item.new_translation_id IS NOT NULL
+    `), runId);
+    if (rows.length === 0) return [];
+    const byNewId = new Map(rows.map((row) => [row.new_translation_id, row]));
+    const relevant = new Set<number>();
+    for (const row of rows.filter((item) => item.active === 1)) {
+      let current: typeof row | undefined = row;
+      while (current !== undefined && !relevant.has(current.new_translation_id)) {
+        relevant.add(current.new_translation_id);
+        current = byNewId.get(current.old_translation_id);
+      }
+    }
+    const invalid = new Set<string>();
+    const envelopes = new Map<string, PersistedTermRetrofitPlanEnvelope>();
+    const bindings = this.#database.prepare(`
+      SELECT term_usages_json FROM translation_concept_bindings
+      WHERE translation_id=? ORDER BY concept_id
+    `);
+    const payload = JSON.parse(this.#source(this.#run(runId).source_version)
+      .source_payload_json) as { sourceLanguage?: unknown };
+    const profile = getSourceLanguageProfile(typeof payload.sourceLanguage === "string"
+      ? payload.sourceLanguage : undefined);
+    for (const row of rows) {
+      if (!relevant.has(row.new_translation_id)) continue;
+      try {
+        if (row.old_text === null || row.new_text === null
+          || row.old_translation_id >= row.new_translation_id) throw new Error("invalid edit lineage");
+        let envelope = envelopes.get(row.job_id);
+        if (envelope === undefined) {
+          envelope = this.#termRetrofitPlanEnvelope(this.#termRetrofitJobRow(runId, row.job_id));
+          envelopes.set(row.job_id, envelope);
+        }
+        const original = envelope.plan.items[row.ordinal];
+        if (original?.translationId !== row.old_translation_id
+          || original.blockId !== row.block_id || original.classification !== "local_repair") {
+          throw new Error("invalid edit identity");
+        }
+        const replay = planTermRetrofit({
+          runId, ruleRevisionId: envelope.plan.ruleRevisionId,
+          baseGeneration: envelope.plan.baseGeneration,
+          baseSnapshotId: envelope.plan.baseSnapshotId,
+          rule: envelope.rule, profile,
+          blocks: [{
+            blockId: row.block_id, sourceVersion: row.source_version,
+            globalIndex: row.global_index, sourceText: row.source_text,
+            translationId: row.old_translation_id, translationText: row.old_text,
+            termUsages: all<{ term_usages_json: string }>(bindings, row.old_translation_id)
+              .flatMap((binding) => termUsagesFromJson(binding.term_usages_json)),
+          }],
+        }).items[0];
+        if (replay?.classification !== "local_repair" || replay.replacementText !== row.new_text) {
+          invalid.add(row.block_id);
+        }
+      } catch {
+        invalid.add(row.block_id);
+      }
+    }
+    return [...invalid].sort();
   }
 
   #termRetrofitSourceBlocks(runId: string): TermRetrofitSourceBlock[] {

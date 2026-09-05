@@ -6,9 +6,11 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.7.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.7.1**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.7.0 能做什么
+v1.7.1 修复批量修词级联替换，严格导出会重新审计已落库的本地修词；支持一条规则包含多个原文词形，完整检测最高优先级冲突，安全恢复已确认退出的进程遗留锁。术语索引消除了平方级解析热点。升级边界与验收结果见[补丁说明](docs/releases/v1.7.1.md)。
+
+## V1.7.1 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -130,7 +132,7 @@ npm.cmd run folioloom -- book retrofit rollback --store <book.db> --run <run-id>
 
 ## 使用已登录的 Codex CLI 翻译
 
-FolioLoom v1.7.0 可以把隔离的 `codex exec` 子进程用作模型传输层。它复用本机 Codex 的交互式登录，因此不需要单独的模型 API Key。原文身份、有界请求、校验、恢复、SQLite 提交、审计与导出仍由 FolioLoom 负责；每个子进程只看到当前模型任务，且不能写入项目。
+FolioLoom v1.7.1 可以把隔离的 `codex exec` 子进程用作模型传输层。它复用本机 Codex 的交互式登录，因此不需要单独的模型 API Key。原文身份、有界请求、校验、恢复、SQLite 提交、审计与导出仍由 FolioLoom 负责；每个子进程只看到当前模型任务，且不能写入项目。
 
 安装 Codex CLI 并执行 `codex login` 后，从仓库根目录启动 Codex。Codex 会从 `.agents/skills/folioloom-translate` 发现仓库级 skill；直接传入待翻译文件，不要把整本书粘贴进对话：
 
