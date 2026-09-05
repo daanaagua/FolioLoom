@@ -144,3 +144,14 @@ test("manual authority wins over a higher-priority glossary seed", () => {
     { sourceVersion: "source-v1", blockId: "block-1", globalIndex: 1 },
   )?.target, "新译");
 });
+
+test("checks every equal-precedence rule, including a conflicting third candidate", () => {
+  const rules = ["a", "b", "c"].map((ruleId) => createTermRenderingRule({
+    ...wholeBook, ruleId, target: ruleId === "c" ? "异译" : "同译",
+    allowedTargets: [ruleId === "c" ? "异译" : "同译"],
+  }));
+  for (const permutation of [rules, [...rules].reverse(), [rules[1]!, rules[2]!, rules[0]!]]) {
+    assert.throws(() => resolveTermRenderingRule(permutation, "Severian",
+      { sourceVersion: "s", blockId: "b", globalIndex: 0 }), /TERM_RULE_CONFLICT/);
+  }
+});

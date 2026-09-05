@@ -24,6 +24,39 @@ const rule = createTermRenderingRule({
   authorityRank: 60,
 });
 
+function renamePlan(text: string, surfaces: string[]) {
+  return planTermRetrofit({
+    runId: "run-a", ruleRevisionId: "d".repeat(64), baseGeneration: 0,
+    baseSnapshotId: "snapshot", profile: getSourceLanguageProfile("de"),
+    rule: createTermRenderingRule({ ...rule, target: "新船长", allowedTargets: ["新船长"] }),
+    blocks: [{ blockId: "block-1", sourceVersion: "source-v1", globalIndex: 1,
+      sourceText: surfaces.map(() => "Prokurist").join(" "), translationId: 1,
+      translationText: text, termUsages: surfaces.map((surface, index) => ({
+        occurrenceId: `occurrence-${index}`, blockId: "block-1", conceptId: "captain",
+        sourceForm: "Prokurist", sourceStart: index * 10, sourceEnd: index * 10 + 9,
+        discourseRole: "narrative", targetSurface: surface,
+      })),
+    }],
+  }).items[0]!;
+}
+
+test("repairs all original target spans once without rewriting inserted text", () => {
+  const item = renamePlan("舰队长走来。船长停下。", ["舰队长", "船长"]);
+  assert.equal(item.classification, "local_repair");
+  assert.equal(item.replacementText, "新船长走来。新船长停下。");
+});
+
+test("declines substring repair inside an already allowed target", () => {
+  const item = renamePlan("新船长走来。", ["船长"]);
+  assert.equal(item.classification, "model_retranslate");
+  assert.equal(item.replacementText, undefined);
+});
+
+test("declines intersecting target spans even when neither surface contains the other", () => {
+  const item = renamePlan("甲乙丙。", ["甲乙", "乙丙"]);
+  assert.equal(item.classification, "model_retranslate");
+});
+
 test("plans only receipt-backed unique surfaces as local repairs", () => {
   const plan = planTermRetrofit({
     runId: "run-a",

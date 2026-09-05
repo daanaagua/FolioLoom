@@ -68,9 +68,21 @@ function normalized(value: string, profile: SourceLanguageProfile): string {
   return profile.normalizeSourceForm(value);
 }
 
-function occurrences(text: string, surface: string): number {
-  if (surface.length === 0) return 0;
-  return text.split(surface).length - 1;
+interface TargetSpan { start: number; end: number }
+
+function spans(text: string, surface: string): TargetSpan[] {
+  const result: TargetSpan[] = [];
+  if (surface.length === 0) return result;
+  // Advance by one, not surface.length: self-overlapping matches are ambiguous.
+  for (let start = text.indexOf(surface); start !== -1;
+    start = text.indexOf(surface, start + 1)) {
+    result.push({ start, end: start + surface.length });
+  }
+  return result;
+}
+
+function overlaps(left: TargetSpan, right: TargetSpan): boolean {
+  return left.start < right.end && right.start < left.end;
 }
 
 function sha256(value: string): string {
@@ -127,16 +139,24 @@ function classify(
   for (const usage of disallowed) {
     counts.set(usage.targetSurface, (counts.get(usage.targetSurface) ?? 0) + 1);
   }
-  const surfaces = [...counts.keys()].sort((left, right) =>
-    right.length - left.length || left.localeCompare(right, "zh-Hans"));
-  const overlapping = surfaces.some((surface, index) =>
-    surfaces.some((other, otherIndex) =>
-      index !== otherIndex && other.includes(surface)));
-  const exact = !overlapping
-    && rule.policy === "locked"
-    && surfaces.length > 0
-    && surfaces.every((surface) =>
-      occurrences(block.translationText, surface) === counts.get(surface));
+  const matches = [...counts].map(([surface, count]) => ({
+    surface, count, spans: spans(block.translationText, surface),
+  }));
+  const patches = matches.flatMap((match) => match.spans)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const protectedSurfaces = new Set([
+    ...rule.allowedTargets,
+    ...block.termUsages.filter((usage) => !disallowed.includes(usage))
+      .map((usage) => usage.targetSurface),
+  ]);
+  const protectedSpans = [...protectedSurfaces]
+    .flatMap((surface) => spans(block.translationText, surface));
+  const exact = rule.policy === "locked"
+    && matches.length > 0
+    && matches.every((match) => match.surface.length > 0 && match.spans.length === match.count)
+    && patches.every((patch, index) =>
+      (index === 0 || !overlaps(patches[index - 1]!, patch))
+      && !protectedSpans.some((protectedSpan) => overlaps(patch, protectedSpan)));
   if (!exact) {
     return {
       blockId: block.blockId,
@@ -147,10 +167,15 @@ function classify(
       reason: "target_surface_is_ambiguous_or_contextual",
     };
   }
-  let replacementText = block.translationText;
-  for (const surface of surfaces) {
-    replacementText = replacementText.replaceAll(surface, rule.target);
+  // All offsets belong to the original text. Inserted text is never scanned.
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const patch of patches) {
+    parts.push(block.translationText.slice(cursor, patch.start), rule.target);
+    cursor = patch.end;
   }
+  parts.push(block.translationText.slice(cursor));
+  const replacementText = parts.join("");
   if (replacementText.split(/\r?\n/u).length
     !== block.translationText.split(/\r?\n/u).length) {
     return {

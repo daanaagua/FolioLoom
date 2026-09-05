@@ -187,26 +187,43 @@ export function resolveTermRenderingRule(
   sourceForm: string,
   block: TermRuleBlockPosition,
 ): TermRenderingRule | undefined {
-  const normalized = normalizedForm(text(sourceForm, "sourceForm", 128));
-  const candidates = rules.filter((rule) =>
-    rule.sourceForms.some((form) => normalizedForm(form) === normalized)
-    && ruleAppliesToBlock(rule, block));
-  candidates.sort((left, right) =>
+  return compileTermRenderingRules(rules).resolve(sourceForm, block);
+}
+
+/** Compile once per knowledge projection; resolve only the matching spelling. */
+export function compileTermRenderingRules(
+  rules: readonly TermRenderingRule[],
+  normalize: (value: string) => string = normalizedForm,
+): { resolve(sourceForm: string, block: TermRuleBlockPosition): TermRenderingRule | undefined } {
+  const byForm = new Map<string, TermRenderingRule[]>();
+  const precedence = (left: TermRenderingRule, right: TermRenderingRule): number =>
     right.authorityRank - left.authorityRank
     || compareSpecificity(left, right)
-    || right.priority - left.priority
-    || left.ruleId.localeCompare(right.ruleId, "und"));
-  const winner = candidates[0];
-  const runnerUp = candidates[1];
-  if (winner !== undefined
-    && runnerUp !== undefined
-    && winner.authorityRank === runnerUp.authorityRank
-    && compareSpecificity(winner, runnerUp) === 0
-    && winner.priority === runnerUp.priority
-    && !sameRendering(winner, runnerUp)) {
-    throw new Error(
-      `TERM_RULE_CONFLICT: ${winner.ruleId} conflicts with ${runnerUp.ruleId}`,
-    );
+    || right.priority - left.priority;
+  for (const rule of rules) {
+    for (const form of new Set(rule.sourceForms.map(normalize))) {
+      const bucket = byForm.get(form) ?? [];
+      bucket.push(rule);
+      byForm.set(form, bucket);
+    }
   }
-  return winner;
+  for (const bucket of byForm.values()) {
+    bucket.sort((left, right) => precedence(left, right)
+      || left.ruleId.localeCompare(right.ruleId, "und"));
+  }
+  return {
+    resolve(sourceForm, block) {
+      const candidates = byForm.get(normalize(text(sourceForm, "sourceForm", 128))) ?? [];
+      let winner: TermRenderingRule | undefined;
+      for (const candidate of candidates) {
+        if (!ruleAppliesToBlock(candidate, block)) continue;
+        if (winner === undefined) { winner = candidate; continue; }
+        if (precedence(winner, candidate) !== 0) break;
+        if (!sameRendering(winner, candidate)) {
+          throw new Error(`TERM_RULE_CONFLICT: ${winner.ruleId} conflicts with ${candidate.ruleId}`);
+        }
+      }
+      return winner;
+    },
+  };
 }

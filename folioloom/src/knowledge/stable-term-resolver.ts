@@ -1,8 +1,10 @@
 import type { StableTerm } from "../domain/types.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { canonicalJson } from "./knowledge-store.js";
 import {
   createTermRenderingRule,
-  resolveTermRenderingRule,
+  compileTermRenderingRules,
+  type TermRenderingRule,
   type TermRuleBlockPosition,
 } from "./term-rendering-rule.js";
 
@@ -28,15 +30,14 @@ export function resolveStableTermsForBlocks(
   blocks: readonly TermRuleBlockPosition[],
   profile: SourceLanguageProfile,
 ): StableTerm[] {
-  const termByRuleId = new Map<string, StableTerm>();
-  const rules = terms.map((term) => {
+  const rules = new Map<string, TermRenderingRule>();
+  const signatures = new Map<string, string>();
+  const formsByRule = new Map<string, Set<string>>();
+  const termsByForm = new Map<string, Map<string, number[]>>();
+  const normalize = (value: string): string => profile.normalizeSourceForm(value);
+  terms.forEach((term, index) => {
     const id = ruleId(term);
-    const previous = termByRuleId.get(id);
-    if (previous !== undefined && previous !== term) {
-      throw new Error(`TERM_RULE_ID_CONFLICT: ${id}`);
-    }
-    termByRuleId.set(id, term);
-    return createTermRenderingRule({
+    const rule = createTermRenderingRule({
       ruleId: id,
       conceptId: term.baseConceptId ?? term.conceptId,
       ...(term.entityId === undefined ? {} : { entityId: term.entityId }),
@@ -48,27 +49,57 @@ export function resolveStableTermsForBlocks(
       priority: term.priority ?? 0,
       authorityRank: authorityRank(term),
     });
+    // A rule may have several lexemes. Only its spelling varies; conflicting
+    // metadata under one durable rule ID must still fail closed.
+    const signature = canonicalJson({
+      ...rule,
+      sourceForms: [],
+      bindingConceptId: term.conceptId,
+      revisionId: term.revisionId ?? null,
+      renderFingerprint: term.renderFingerprint ?? null,
+    });
+    if (signatures.has(id) && signatures.get(id) !== signature) {
+      throw new Error(`TERM_RULE_ID_CONFLICT: ${id}`);
+    }
+    signatures.set(id, signature);
+    rules.set(id, rule);
+    const forms = formsByRule.get(id) ?? new Set<string>();
+    forms.add(term.sourceForm);
+    formsByRule.set(id, forms);
+    const form = normalize(term.sourceForm);
+    const byRule = termsByForm.get(form) ?? new Map<string, number[]>();
+    const indices = byRule.get(id) ?? [];
+    indices.push(index);
+    byRule.set(id, indices);
+    termsByForm.set(form, byRule);
   });
-  const normalizedForms = [...new Set(terms.map((term) =>
-    profile.normalizeSourceForm(term.sourceForm)))].sort();
-  const blockIdsByRule = new Map<string, string[]>();
-  const firstBlockOrder = new Map<string, number>();
+  const resolver = compileTermRenderingRules([...rules].map(([id, rule]) => ({
+    ...rule, sourceForms: [...formsByRule.get(id)!],
+  })), normalize);
+  const normalizedForms = [...termsByForm.keys()].sort();
+  const blockIdsByTerm = new Map<number, Set<string>>();
+  const firstBlockOrder = new Map<number, number>();
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index]!;
     for (const form of normalizedForms) {
-      const winner = resolveTermRenderingRule(rules, form, block);
+      const winner = resolver.resolve(form, block);
       if (winner === undefined) continue;
-      const ids = blockIdsByRule.get(winner.ruleId) ?? [];
-      if (!ids.includes(block.blockId)) ids.push(block.blockId);
-      blockIdsByRule.set(winner.ruleId, ids);
-      if (!firstBlockOrder.has(winner.ruleId)) {
-        firstBlockOrder.set(winner.ruleId, index);
+      for (const termIndex of termsByForm.get(form)!.get(winner.ruleId)!) {
+        const ids = blockIdsByTerm.get(termIndex) ?? new Set<string>();
+        ids.add(block.blockId);
+        blockIdsByTerm.set(termIndex, ids);
+        if (!firstBlockOrder.has(termIndex)) firstBlockOrder.set(termIndex, index);
       }
     }
   }
-  return [...blockIdsByRule.entries()]
-    .map(([id, applicableBlockIds]) => {
-      const term = termByRuleId.get(id) as StableTerm;
+  return [...blockIdsByTerm.entries()]
+    .sort(([left], [right]) =>
+      (firstBlockOrder.get(left) ?? 0) - (firstBlockOrder.get(right) ?? 0)
+      || terms[left]!.sourceForm.localeCompare(terms[right]!.sourceForm, profile.locale)
+      || ruleId(terms[left]!).localeCompare(ruleId(terms[right]!), "und"))
+    .map(([index, blockIds]) => {
+      const term = terms[index]!;
+      const applicableBlockIds = [...blockIds];
       const isPartiallyShadowed = applicableBlockIds.length < blocks.length;
       return term.applicability === undefined && !isPartiallyShadowed
         ? { ...term }
@@ -76,10 +107,5 @@ export function resolveStableTermsForBlocks(
             ...term,
             applicableBlockIds: Object.freeze(applicableBlockIds),
           };
-    })
-    .sort((left, right) =>
-      (firstBlockOrder.get(ruleId(left)) ?? 0)
-        - (firstBlockOrder.get(ruleId(right)) ?? 0)
-      || left.sourceForm.localeCompare(right.sourceForm, profile.locale)
-      || ruleId(left).localeCompare(ruleId(right), "und"));
+    });
 }
