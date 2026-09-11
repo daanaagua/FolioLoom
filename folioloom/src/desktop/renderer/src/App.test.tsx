@@ -887,7 +887,7 @@ describe("FolioLoom desktop onboarding", () => {
       discoverModels,
     })} />);
 
-    await user.click(await screen.findByRole("button", { name: "获取模型" }));
+    await user.click(await screen.findByRole("button", { name: "刷新模型" }));
     await waitFor(() => expect(discoverModels).toHaveBeenCalledTimes(1));
     expect((screen.getByRole("button", { name: "Kimi" }) as HTMLButtonElement).disabled).toBe(true);
 

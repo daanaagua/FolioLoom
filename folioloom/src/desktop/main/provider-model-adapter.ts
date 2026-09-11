@@ -74,8 +74,8 @@ export function createDesktopProviderRegistryAdapter(
     },
     async discoverModels(request, credential) {
       const profile = discoveryProfile(registry, request);
-      const models = await registry.discoverModels({ profile, credential });
-      return models.map((model) => ({ id: model.id, displayName: model.id }));
+      const models = await registry.discoverModels({ profile, credential, forceLive: true });
+      return models.map((model) => ({ id: model.id, displayName: model.id, source: model.source }));
     },
     async probe(profile, credential) {
       const resolved = resolvedProfile(registry, {

@@ -7,13 +7,13 @@ llm:
       api_key: "${DEEPSEEK_API_KEY}"
       timeout: 1800
       models:
-        scan: "deepseek-v4-flash"
-        semantic: "deepseek-v4-flash"
-        reconcile: "deepseek-v4-flash"
-        verify: "deepseek-v4-flash"
-        repair: "deepseek-v4-flash"
-        draft: "deepseek-v4-flash"
-        polish: "deepseek-v4-flash"
+        scan: "deepseek-flash"
+        semantic: "deepseek-flash"
+        reconcile: "deepseek-flash"
+        verify: "deepseek-flash"
+        repair: "deepseek-flash"
+        draft: "deepseek-flash"
+        polish: "deepseek-flash"
       request_options:
         draft:
           reasoning_effort: "high"

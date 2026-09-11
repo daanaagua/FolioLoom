@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createDesktopProviderRegistryAdapter } from "../src/desktop/main/provider-model-adapter.js";
-import { providerRegistry } from "../src/providers/registry.js";
+import { ProviderRegistry, providerRegistry } from "../src/providers/registry.js";
 
 test("desktop provider adapter exposes only safe provider summaries", () => {
   const adapter = createDesktopProviderRegistryAdapter(providerRegistry);
@@ -33,4 +33,16 @@ test("desktop provider adapter rejects a custom URL for a preset provider before
       && !error.message.includes(apiKey)
       && /customBaseUrl/u.test(error.message),
   );
+});
+
+test("desktop discovery requests live models and preserves their source", async () => {
+  const registry = new ProviderRegistry();
+  registry.discoverModels = async (request) => {
+    assert.equal(request.forceLive, true);
+    assert.equal(request.profile.providerId, "deepseek");
+    return [{ id: "deepseek-flash", source: "live" }];
+  };
+  const models = await createDesktopProviderRegistryAdapter(registry)
+    .discoverModels({ providerId: "deepseek" }, "fixture-key");
+  assert.deepEqual(models, [{ id: "deepseek-flash", displayName: "deepseek-flash", source: "live" }]);
 });

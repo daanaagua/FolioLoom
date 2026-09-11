@@ -5,13 +5,25 @@ const COMMON_LIMITS = {
   maxTokens: 37_200,
 } as const;
 
-export const DEEPSEEK_V4_MODEL_IDS = Object.freeze([
+export const DEEPSEEK_MODEL_IDS = Object.freeze([
+  "deepseek-flash",
   "deepseek-v4-flash",
   "deepseek-v4-pro",
 ] as const);
 
+// Keep the existing export and request IDs for integrations and durable runs.
+export const DEEPSEEK_V4_MODEL_IDS = DEEPSEEK_MODEL_IDS;
+
+export function isWellFormedModelId(modelId: string): boolean {
+  return modelId.length > 0 && modelId.length <= 256 && modelId === modelId.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(modelId);
+}
+
 export function isCurrentDeepSeekModelId(modelId: string): boolean {
-  return (DEEPSEEK_V4_MODEL_IDS as readonly string[]).includes(modelId);
+  // Discovery is authoritative for new names. Keep only explicitly retired
+  // aliases blocked; unknown names still need the normal capability probe.
+  return isWellFormedModelId(modelId)
+    && modelId !== "deepseek-chat" && modelId !== "deepseek-reasoner";
 }
 
 export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
@@ -21,8 +33,8 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
     apiFamily: "openai-chat",
     defaultBaseUrl: "https://api.deepseek.com/v1",
     keyPlaceholder: "DeepSeek API Key",
-    modelDiscovery: "curated",
-    fallbackModels: DEEPSEEK_V4_MODEL_IDS,
+    modelDiscovery: "standard-models",
+    fallbackModels: DEEPSEEK_MODEL_IDS,
     allowManualModel: false,
     allowCustomBaseUrl: false,
     capabilities: {

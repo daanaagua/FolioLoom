@@ -138,6 +138,7 @@ export interface DesktopOnboardingProvider {
 export interface DesktopModelOption {
   id: string;
   displayName: string;
+  source?: "live" | "fallback";
 }
 
 export interface DesktopModelProbe {

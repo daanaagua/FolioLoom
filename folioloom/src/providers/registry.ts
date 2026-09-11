@@ -12,6 +12,7 @@ import type {
 import {
   PROVIDER_PRESETS,
   isCurrentDeepSeekModelId,
+  isWellFormedModelId,
 } from "./presets.js";
 
 const MAX_DISCOVERED_MODELS = 500;
@@ -81,8 +82,9 @@ function uniqueSortedModelIds(value: unknown): string[] {
   }
   const ids = (value as { data: unknown[] }).data
     .map((item) => typeof item === "object" && item !== null ? (item as { id?: unknown }).id : undefined)
-    .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
-    .map((id) => id.trim());
+    .filter((id): id is string => typeof id === "string")
+    .map((id) => id.trim())
+    .filter(isWellFormedModelId);
   return [...new Set(ids)].sort((left, right) => left.localeCompare(right)).slice(0, MAX_DISCOVERED_MODELS);
 }
 
@@ -95,6 +97,9 @@ export interface DiscoverModelsRequest {
   credential: SecretCredential;
   fetch?: FetchLike;
   signal?: AbortSignal;
+  timeoutMs?: number;
+  /** Attempt /models even for providers whose built-in catalogue is curated. */
+  forceLive?: boolean;
 }
 
 export class ProviderModelConfigurationError extends Error {
@@ -145,10 +150,11 @@ export class ProviderRegistry {
   resolve(profile: ModelProfile): ResolvedProviderProfile {
     const definition = this.get(profile.providerId);
     const modelId = requireText(profile.modelId, "modelId");
+    if (!isWellFormedModelId(modelId)) throw new TypeError("modelId is invalid");
     if (definition.id === "deepseek" && !isCurrentDeepSeekModelId(modelId)) {
       throw new ProviderModelConfigurationError(
         "DEEPSEEK_MODEL_RETIRED",
-        "DeepSeek 已停用旧模型路由，请选择 deepseek-v4-flash 或 deepseek-v4-pro",
+        "DeepSeek 已停用该模型路由，新任务请选择 deepseek-flash；旧任务兼容 deepseek-v4-flash 或 deepseek-v4-pro",
       );
     }
     const reasoningEffort = profile.reasoningEffort;
@@ -171,24 +177,44 @@ export class ProviderRegistry {
   }
 
   async discoverModels(request: DiscoverModelsRequest): Promise<readonly ModelOption[]> {
-    const resolved = this.resolve(request.profile);
-    const fallback = resolved.definition.fallbackModels.map((id) => ({ id, source: "fallback" as const }));
-    if (resolved.definition.modelDiscovery === "curated") {
+    request.signal?.throwIfAborted();
+    // Discovery must not depend on a previously selected model still existing.
+    const definition = this.get(request.profile.providerId);
+    const baseUrl = definition.allowCustomBaseUrl
+      ? validateCustomOpenAICompatibleBaseUrl(request.profile.customBaseUrl ?? "")
+      : definition.defaultBaseUrl;
+    const fallback = definition.fallbackModels.map((id) => ({ id, source: "fallback" as const }));
+    if (definition.modelDiscovery === "curated" && !request.forceLive) {
       return fallback;
     }
+    const timeoutMs = request.timeoutMs ?? 8000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 30_000) {
+      throw new TypeError("model discovery timeout must be between 0 and 30000 ms");
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const signal = request.signal === undefined ? controller.signal
+      : AbortSignal.any([request.signal, controller.signal]);
     const fetcher = request.fetch ?? globalThis.fetch;
     try {
-      const response = await fetcher(modelsEndpoint(resolved.baseUrl), {
+      const response = await fetcher(modelsEndpoint(baseUrl), {
         method: "GET",
         headers: { Authorization: `Bearer ${request.credential}` },
-        signal: request.signal,
+        signal,
       });
       if (!response.ok) {
         throw new Error(`model discovery failed with ${response.status}`);
       }
-      return uniqueSortedModelIds(await response.json()).map((id) => ({ id, source: "live" as const }));
+      return uniqueSortedModelIds(await response.json())
+        .filter((id) => definition.id !== "deepseek" || isCurrentDeepSeekModelId(id))
+        .filter((id) => request.credential.length === 0 || !id.includes(request.credential))
+        .map((id) => ({ id, source: "live" as const }));
     } catch {
+      request.signal?.throwIfAborted();
+      if (fallback.length === 0) throw new Error("MODEL_DISCOVERY_UNAVAILABLE");
       return fallback;
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

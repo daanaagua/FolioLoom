@@ -600,6 +600,15 @@ export function expectedTermOccurrencesForTranslationInput(
     && occurrence.sourceEnd <= end);
 }
 
+/** Keep persistence version metadata local; every rendering constraint remains
+ * model-visible. This is a wire projection, never a mutation of audit records. */
+function withoutLocalTermRevision<T extends { revisionId?: string; renderFingerprint?: string }>(
+  value: T,
+): Omit<T, "revisionId" | "renderFingerprint"> {
+  const { revisionId: _revisionId, renderFingerprint: _renderFingerprint, ...wire } = value;
+  return wire;
+}
+
 export function translationBatchSystemPrompt(
   profile: SourceLanguageProfile,
   responseProtocol: TranslationResponseProtocol = "typed_tool",
@@ -662,6 +671,8 @@ export function prepareTranslationRequest(
   const requestedBlockIds = new Set(windows.flatMap((window) =>
     window.blocks.map((block) => block.blockId)));
   const termOccurrences = expectedTermOccurrencesForTranslationInput(input);
+  const wireStableTerms = input.stableTerms.map(withoutLocalTermRevision);
+  const wireTermOccurrences = termOccurrences.map(withoutLocalTermRevision);
   const knowledgeContext = translationKnowledgeWireContext(input, windows);
   const framedProtocol = responseProtocol === "framed_text"
     ? createFramedTranslationProtocol({
@@ -697,9 +708,9 @@ export function prepareTranslationRequest(
     },
   );
   const termsPayload = {
-    stableTerms: input.stableTerms,
+    stableTerms: wireStableTerms,
     entityLinkWarnings: input.entityLinkWarnings ?? [],
-    expectedTermOccurrences: termOccurrences,
+    expectedTermOccurrences: wireTermOccurrences,
   };
   const stylePayload = input.effectiveStyleByWindow === undefined
     ? {
@@ -751,11 +762,11 @@ export function prepareTranslationRequest(
       kind: "terms",
       text: [
         "STABLE TERMS",
-        JSON.stringify(input.stableTerms),
+        JSON.stringify(wireStableTerms),
         "UNRESOLVED ENTITY LINKS",
         JSON.stringify(input.entityLinkWarnings ?? []),
         "TERM OCCURRENCES",
-        JSON.stringify(termOccurrences),
+        JSON.stringify(wireTermOccurrences),
       ].join("\n\n"),
       jsonPayload: termsPayload,
     },

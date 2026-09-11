@@ -205,7 +205,7 @@ export interface DesktopIpcModelTestResult {
 
 export interface DesktopIpcModelService {
   snapshot(): DesktopIpcModelSnapshot;
-  discoverModels(request: ServiceDiscoverModelsRequest): Promise<readonly { id: string; displayName: string }[]>;
+  discoverModels(request: ServiceDiscoverModelsRequest): Promise<readonly { id: string; displayName: string; source?: "live" | "fallback" }[]>;
   testAndSave(request: ServiceTestModelRequest): Promise<DesktopIpcModelTestResult>;
   forgetCredential(providerId: ProviderId): void;
 }
@@ -1394,6 +1394,7 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     const value: readonly DesktopModelOption[] = models.map((model) => ({
       id: model.id,
       displayName: model.displayName,
+      ...(model.source === "live" || model.source === "fallback" ? {source: model.source} : {}),
     }));
     return ok(value);
   }));

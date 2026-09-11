@@ -113,3 +113,18 @@ test("desktop runtime plan rejects illegal effort capabilities and dishonest der
       && error.code === "DESKTOP_RUNTIME_MISMATCH",
   );
 });
+
+test("DeepSeek planning deduplicates equivalent efforts without changing the selected profile", () => {
+  const efforts: ProviderEffort[] = ["off","minimal","low","medium","high","xhigh","max"];
+  for (const selected of ["high", "medium", "xhigh", undefined] as const) {
+    const runtime = runtimeFor({providerId:"deepseek",modelId:"deepseek-flash",
+      ...(selected === undefined ? {} : {reasoningEffort:selected})}, efforts);
+    const plan = buildDesktopRuntimePlan("quality", runtime);
+    assert.equal(plan.runtimeSet.variants?.length, 4);
+    assert.equal(plan.runtimeSet.primary.effort, selected);
+    assert.equal(plan.fingerprint.primary.reasoningEffort, selected);
+    assert.ok(plan.runtimeSet.variants?.some((variant)=>variant.effort === selected));
+    assert.deepEqual(plan.runtimeSet.variants?.filter((variant)=>variant.effort !== selected)
+      .map((variant)=>variant.effort), ["off","low","max"]);
+  }
+});

@@ -160,6 +160,29 @@ function derivedRuntime(
   return derived;
 }
 
+function distinctCandidateEfforts(
+  profile: ModelProfile,
+  supported: readonly ProviderEffort[],
+): Array<ProviderEffort | undefined> {
+  if (profile.providerId !== "deepseek") {
+    return [...new Set([...supported, profile.reasoningEffort])];
+  }
+  // DeepSeek's documented aliases are not additional execution strategies.
+  // Preserve the selected raw profile so durable fingerprints do not change.
+  const effective = (effort: ProviderEffort | undefined): ProviderEffort => {
+    if (effort === "minimal") return "low";
+    if (effort === undefined || effort === "medium" || effort === "xhigh") return "high";
+    return effort;
+  };
+  const choices = new Map<ProviderEffort, ProviderEffort | undefined>();
+  for (const effort of supported) {
+    const group = effective(effort);
+    choices.set(group, supported.includes(group) ? group : effort);
+  }
+  choices.set(effective(profile.reasoningEffort), profile.reasoningEffort);
+  return [...choices.values()];
+}
+
 export function buildDesktopRuntimePlan(
   mode: DesktopTrialMode,
   qualityRuntime: DesktopTranslationRuntime,
@@ -170,11 +193,8 @@ export function buildDesktopRuntimePlan(
   const qualityProfile = normalizedProfile(qualityRuntime);
   const quality = translationRuntime(qualityRuntime);
   const supportedEfforts = requireSupportedEfforts(qualityRuntime);
-  const candidateEfforts = new Set<ProviderEffort | undefined>([
-    ...supportedEfforts,
-    qualityRuntime.profile.reasoningEffort,
-  ]);
-  const variants = validateRuntimeVariants([...candidateEfforts].map((effort) => {
+  const candidateEfforts = distinctCandidateEfforts(qualityRuntime.profile, supportedEfforts);
+  const variants = validateRuntimeVariants(candidateEfforts.map((effort) => {
     if (effort === qualityRuntime.profile.reasoningEffort) {
       return quality;
     }

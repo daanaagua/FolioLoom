@@ -1,6 +1,6 @@
 {
   "name": "folioloom",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "private": true,
   "description": "A continuity-aware translation engine for long-form fiction.",
   "type": "module",

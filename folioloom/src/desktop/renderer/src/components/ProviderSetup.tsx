@@ -105,7 +105,14 @@ export function ProviderSetup({
   const [modelId, setModelId] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("");
   const [customBaseUrl, setCustomBaseUrl] = useState("");
-  const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[]>([]);
+  const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[] | undefined>();
+  const [scanningModels, setScanningModels] = useState(false);
+  const [discoveryFeedback, setDiscoveryFeedback] = useState<string>();
+  const scanGeneration = useRef(0);
+  const lastScanOrigin = useRef<string | undefined>(undefined);
+  const scanningRef = useRef(false);
+  const discoverCallback = useRef(onDiscoverModels);
+  discoverCallback.current = onDiscoverModels;
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback | undefined>(
     () => shouldShowPersistedProbe(latestProbe, activeModel) ? probeFeedback(latestProbe) : undefined,
@@ -133,7 +140,7 @@ export function ProviderSetup({
     setModelId(activeModel.modelId);
     setReasoningEffort(activeModel.reasoningEffort ?? "");
     setCustomBaseUrl(activeModel.customBaseUrl ?? "");
-    setDiscoveredModels([]);
+    setDiscoveredModels(undefined);
   }, [activeModel, providers]);
 
   useLayoutEffect(() => {
@@ -143,18 +150,50 @@ export function ProviderSetup({
     const savedModel = activeModel?.providerId === selectedProvider.id ? activeModel : undefined;
     setModelId(savedModel?.modelId ?? firstModel(selectedProvider));
     setReasoningEffort(savedModel?.reasoningEffort ?? selectedProvider.efforts[0] ?? "");
-    setDiscoveredModels([]);
+    setDiscoveredModels(undefined);
     setApiKey("");
     if (providerChanged) setConnectionFeedback(undefined);
   }, [selectedProvider?.id]);
 
-  const listedModelOptions = discoveredModels.length > 0
-    ? discoveredModels
-    : (selectedProvider?.fallbackModelIds ?? []).map((id) => ({ id, displayName: id }));
+  const listedModelOptions = discoveredModels
+    ?? (selectedProvider?.fallbackModelIds ?? []).map((id) => ({ id, displayName: id }));
   const modelOptions = modelId !== "" && !listedModelOptions.some((model) => model.id === modelId)
     ? [{ id: modelId, displayName: modelId }, ...listedModelOptions]
     : listedModelOptions;
-  const formLocked = busy || testingConnection;
+  const formLocked = busy || testingConnection || scanningModels;
+  const lockedRef = useRef(formLocked);
+  lockedRef.current = formLocked;
+  const discoveryOrigin = JSON.stringify([selectedProvider?.id, apiKey, customBaseUrl,
+    selectedProvider?.credentialStatus]);
+
+  useLayoutEffect(() => {
+    scanGeneration.current++;
+    lastScanOrigin.current = undefined;
+    scanningRef.current = false;
+    setScanningModels(false);
+    setDiscoveredModels(undefined);
+    setDiscoveryFeedback(undefined);
+    return () => { scanGeneration.current++; };
+  }, [discoveryOrigin]);
+
+  useEffect(() => {
+    if (selectedProvider === undefined
+      || (apiKey.trim() === "" && selectedProvider.credentialStatus !== "available")) return;
+    if (selectedProvider.allowCustomBaseUrl) {
+      try {
+        const url = new URL(customBaseUrl);
+        if (url.protocol !== "https:" && url.protocol !== "http:") return;
+      } catch { return; }
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      if (lastScanOrigin.current === discoveryOrigin) return;
+      if (lockedRef.current) { timer = setTimeout(attempt, 200); return; }
+      void discoverModels();
+    };
+    timer = setTimeout(attempt, 800);
+    return () => clearTimeout(timer);
+  }, [discoveryOrigin]);
   const draftMatchesActive = apiKey === ""
     && activeModel?.capability === "ready"
     && selectedProvider?.id === activeModel.providerId
@@ -173,15 +212,44 @@ export function ProviderSetup({
   }
 
   async function discoverModels(): Promise<void> {
-    if (selectedProvider === undefined) return;
-    const result = await onDiscoverModels({
-      providerId: selectedProvider.id,
-      ...(apiKey === "" ? {} : { apiKey }),
-      ...(selectedProvider.allowCustomBaseUrl && customBaseUrl !== "" ? { customBaseUrl } : {}),
-    });
-    if (result.ok) {
+    if (selectedProvider === undefined || scanningRef.current) return;
+    const generation = ++scanGeneration.current;
+    lastScanOrigin.current = discoveryOrigin;
+    scanningRef.current = true;
+    setScanningModels(true);
+    setDiscoveryFeedback(undefined);
+    try {
+      const result = await discoverCallback.current({
+        providerId: selectedProvider.id,
+        ...(apiKey === "" ? {} : { apiKey }),
+        ...(selectedProvider.allowCustomBaseUrl && customBaseUrl !== "" ? { customBaseUrl } : {}),
+      });
+      if (generation !== scanGeneration.current) return;
+      if (!result.ok) {
+        setDiscoveryFeedback("模型列表更新失败，请检查凭据或网络后刷新。");
+        return;
+      }
       setDiscoveredModels(result.value);
-      if (result.value[0] !== undefined) setModelId(result.value[0].id);
+      // A refresh discovers choices; it does not silently choose a new model.
+      setModelId((selected) => selected || result.value[0]?.id || "");
+      if (result.value.length === 0) {
+        setDiscoveryFeedback("服务端未返回可用模型，当前选择保持不变。");
+      } else if (result.value.some((model) => model.source === "fallback")) {
+        setDiscoveryFeedback("当前显示内置备用列表，未能确认服务端实时模型；可稍后刷新。");
+      } else if (result.value.every((model) => model.source === "live")) {
+        setDiscoveryFeedback(`实时列表：${result.value.length} 个模型 · ${new Date().toLocaleTimeString()}`);
+      } else {
+        setDiscoveryFeedback(`已获取 ${result.value.length} 个模型。`);
+      }
+    } catch {
+      if (generation === scanGeneration.current) {
+        setDiscoveryFeedback("模型列表更新失败，请检查凭据或网络后刷新。");
+      }
+    } finally {
+      if (generation === scanGeneration.current) {
+        scanningRef.current = false;
+        setScanningModels(false);
+      }
     }
   }
 
@@ -327,9 +395,12 @@ export function ProviderSetup({
                 {modelOptions.map((model) => <option value={model.id} key={model.id}>{model.displayName}</option>)}
               </select>
               <button className="quiet-button" type="button" onClick={() => { void discoverModels(); }} disabled={formLocked}>
-                获取模型
+                {scanningModels ? "正在扫描…" : "刷新模型"}
               </button>
             </div>
+            {discoveryFeedback === undefined ? null : <p className="inline-note" role="status">{discoveryFeedback}</p>}
+            {discoveredModels !== undefined && modelId !== "" && !discoveredModels.some((model) => model.id === modelId)
+              ? <p className="inline-note">当前选择不在本次列表中，已保留；可刷新或选择其他模型后测试连接。</p> : null}
           </div>
 
           {selectedProvider.allowManualModel ? (
