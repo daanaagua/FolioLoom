@@ -13,11 +13,13 @@ function readText(path: string): string {
 
 test("desktop package scripts and portable metadata stay explicit", () => {
   const packageJson = JSON.parse(readText(join(projectRoot, "package.json"))) as {
+    version: string;
     main?: string;
     scripts: Record<string, string>;
     dependencies?: Record<string, string>;
   };
   const scripts = packageJson.scripts;
+  assert.match(packageJson.version, /^\d+\.\d+\.\d+$/);
   assert.equal(packageJson.main, "out/main/index.js");
   assert.equal(scripts["desktop:dev"], "electron-vite dev");
   assert.match(scripts["desktop:build"] ?? "", /electron-vite build/);
@@ -66,7 +68,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
   };
   assert.deepEqual(resource, {
     schema: "folioloom-desktop-resource-1",
-    version: "1.7.1",
+    version: packageJson.version,
     apiKeyPolicy: "never-packaged",
     projectDataPolicy: "user-selected",
     translationWritePolicy: "single-window-trial-and-durable-fullbook",
