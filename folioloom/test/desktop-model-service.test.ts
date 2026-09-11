@@ -37,7 +37,7 @@ function registry(status: "ready" | "limited" = "ready"): DesktopProviderRegistr
     },
     async discoverModels(_request, credential) {
       seenCredentials.push(credential);
-      return [{ id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro" }];
+      return [{ id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", source: "live" }];
     },
     async probe(_profile, credential) {
       seenCredentials.push(credential);
@@ -96,7 +96,7 @@ test("model service persists only ready non-secret model settings and never retu
     assert.doesNotMatch(JSON.stringify(service.snapshot()), new RegExp(apiKey));
 
     const discovered = await service.discoverModels({ providerId: "deepseek" });
-    assert.deepEqual(discovered, [{ id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro" }]);
+    assert.deepEqual(discovered, [{ id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", source: "live" }]);
     assert.deepEqual(providers.seenCredentials, [apiKey, apiKey]);
 
     service.forgetCredential("deepseek");

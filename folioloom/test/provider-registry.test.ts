@@ -23,21 +23,18 @@ test("provider registry exposes the supported first-party order", () => {
   ]);
 });
 
-test("DeepSeek exposes only the current V4 Flash and Pro models", () => {
+test("DeepSeek offers the canonical Flash name and preserves existing run model IDs", () => {
   const definition = providerRegistry.get("deepseek");
-  assert.equal(definition.modelDiscovery, "curated");
+  assert.equal(definition.modelDiscovery, "standard-models");
   assert.deepEqual(definition.fallbackModels, [
+    "deepseek-flash",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
   ]);
   assert.equal(definition.allowManualModel, false);
-  assert.equal(
-    providerRegistry.resolve({
-      providerId: "deepseek",
-      modelId: "deepseek-v4-flash",
-    }).profile.modelId,
-    "deepseek-v4-flash",
-  );
+  for (const modelId of definition.fallbackModels) {
+    assert.equal(providerRegistry.resolve({providerId: "deepseek", modelId}).profile.modelId, modelId);
+  }
 });
 
 test("retired DeepSeek aliases fail with a stable public error code", () => {
@@ -141,4 +138,58 @@ test("dynamic provider model discovery de-duplicates live ids and labels a fallb
     { id: "moonshot-v1-8k", source: "fallback" },
     { id: "moonshot-v1-32k", source: "fallback" },
   ]);
+});
+
+test("DeepSeek discovery queries the live endpoint and a newly listed ID can be probed", async () => {
+  let calls = 0;
+  const models = await providerRegistry.discoverModels({
+    profile: {providerId: "deepseek", modelId: "deepseek-flash"}, credential: "fixture",
+    fetch: async (url) => {
+      assert.equal(String(url), "https://api.deepseek.com/v1/models");
+      calls++;
+      return new Response(JSON.stringify({data:[{id:"deepseek-future-model"},{id:"deepseek-flash"}]}));
+    },
+  });
+  assert.equal(calls, 1);
+  assert.ok(models.every((model) => model.source === "live"));
+  assert.equal(providerRegistry.resolve({providerId:"deepseek", modelId:"deepseek-future-model"})
+    .profile.modelId, "deepseek-future-model");
+});
+
+test("model discovery has a deadline and distinguishes caller cancellation from fallback", async () => {
+  const stalled: typeof fetch = async (_url, options) => new Promise((_resolve, reject) => {
+    options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), {once: true});
+  });
+  const request = {profile:{providerId:"deepseek" as const,modelId:"deepseek-flash"},
+    credential:"fixture", fetch:stalled, timeoutMs:20};
+  const models = await providerRegistry.discoverModels(request);
+  assert.ok(models.length > 0 && models.every((model) => model.source === "fallback"));
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(providerRegistry.discoverModels({...request, signal:controller.signal}),
+    {name:"AbortError"});
+});
+
+test("live empty lists are not replaced with advertised availability and unsafe IDs are ignored", async () => {
+  const request = {profile:{providerId:"deepseek" as const,modelId:"deepseek-flash"},credential:"fixture"};
+  assert.deepEqual(await providerRegistry.discoverModels({...request,
+    fetch:async()=>new Response(JSON.stringify({data:[]}))}), []);
+  const models = await providerRegistry.discoverModels({...request,
+    fetch:async()=>new Response(JSON.stringify({data:[{id:"deepseek-flash"},{id:"bad\nmodel"},
+      {id:"x".repeat(257)},{id:42},{id:"deepseek-chat"}]}))});
+  assert.deepEqual(models,[{id:"deepseek-flash",source:"live"}]);
+});
+
+test("discovery works with a retired selection and never fabricates empty fallback success", async () => {
+  const result = await providerRegistry.discoverModels({
+    profile: {providerId:"deepseek", modelId:"deepseek-chat"}, credential:"fixture-secret",
+    fetch:async()=>new Response(JSON.stringify({data:[
+      {id:"deepseek-flash"}, {id:"echo-fixture-secret"},
+    ]})),
+  });
+  assert.deepEqual(result, [{id:"deepseek-flash", source:"live"}]);
+  await assert.rejects(providerRegistry.discoverModels({
+    profile:{providerId:"openai-compatible", modelId:"test", customBaseUrl:"http://localhost:11434/v1"},
+    credential:"fixture", fetch:async()=>{throw new Error("offline");},
+  }), /MODEL_DISCOVERY_UNAVAILABLE/);
 });

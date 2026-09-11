@@ -35,11 +35,13 @@ export interface DesktopProviderSummary extends DesktopRegisteredProvider {
 export interface DesktopModelOption {
   id: string;
   displayName: string;
+  source?: "live" | "fallback";
 }
 
 export interface DesktopRegistryModelOption {
   id: string;
   displayName?: string;
+  source?: "live" | "fallback";
 }
 
 export interface DesktopCapabilityReport {
@@ -220,6 +222,7 @@ export class DesktopModelService {
             displayName: typeof model.displayName === "string" && model.displayName.trim().length > 0
               ? model.displayName.trim()
               : id,
+            ...(model.source === "live" || model.source === "fallback" ? {source: model.source} : {}),
           };
         });
     } catch {

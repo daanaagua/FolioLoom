@@ -6,11 +6,11 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.7.1**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.7.2**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-v1.7.1 fixes cascading terminology replacements, audits persisted local edits before strict export, supports multi-form rules, detects every highest-precedence conflict, and safely recovers confirmed dead-owner run locks. Indexed terminology resolution removes a quadratic hot path. See the [patch notes](docs/releases/v1.7.1.md) for upgrade boundaries and validation.
+v1.7.2 adds live model discovery with explicit fallback status, defaults new DeepSeek configurations to `deepseek-flash`, compacts model-facing terminology data, and deduplicates equivalent DeepSeek reasoning strategies. Existing model selections, run identities, and strict audit rules are preserved. See the [patch notes](docs/releases/v1.7.2.md).
 
-## What v1.7.1 can do
+## What v1.7.2 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
@@ -28,7 +28,7 @@ v1.7.1 fixes cascading terminology replacements, audits persisted local edits be
 - Apply language profiles for English, German, French, Spanish, Russian, Japanese, and Korean, with support for common Unicode encodings, Windows-1252, and legacy Japanese and Korean encodings.
 - Export privacy-safe diagnostic JSON without API keys, book text, translations, or complete private paths.
 - Show text blocks requiring attention, failure categories, public error codes, and next actions in the desktop app. Recoverable incidents receive at most one safe retry through shadow audit and atomic promotion.
-- Offer only `deepseek-v4-flash` and `deepseek-v4-pro` for DeepSeek; legacy model names are rejected before translation starts.
+- Scan the provider's live model list after credentials are entered, with manual refresh and explicit fallback status. New DeepSeek configurations default to `deepseek-flash`; existing compatible model IDs are preserved.
 - Run an optional, isolated `codex exec` worker with the user's existing Codex CLI login, without a separate model API key or provider configuration.
 - Use the repository-scoped [`$folioloom-translate`](.agents/skills/folioloom-translate/SKILL.md) skill to import a manuscript, run a bounded smoke translation, resume the same durable run, audit it, and strictly export it.
 - Amortize safe Codex file work across adjacent logical windows, retain per-window validation and commits, try paragraph-heavy blocks whole before bounded fragment recovery, and import paragraph-heavy DOCX files in linear time.
@@ -48,7 +48,7 @@ Both runs passed strict export and audit with no human-required or failed window
 - The local V4 adjudication page and legacy Streamlit page remain in the repository but are not the primary interface.
 - Offline regression tests and live-model one-window and three-window gates are complete; a full-book quality benchmark for the latest architecture has not yet been published.
 - The desktop app supports book import, model compatibility checks, single-fragment trials, full-book start/pause/resume, live terminology review, audited batch term correction, the attention center, and strict export. Paragraph-level manual rewriting and general batch review are still planned.
-- The desktop app includes DeepSeek, Kimi, Alibaba Cloud Model Studio, Volcano Ark, OpenAI, SiliconFlow, and custom OpenAI-compatible endpoints. DeepSeek accepts only V4 Flash/Pro, and every model must pass a live compatibility check.
+- The desktop app includes DeepSeek, Kimi, Alibaba Cloud Model Studio, Volcano Ark, OpenAI, SiliconFlow, and custom OpenAI-compatible endpoints. Model discovery never silently changes the selected model; every model must still pass a live compatibility check. Known retired DeepSeek routes (`deepseek-chat` and `deepseek-reasoner`) are rejected.
 - The Codex worker is currently a CLI/skill workflow, requires a locally installed and signed-in Codex CLI, and intentionally runs with `--max-concurrency 1`. It is not yet exposed in the desktop app.
 - Original-template EPUB preservation applies only to projects re-imported with v1.5.2 or later. Older projects are not fuzzily aligned to guessed link positions; re-import the original EPUB before translating.
 

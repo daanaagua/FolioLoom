@@ -31,7 +31,7 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
   },
   DEEPSEEK_MODEL_RETIRED: {
     message: "DeepSeek 旧模型路由已经停用",
-    nextAction: "请选择 deepseek-v4-flash 或 deepseek-v4-pro 后重新测试连接。",
+    nextAction: "新任务请选择 deepseek-flash 后测试连接；已有任务可保留 deepseek-v4-flash 或 deepseek-v4-pro。",
     retryable: false,
   },
   QUOTA_EXHAUSTED: {

@@ -107,3 +107,21 @@ test("legacy DeepSeek CLI wrappers delegate to the provider runtime", () => {
   assert.equal(model.thinkingLevelMap?.xhigh, "max");
   assert.equal(typeof streamFn, "function");
 });
+
+test("DeepSeek canonical and compatibility IDs reach the Pi wire unchanged", async () => {
+  for (const modelId of ["deepseek-flash", "deepseek-v4-flash"]) {
+    const runtime = createProviderRuntime({providerId: "deepseek", modelId, reasoningEffort: "high"},
+      "offline-payload-fixture-secret");
+    let captured: Record<string, unknown> | undefined;
+    const stream = await runtime.streamFn(runtime.model, {
+      messages: [{role: "user", content: "Offline payload fixture.", timestamp: 0}],
+    }, {onPayload(payload) {
+      captured = payload as Record<string, unknown>;
+      throw new Error("stop before network dispatch");
+    }});
+    await stream.result();
+    assert.equal(captured?.model, modelId);
+    assert.equal(captured?.reasoning_effort, "high");
+    assert.deepEqual(captured?.thinking, {type: "enabled"});
+  }
+});
