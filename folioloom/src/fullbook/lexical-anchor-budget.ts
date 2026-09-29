@@ -12,6 +12,7 @@ import {
   type BudgetOracleAssessment,
 } from "./budget-oracle.js";
 import type { TranslationRuntime } from "./types.js";
+import { effectiveSystemPrompt } from "../agents/task-context.js";
 
 export type LexicalAnchorBudgetComponentKind =
   | "system"
@@ -97,7 +98,7 @@ export function assessLexicalAnchorAttempt(
   }).assess<LexicalAnchorBudgetComponentKind>([
     {
       kind: "system",
-      text: prepared.systemPrompt,
+      text: effectiveSystemPrompt(runtime.streamFn, prepared.systemPrompt),
     },
     {
       kind: "request",

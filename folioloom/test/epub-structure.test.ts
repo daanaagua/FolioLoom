@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   analyzeEpubXhtml,
+  epubStructuralTranslationError,
   rewriteEpubXhtml,
   type EpubXhtmlBlock,
 } from "../src/source/epub-structure.js";
@@ -26,6 +27,16 @@ const XHTML = `<?xml version="1.0" encoding="UTF-8"?>
   </section>
 </body>
 </html>`;
+
+test("EPUB structural validation ignores blank paragraph delimiters at lossless block edges", () => {
+  const source = "⟦E0.0.0⟧A title⟦/E0.0.0⟧\n\nA complete paragraph.\n\n";
+  const target = "⟦E0.0.0⟧标题⟦/E0.0.0⟧\n\n完整的一段。";
+  assert.equal(epubStructuralTranslationError(source, target), undefined);
+  assert.equal(epubStructuralTranslationError(`\r\n\r\n${source}`, `${target}\r\n\r\n`), undefined);
+  assert.match(epubStructuralTranslationError(source, "⟦E0.0.0⟧标题⟦/E0.0.0⟧") ?? "", /paragraph counts/);
+  assert.match(epubStructuralTranslationError(source, "⟦E0.0.0⟧标题⟦/E0.0.0⟧完整的一段。") ?? "", /paragraph counts/);
+  assert.match(epubStructuralTranslationError(source, "标题\n\n完整的一段。") ?? "", /expected markers/);
+});
 
 test("EPUB XHTML structural slots translate link labels without changing link attributes", () => {
   const analysis = analyzeEpubXhtml(XHTML, 0);

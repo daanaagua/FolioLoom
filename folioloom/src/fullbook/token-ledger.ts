@@ -5,6 +5,7 @@ import type {
 import type { SchedulerRunReport } from "./dynamic-scheduler.js";
 
 export type LedgerPurpose =
+  | "supervision"
   | "translate"
   | "repair"
   | "protocol_switch"
@@ -14,6 +15,7 @@ export type LedgerPurpose =
   | "revalidate";
 
 export type LedgerBaselineSource =
+  | "supervision"
   | "translate_horizon"
   | "revalidate"
   | "anchor"

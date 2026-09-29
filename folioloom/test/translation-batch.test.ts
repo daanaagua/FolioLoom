@@ -57,6 +57,30 @@ const request: PhysicalRequestPlan = {
   })),
 };
 
+test("supervised wire receipts select known occurrences and leave source coordinates to the host", async () => {
+  const concept = reviseConcept(conceptFromAnchor({ sourceForm: "Alpha", target: "阿尔法", mode: "stable", semanticClass: "proper_name", confidence: 0.95 }), { policy: "locked" });
+  const terms = [{ conceptId: concept.conceptId, lexemeId: "alpha", sourceForm: "Alpha", canonicalSource: "Alpha", target: "阿尔法", locked: true,
+    policy: concept.policy, semanticClass: concept.semanticClass, allowedTargets: concept.allowedRealizations, revisionId: concept.revisionId, renderFingerprint: concept.renderFingerprint }];
+  let submitted: any;
+  const prepared = prepareTranslationRequest({ request: { ...request, windows: [request.windows[0]!] }, blocks, stableTerms: terms,
+    snapshot: { id: "snapshot-compact", revisions: [] }, strictIdentifiers: true }, { onFinalize: async args => { submitted = args; } });
+  const tool = prepared.tools[0]!;
+  const schema = JSON.parse(JSON.stringify(tool.parameters));
+  const receipt = schema.properties.windows.items.properties.termUsages.items;
+  assert.deepEqual(Object.keys(receipt.properties).sort(), ["discourseRole", "occurrenceId", "targetSurface"]);
+  const occurrence = prepared.expectedTermOccurrences[0]!;
+  assert.deepEqual(receipt.properties.occurrenceId.enum, [occurrence.occurrenceId]);
+  await tool.execute({ windows: [{ windowId: "window-0", translations: [{ blockId: "block-0", text: "阿尔法。" }],
+    termUsages: [{ occurrenceId: occurrence.occurrenceId, targetSurface: "阿尔法", discourseRole: "narrative" }] }] }, new AbortController().signal);
+  const actual = submitted.windows[0].termUsages[0];
+  assert.equal(actual.sourceStart, occurrence.sourceStart);
+  assert.equal(actual.sourceEnd, occurrence.sourceEnd);
+  assert.equal(actual.blockId, "block-0");
+  assert.equal(actual.conceptId, occurrence.conceptId);
+  const empty = prepareTranslationRequest({ request, blocks, stableTerms: [], snapshot: { id: "empty", revisions: [] }, strictIdentifiers: true });
+  assert.equal(JSON.parse(JSON.stringify(empty.tools[0]!.parameters)).properties.windows.items.properties.termUsages.maxItems, 0);
+});
+
 function singleWindowRequest(sourceBlocks: readonly LosslessBlock[]): PhysicalRequestPlan {
   return {
     requestId: "request-canonical-id-fixture",
@@ -74,6 +98,29 @@ function singleWindowRequest(sourceBlocks: readonly LosslessBlock[]): PhysicalRe
     }],
   };
 }
+
+test("a rejected repair response retains its real usage and an auth failure stops the run", async () => {
+  for (const errorMessage of ["invalid JSON tool call", "401 Unauthorized"]) {
+    const sourceBlocks = [block("failure-usage", 0, "a traveler waited quietly by the door.")];
+    const req = singleWindowRequest(sourceBlocks);
+    const faux = fauxProvider();
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("finalize_translation_batch", { windows: [{ windowId: req.windows[0]!.windowId,
+        translations: [{ blockId: "failure-usage", text: "a traveler waited quietly by the door." }], notes: [] }] }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage }),
+    ]);
+    const operation = () => runTranslationBatch({ request: req, blocks: sourceBlocks, stableTerms: [], snapshot: { id: "s", revisions: [] },
+      model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider), budget: new BudgetLedger() });
+    if (errorMessage.startsWith("401")) await assert.rejects(operation, /Unauthorized/u);
+    else {
+      const result = await operation();
+      assert.equal(result.windows[0]?.status, "failed");
+      assert.equal(result.repairRuns.length, 1);
+      assert.ok(result.repairRuns[0]!.usage.totalTokens > 0);
+    }
+    assert.equal(faux.state.callCount, 2);
+  }
+});
 
 function promptText(context: Context): string {
   const message = context.messages.findLast((item) => item.role === "user");
@@ -127,6 +174,7 @@ test("batch runtime uses the same prepared prompt as complete-request budgeting"
   ), { stopReason: "toolUse" })]);
 
   const result = await runTranslationBatch({
+    repairEnabled: false, // This fixture tests prompt identity, not translated prose.
     request,
     blocks,
     stableTerms: [],
@@ -655,6 +703,7 @@ test("batch prompt includes only the bounded current knowledge projection behind
   }];
 
   const result = await runTranslationBatch({
+    repairEnabled: false,
     request,
     blocks,
     stableTerms: [],
@@ -830,6 +879,7 @@ test("batch projects bounded structured style and returns the same-call style ob
   ]));
 
   const result = await runTranslationBatch({
+    repairEnabled: false,
     request,
     blocks,
     stableTerms: [],

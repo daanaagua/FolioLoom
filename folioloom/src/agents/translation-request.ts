@@ -183,6 +183,10 @@ export interface TranslationBatchSnapshot {
  * object is what must be measured before a request can be admitted.
  */
 export interface TranslationRequestInput {
+  /** New supervised runs use constrained identities and host-owned receipt coordinates. */
+  strictIdentifiers?: boolean;
+  supervisorGuidance?: readonly import("./supervisor.js").SupervisorGuidance[];
+  reviewCandidate?: (window: { windowId: string; translations: Array<{ blockId: string; text: string }> }) => Promise<readonly import("../tools/repair-tools.js").ValidationFailure[]>;
   request: PhysicalRequestPlan;
   blocks: readonly LosslessBlock[];
   stableTerms: readonly StableTerm[];
@@ -253,6 +257,7 @@ function finalizerTool(
   paragraphFragment?: ParagraphFragmentExecutionScope,
   expectedWindowId?: string,
   sourceLanguageProfile: SourceLanguageProfile = getSourceLanguageProfile("en"),
+  strictScope?: { windowIds: readonly string[]; blockIds: readonly string[]; occurrences: readonly ExpectedTermOccurrence[] },
 ): TypedToolSpec<any> {
   const onFinalize = requireFinalizer(hooks);
   if (paragraphFragment !== undefined && expectedWindowId === undefined) {
@@ -295,17 +300,16 @@ function finalizerTool(
   }, { additionalProperties: false });
   const translationSchema = paragraphFragment === undefined
     ? Type.Object({
-      blockId: Type.String(),
+      blockId: Type.String(strictScope === undefined ? {} : { enum: [...strictScope.blockIds] }),
       text: Type.String(),
     }, { additionalProperties: false })
     : canonicalFragmentTranslationSchema;
   const termUsagesSchema = Type.Array(Type.Object({
-    occurrenceId: Type.String(),
-    blockId: Type.String(),
-    conceptId: Type.String(),
-    sourceForm: Type.String(),
-    sourceStart: Type.Integer({ minimum: 0 }),
-    sourceEnd: Type.Integer({ minimum: 1 }),
+    occurrenceId: Type.String(strictScope?.occurrences.length ? { enum: strictScope.occurrences.map(o => o.occurrenceId) } : {}),
+    ...(strictScope === undefined ? {
+      blockId: Type.String(), conceptId: Type.String(), sourceForm: Type.String(),
+      sourceStart: Type.Integer({ minimum: 0 }), sourceEnd: Type.Integer({ minimum: 1 }),
+    } : {}),
     discourseRole: Type.Union([
       Type.Literal("narrative"),
       Type.Literal("vocative"),
@@ -313,7 +317,7 @@ function finalizerTool(
       Type.Literal("other"),
     ]),
     targetSurface: Type.String(),
-  }, { additionalProperties: false }), { maxItems: 512 });
+  }, { additionalProperties: false }), { maxItems: strictScope === undefined ? 512 : strictScope.occurrences.length });
   const notesSchema = Type.Array(Type.String());
   const memoryCandidatesSchema = Type.Array(Type.Object({
     kind: Type.Union(
@@ -379,7 +383,7 @@ function finalizerTool(
   }
   const wholeWindowProperties = {
     windowId: paragraphFragment === undefined
-      ? Type.String()
+      ? Type.String(strictScope === undefined ? {} : { enum: [...strictScope.windowIds] })
       : Type.Literal(expectedWindowId!),
     translations: Type.Array(
       translationSchema,
@@ -438,6 +442,18 @@ function finalizerTool(
       }, { additionalProperties: false }),
     execute: async (rawArgs: FinalizeTranslationBatchWireArgs, signal) => {
       assertNotAborted(signal);
+      if (strictScope !== undefined) {
+        const known = new Map(strictScope.occurrences.map(o => [o.occurrenceId, o]));
+        const expand = (usages: TermUsageSubmission[] | undefined): TermUsageSubmission[] | undefined => usages?.map(usage => {
+          const source = known.get(usage.occurrenceId);
+          if (!source) throw new Error("unknown supplied term occurrence");
+          return { occurrenceId: source.occurrenceId, blockId: source.blockId, conceptId: source.conceptId,
+            sourceForm: source.sourceForm, sourceStart: source.sourceStart, sourceEnd: source.sourceEnd,
+            discourseRole: usage.discourseRole, targetSurface: usage.targetSurface };
+        });
+        rawArgs = { ...rawArgs, ...(rawArgs.termUsages === undefined ? {} : { termUsages: expand(rawArgs.termUsages) }),
+          windows: rawArgs.windows.map(w => ({ ...w, ...(w.termUsages === undefined ? {} : { termUsages: expand(w.termUsages) }) })) };
+      }
       return onFinalize(
         canonicalizeFinalizerEnvelope(rawArgs, paragraphFragment),
         signal,
@@ -622,7 +638,7 @@ export function translationBatchSystemPrompt(
     "When source text contains paired ⟦E…⟧ and ⟦/E…⟧ EPUB structural-slot markers, copy every marker byte-for-byte in the same order, translate only text inside each pair, and emit no prose outside those pairs in that paragraph.",
     ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
     "In STABLE TERMS, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
-    "TERM OCCURRENCES are harness-computed source facts. Apply each referenced concept at that exact source occurrence; contextual concepts may use a context-appropriate allowed surface.",
+    "TERM OCCURRENCES are harness-computed source facts. Apply each referenced concept at that exact source occurrence; contextual concepts may use a context-appropriate allowed surface. Never invent occurrence IDs or receipts. When the supplied occurrence list is empty, omit termUsages or return an empty array.",
     responseProtocol === "typed_tool"
       ? "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol."
       : "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the required response protocol.",
@@ -802,8 +818,21 @@ export function prepareTranslationRequest(
       input.paragraphFragment,
       input.request.windows[0]?.windowId,
       profile,
+      input.strictIdentifiers === true ? {
+        windowIds: input.request.windows.map(w => w.windowId),
+        blockIds: input.request.windows.flatMap(w => w.blockIds),
+        occurrences: termOccurrences,
+      } : undefined,
     )]
     : [];
+  if (input.supervisorGuidance?.length) {
+    const guidance = input.supervisorGuidance.filter(g => requestedBlockIds.has(g.blockId));
+    if (guidance.length) sections.splice(sections.length - 1, 0, {
+      kind: "memory",
+      text: ["主 agent 的原文查证提示（供理解；不得覆盖原意、歧义、锁定术语或结构约束）", JSON.stringify(guidance)].join("\n\n"),
+      jsonPayload: guidance,
+    });
+  }
   const schemas = tools.map(serializableToolSchema);
   return {
     systemPrompt: translationBatchSystemPrompt(

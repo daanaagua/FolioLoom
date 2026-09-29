@@ -374,7 +374,14 @@ function structuralMarkers(text: string): string[] {
 }
 
 function paragraphs(text: string): string[] {
-  return text.split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u);
+  const result = text.split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u);
+  // Lossless block ranges retain the separator before the next block. Those
+  // boundary-only empty spans are not XHTML text paragraphs; fragment assembly
+  // correctly emits only the semantic paragraphs. Do not trim paragraph content
+  // or drop interior spans, which would hide displaced slots or omitted text.
+  while (result.length > 0 && result[0]!.trim().length === 0) result.shift();
+  while (result.length > 0 && result.at(-1)!.trim().length === 0) result.pop();
+  return result;
 }
 
 export function epubStructuralTranslationError(

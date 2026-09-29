@@ -234,7 +234,7 @@ export interface ProviderResponseEvidenceInput {
   readonly runId: string;
   readonly requestId: string;
   readonly snapshotId: string;
-  readonly phase: "research" | "translation" | "repair" | "recovery";
+  readonly phase: "research" | "translation" | "repair" | "recovery" | "supervision";
   readonly modelCallOrdinal: number;
   readonly requestHash: string;
   readonly responseProtocol: "typed_tool" | "framed_text";
@@ -6504,6 +6504,50 @@ export class LosslessBookStore {
       throw new Error(`conflicting cached wave anchor decision for ${inputHash}`);
     }
     return structuredClone(matches[0]?.decision);
+  }
+
+  supervisionRecords(runId: string): import("../domain/supervision.js").SupervisionRecord[] {
+    this.#run(runId);
+    return all<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events WHERE run_id=? AND kind='supervision_record' ORDER BY sequence
+    `), runId).map(row => JSON.parse(row.payload_json) as import("../domain/supervision.js").SupervisionRecord);
+  }
+
+  appendSupervisionRecord(runId: string, record: import("../domain/supervision.js").SupervisionRecord): void {
+    this.#run(runId);
+    requireNonempty(record.id, "supervision record id");
+    requireNonempty(record.key, "supervision record key");
+    if (!/^[a-f0-9]{64}$/u.test(record.inputHash)
+      || !["plan", "review"].includes(record.event)
+      || !["started", "completed", "paused", "failed", "released"].includes(record.state)) {
+      throw new Error("invalid supervision record");
+    }
+    const windows = new Set(this.allWindows(runId).map(w => w.windowId));
+    if (!record.windowIds.length || record.windowIds.some(id => !windows.has(id))) {
+      throw new Error("supervision record outside run scope");
+    }
+    const serialized = jsonText(record, "supervision record");
+    if (serialized.length > 64_000) throw new Error("supervision record too large");
+    this.#transaction(() => {
+      const existing = this.supervisionRecords(runId).find(r => r.id === record.id);
+      if (existing !== undefined) {
+        if (canonicalJson(existing) !== canonicalJson(record)) throw new Error("supervision record id conflict");
+        return;
+      }
+      this.#appendEvent(runId, "supervision_record", record);
+    });
+  }
+
+  releaseSupervisionPause(runId: string, recordId: string, reason: string): void {
+    requireNonempty(reason, "supervision release reason");
+    if (reason.length > 1200) throw new Error("supervision release reason too long");
+    if (this.allWindows(runId).some(w => w.status === "running" || w.status === "staged")) throw new Error("supervision pause release requires an idle run");
+    const record = this.supervisionRecords(runId).find(r => r.id === recordId && r.state === "paused");
+    if (!record) throw new Error("unknown paused supervision decision");
+    this.appendSupervisionRecord(runId, {
+      id: `release:${recordId}`, key: recordId, event: record.event, state: "released",
+      windowIds: record.windowIds, inputHash: record.inputHash, reason,
+    });
   }
 
   cacheWaveAnchorDecision(runId: string, inputHash: string, decision: unknown): void {

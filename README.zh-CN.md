@@ -6,13 +6,16 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.7.2**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.8.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-v1.7.2 增加实时模型扫描与明确的备用列表提示，新 DeepSeek 配置默认使用 `deepseek-flash`，精简模型侧术语数据并合并等价推理策略。已有模型选择、任务身份和严格审计规则保持不变。详情见[补丁说明](docs/releases/v1.7.2.md)。
+v1.8.0 增加原生 Pi 有界主 agent，按原文证据规划批次、进行语义审校与局部返修；任务背景贯穿各模型阶段，术语回执进一步精简，并支持显式选择外部框架 worker。已有运行保留原后端与监督策略。详情见[版本说明](docs/releases/v1.8.0.md)。
 
-## V1.7.2 能做什么
+- ✓ **已针对 DeepSeek 的“幻觉式版权误判／误拒译”做了部分修正**：可通过桌面“任务背景前缀”或 `--task-context-file` 提供真实的原文来源与使用目的，并贯穿翻译、研究、修复和监督请求，帮助减少因缺少上下文而产生的错误拒译。这是提示上下文层面的修正，不是修改 DeepSeek 官方策略，也不保证完全消除误拒；不会代替使用者判断权利或编造授权。
+
+## V1.8.0 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
+- 由内嵌 Pi 主 agent 批准有界批次、查询原文证据、审校指定候选并提出有据可查的局部修复，内核继续控制预算、校验和提交；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
 - 按证据记录实体别名、候选关系和再验证状态；
 - 在每个并行波次冻结术语锚点，减少兄弟窗口的译名漂移；
@@ -46,7 +49,7 @@ FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调�
 
 - 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
 - V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是当前版本主入口；
-- 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
+- 语义审校仍是模型判断，不能保证文学质量；上面的历史 100K 数据不包含新增主 agent 的调用成本和耗时；
 - 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复、运行中术语审查、审计式批量修词、需要处理中心和严格导出；逐段人工改译与一般批量审阅仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；刷新列表不会自动更换已选模型，各模型仍须通过真实兼容性检查。已停用的 DeepSeek 路由（`deepseek-chat`、`deepseek-reasoner`）会被明确拒绝。
 - Codex worker 当前只提供命令行/skill 工作流，需要本机安装并登录 Codex CLI，并有意限制为 `--max-concurrency 1`；它尚未接入桌面端。
@@ -115,7 +118,7 @@ npm.cmd run folioloom -- book status `
 
 保存规则后，在“术语控制”中预览精确影响。执行锁定计划时，回执唯一的安全替换会产生新译文版本；存在歧义的块进入既有稀疏模型重验证。未执行的计划可以取消，完成或需要处理的作业可以回滚。排队中的修改、尚未处理的活动术语影响和未收敛的修词 item 都会阻断严格导出。
 
-CLI 和私有 Codex skill 使用同一个控制面：
+CLI 和翻译 skill 使用同一个控制面：
 
 ```powershell
 npm.cmd run folioloom -- book knowledge queue-status --store <book.db> --run <run-id>
@@ -129,6 +132,18 @@ npm.cmd run folioloom -- book retrofit rollback --store <book.db> --run <run-id>
 ```
 
 类型化 term-upsert JSON 和完整安全流程见 [terminology-control 参考](.agents/skills/folioloom-translate/references/terminology-control.md)。CLI 与 skill 都不会直接改写 SQLite。
+
+## 使用其他框架及其模型翻译
+
+任何具备本地文件与命令执行能力的 agent 宿主都可以使用翻译 skill；读取 skill 的宿主与实际翻译后端相互独立。外部 worker 协议不限制框架或模型 ID，随附 OpenCode、Claude Code 桥接脚本，其他 CLI 或 SDK 可以实现同一协议。外部 worker 不要求安装 Codex。配置与接入方式见[外部 worker 参考](.agents/skills/folioloom-translate/references/external-workers.md)。
+
+完成导入与 book doctor 后，在 `folioloom` 目录运行：
+
+```text
+npm run folioloom -- book run --manifest <manifest> --store <store> --worker external --worker-profile <profile.json> --max-windows 2 --max-concurrency 1 --output <exports>
+```
+
+profile 选择真实执行程序、模型和保守规划上限，续跑保持该身份；框架返回的真实用量进入审计，缺失用量会阻止严格导出。选择的 CLI 版本、账号访问权限和模型结构化输出能力需要通过有界试译建立。worker 模式只用于 CLI/skill，不改变桌面端服务商工作流。
 
 ## 使用已登录的 Codex CLI 翻译
 
@@ -328,6 +343,12 @@ FolioLoom 的核心不是把尽可能多的背景材料塞进模型，而是只�
 6. 独立 Auditor 从认证原文和 SQLite 重新计算覆盖与顺序。
 
 详细设计和实施记录位于 [`docs/superpowers/`](docs/superpowers/)。
+
+## 原生 Pi 主 agent 监督
+
+新建原生 API 运行默认启用有界主 agent：按批次查询原文证据、批准翻译，并针对实质语义问题安排审校或局部返修。预算、数据库提交和严格导出仍由内核控制，不通过 OpenCode 等外部 CLI 执行。桌面运行页可配置监督模式和任务背景；CLI 支持 `--supervisor bounded` 与私有 UTF-8 `--task-context-file`，续跑保持原配置。
+
+详见[监督架构、运行命令与恢复边界](docs/bounded-supervisor.md)。
 
 ## 数据、密钥与版权
 

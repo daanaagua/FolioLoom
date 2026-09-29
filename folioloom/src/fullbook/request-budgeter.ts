@@ -3,6 +3,8 @@ import {
   type TranslationRequestInput,
   type TranslationRequestSectionKind,
 } from "../agents/translation-request.js";
+import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { effectiveSystemPrompt } from "../agents/task-context.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import {
@@ -17,6 +19,7 @@ export type RequestTokenEstimate = BudgetTokenEstimate;
 export type RequestTokenEstimator = BudgetTokenEstimator;
 
 export interface RequestBudgetOptions {
+  readonly streamFn?: StreamFn;
   /** Calibration scope for the provider/model that will execute this request. */
   readonly modelId?: string;
   /** Provider context capacity reserved for this complete request. */
@@ -84,7 +87,7 @@ export class RequestBudgeter {
       jsonPayload?: unknown;
     }> = [{
       kind: "system",
-      text: prepared.systemPrompt,
+      text: effectiveSystemPrompt(this.#options.streamFn, prepared.systemPrompt),
     }];
     for (const section of prepared.sections) {
       payload.push({

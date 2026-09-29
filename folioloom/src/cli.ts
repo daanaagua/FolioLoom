@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { summarizeSupervision, type SupervisionMode } from "./domain/supervision.js";
 import {
   createDeepSeekModel,
   createDeepSeekStreamFn,
@@ -14,6 +15,7 @@ import {
   type CodexExecRuntimeOptions,
 } from "./agents/codex-exec-stream.js";
 import { RecoveryAgent } from "./agents/recovery-agent.js";
+import { createExternalWorkerRuntime, loadWorkerProfile, workerRunMetadata } from "./agents/external-worker.js";
 import {
   loadOpenCodeApiKey,
   loadPilotConfig,
@@ -85,6 +87,8 @@ import {
 } from "./style/style-profile.js";
 
 export type CliCommand =
+  | "book-supervisor-status"
+  | "book-supervisor-release"
   | "preview"
   | "book-import"
   | "book-preflight"
@@ -106,6 +110,9 @@ export type CliCommand =
   | "book-retrofit-rollback";
 
 export interface CliOptions {
+  supervisorMode?: SupervisionMode;
+  taskContextFile?: string;
+  supervisorReason?: string;
   command: CliCommand;
   source?: string;
   project?: string;
@@ -139,7 +146,8 @@ export interface CliOptions {
   schedulerMode?: SchedulerMode;
   runtimeProfileStore?: string;
   maxInFlightTokens?: number;
-  worker?: "codex";
+  worker?: "codex" | "external";
+  workerProfile?: string;
   codexModel?: string;
   codexContextWindow?: number;
   codexMaxOutputTokens?: number;
@@ -591,7 +599,7 @@ function runMetadataForScheduler(
   };
 }
 
-export type TranslationExecutionBackend = "provider-api" | "codex-exec";
+export type TranslationExecutionBackend = "provider-api" | "codex-exec" | "external-worker";
 
 export function runMetadataForExecutionBackend(
   metadata: unknown,
@@ -600,6 +608,11 @@ export function runMetadataForExecutionBackend(
 ): unknown {
   const existing = metadataRecord(metadata);
   const stored = existing.executionBackend;
+  if (backend === "external-worker") {
+    if (resuming && stored !== backend) throw new Error("cannot resume another backend with an external worker");
+    return {...existing, executionBackend: backend};
+  }
+  if (stored === "external-worker") throw new Error("external worker run requires --worker external and the original profile");
   if (backend === "codex-exec") {
     if (resuming && stored !== "codex-exec") {
       throw new Error("cannot resume a provider run with the Codex worker");
@@ -890,6 +903,14 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       store: pathValue(values, "--store"),
     };
   }
+  if (action === "supervisor") {
+    const sub = argv[2];
+    if (sub !== "status" && sub !== "release") throw new Error("book supervisor requires status or release");
+    const { values } = parseFlags(argv.slice(3), `book supervisor ${sub}`, ["--store", "--run", "--request", "--reason"]);
+    return { command: sub === "status" ? "book-supervisor-status" : "book-supervisor-release",
+      store: pathValue(values, "--store"), runId: identifierValue(values, "--run"),
+      requestId: identifierValue(values, "--request"), supervisorReason: identifierValue(values, "--reason") };
+  }
   if (action === "run") {
     const { values } = parseFlags(
       argv.slice(2),
@@ -903,7 +924,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--optimization-profile", "--scheduler-mode",
         "--runtime-profile-store",
         "--worker", "--codex-model", "--codex-context-window",
-        "--codex-max-output-tokens", "--codex-executable",
+        "--codex-max-output-tokens", "--codex-executable", "--worker-profile",
+        "--supervisor", "--task-context-file",
       ],
     );
     const explicitProfile = optimizationProfileFlag(
@@ -925,10 +947,16 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       );
     }
     const rawWorker = identifierValue(values, "--worker");
-    if (rawWorker !== undefined && rawWorker !== "codex") {
-      throw new Error("--worker must be codex");
+    if (rawWorker !== undefined && rawWorker !== "codex" && rawWorker !== "external") {
+      throw new Error("--worker must be codex or external");
     }
-    const worker = rawWorker as "codex" | undefined;
+    const worker = rawWorker as "codex" | "external" | undefined;
+    const supervisorMode = identifierValue(values, "--supervisor");
+    if (supervisorMode !== undefined && supervisorMode !== "bounded" && supervisorMode !== "off") throw new Error("--supervisor must be bounded or off");
+    if (worker !== undefined && supervisorMode === "bounded") throw new Error("bounded supervisor requires native Pi; do not combine it with --worker");
+    const workerProfile = pathValue(values, "--worker-profile", false);
+    if (worker === "external" && workerProfile === undefined) throw new Error("--worker-profile is required with --worker external");
+    if (worker !== "external" && workerProfile !== undefined) throw new Error("--worker-profile requires --worker external");
     const config = pathValue(values, "--config", worker === undefined);
     const openCodeAuth = pathValue(values, "--opencode-auth", false);
     const codexModel = identifierValue(values, "--codex-model");
@@ -959,8 +987,15 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     } else if (hasCodexOnlyOption) {
       throw new Error("--codex-model requires --worker codex");
     }
+    if (worker === "external") {
+      if (config !== undefined || openCodeAuth !== undefined) throw new Error("--worker external cannot be combined with --config or --opencode-auth");
+      if (requestedConcurrency !== undefined && requestedConcurrency !== 1) throw new Error("external worker requires --max-concurrency 1");
+      if (runMode !== "quality") throw new Error("external worker supports quality run mode");
+    }
     return {
       command: "book-run",
+      ...(supervisorMode === undefined ? {} : { supervisorMode }),
+      taskContextFile: pathValue(values, "--task-context-file", false),
       manifest: pathValue(values, "--manifest"),
       legacyV4Db: pathValue(values, "--v4-db", false),
       store: pathValue(values, "--store"),
@@ -969,7 +1004,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       ...(openCodeAuth === undefined ? {} : { openCodeAuth }),
       runId: identifierValue(values, "--run"),
       maxWindows: positiveFlag(values, "--max-windows"),
-      maxConcurrency: worker === "codex" ? 1 : requestedConcurrency,
+      maxConcurrency: worker === undefined ? requestedConcurrency : 1,
       runMode,
       optimizationProfile: explicitProfile ?? legacyProfile,
       schedulerMode: schedulerModeFlag(values, "--scheduler-mode"),
@@ -987,6 +1022,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       prompt: identifierValue(values, "--prompt"),
       glossary: pathValue(values, "--glossary", false),
       ...(worker === undefined ? {} : { worker }),
+      ...(workerProfile === undefined ? {} : { workerProfile }),
       ...(codexModel === undefined ? {} : { codexModel }),
       ...(codexContextWindow === undefined ? {} : { codexContextWindow }),
       ...(codexMaxOutputTokens === undefined ? {} : { codexMaxOutputTokens }),
@@ -1124,6 +1160,15 @@ export async function main(
   dependencyOverrides: Partial<CliRuntimeDependencies> = {},
 ): Promise<void> {
   const options = parseArgs(argv);
+  if (options.command === "book-supervisor-status" || options.command === "book-supervisor-release") {
+    const store = new LosslessBookStore(requireOption(options, "store"));
+    try {
+      const runId = requireOption(options, "runId");
+      if (options.command === "book-supervisor-release") store.releaseSupervisionPause(runId, requireOption(options, "requestId"), requireOption(options, "supervisorReason"));
+      console.log(JSON.stringify({ schema: "folioloom-supervision-status-1", runId, records: store.supervisionRecords(runId) }, null, 2));
+    } finally { store.close(); }
+    return;
+  }
   if (options.command.startsWith("book-knowledge-")
     || options.command.startsWith("book-retrofit-")) {
     const store = new LosslessBookStore(requireOption(options, "store"));
@@ -1357,6 +1402,7 @@ export async function main(
         modelId: state.modelId,
         runMetadata: state.runMetadata,
         status: store.statusSummary(runId),
+        supervision: summarizeSupervision((state.runMetadata as { supervision?: { mode?: string } } | undefined)?.supervision?.mode === "bounded" ? "bounded" : "off", store.supervisionRecords(runId), store.allWindows(runId), store.activeTranslations(runId)),
         windows: store.allWindows(runId),
       }, null, 2));
     } finally {
@@ -1395,6 +1441,11 @@ export async function main(
     } finally {
       selectionStore.close();
     }
+    const taskContext = options.taskContextFile === undefined ? undefined
+      : new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(options.taskContextFile));
+    const supervisorMode = options.supervisorMode ?? (selectedRun === undefined
+      ? options.worker === undefined ? "bounded" : "off"
+      : (selectedRun.metadata as { supervision?: { mode?: string } } | undefined)?.supervision?.mode === "bounded" ? "bounded" : "off");
     const style = loadStyleProfile({
       ...(options.styleProfile === undefined ? {} : { profilePath: options.styleProfile }),
       ...(options.prompt === undefined ? {} : { cliPrompt: options.prompt }),
@@ -1423,7 +1474,7 @@ export async function main(
     );
     const executionBackendMetadata = runMetadataForExecutionBackend(
       schedulerMetadata,
-      options.worker === "codex" ? "codex-exec" : "provider-api",
+      options.worker === "codex" ? "codex-exec" : options.worker === "external" ? "external-worker" : "provider-api",
       selectedRun !== undefined,
     );
     const codexPolicy = options.worker === "codex"
@@ -1432,7 +1483,8 @@ export async function main(
         selectedRun !== undefined,
       )
       : { metadata: executionBackendMetadata };
-    const runMetadata = codexPolicy.metadata;
+    const externalProfile = options.worker === "external" ? loadWorkerProfile(requireOption(options, "workerProfile")) : undefined;
+    const runMetadata = externalProfile === undefined ? codexPolicy.metadata : workerRunMetadata(codexPolicy.metadata, externalProfile, selectedRun !== undefined);
     const runtimeSet = options.worker === "codex"
       ? buildCodexTranslationRuntimeSet({
         modelId: requireOption(options, "codexModel"),
@@ -1449,6 +1501,12 @@ export async function main(
           ? {}
           : { executable: options.codexExecutable }),
       }, dependencyOverrides.createCodexRuntime ?? createCodexExecRuntime)
+      : externalProfile !== undefined
+        ? (() => {
+          const created = createExternalWorkerRuntime(externalProfile);
+          const variant = {...created, effort: "off" as const, thinkingLevel: "off" as const};
+          return {mode: "quality" as const, primary: variant, escalation: variant, variants: validateRuntimeVariants([variant])};
+        })()
       : buildTranslationRuntimeSet(
         loadRuntimeConfig(options),
         options.runMode ?? "quality",
@@ -1466,6 +1524,8 @@ export async function main(
     let result: LosslessBookRunResult;
     try {
       result = await bookRunner({
+        supervisorMode,
+        ...(taskContext === undefined ? {} : { taskContext }),
         manifestPath: requireOption(options, "manifest"),
         ...(options.legacyV4Db === undefined ? {} : { legacyV4DbPath: options.legacyV4Db }),
         storePath: requireOption(options, "store"),

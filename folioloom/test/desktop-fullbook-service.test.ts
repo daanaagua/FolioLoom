@@ -316,7 +316,7 @@ test("desktop full-book start launches in background with formal run metadata", 
 
     const snapshot = await service.start(
       { manifestPath: project.manifestPath },
-      { optimizationProfile: "balanced" },
+      { optimizationProfile: "balanced", taskContext: "测试材料仅供个人阅读。" },
     );
 
     assert.equal(snapshot.activeRunId, "run-fullbook-start");
@@ -327,10 +327,14 @@ test("desktop full-book start launches in background with formal run metadata", 
     assert.equal(seen[0]?.runtimeSet?.mode, "quality");
     assert.equal(seen[0]?.optimizationProfile, "balanced");
     assert.equal(seen[0]?.schedulerMode, "active");
+    assert.equal(seen[0]?.supervisorMode, "bounded");
+    assert.equal(seen[0]?.taskContext, "测试材料仅供个人阅读。");
     assert.equal(seen[0]?.runtimeProfileStore, runtimeProfileStore);
     assert.deepEqual(seen[0]?.runMeta.metadata, {
       desktopFullBook: {
         schema: "folioloom-desktop-fullbook-1",
+        supervisorMode: "bounded",
+        taskContext: "测试材料仅供个人阅读。",
         mode: "quality",
         optimizationProfile: "balanced",
         runtimeFingerprint: serializeDesktopRuntimeFingerprint(
@@ -511,6 +515,7 @@ test("desktop full-book resume reuses exact stored metadata and rejects a change
     assert.deepEqual(seen[0]?.runMeta.metadata, metadata);
     assert.equal(seen[0]?.optimizationProfile, "balanced");
     assert.equal(seen[0]?.schedulerMode, "off");
+    assert.equal(seen[0]?.supervisorMode, "off");
     const pausing = service.pause();
     settle(runResult("run-resume", {
       outcome: "partial",

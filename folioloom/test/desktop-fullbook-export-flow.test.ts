@@ -51,6 +51,20 @@ function userText(context: Context): string {
 
 function deterministicResponse(context: Context) {
   const prompt = userText(context);
+  if (context.tools?.some((tool) => tool.name === "submit_supervisor_decision")) {
+    const data = JSON.parse(prompt) as {
+      event: "plan" | "review";
+      windows: Array<{ windowId: string; blockIds: string[] }>;
+    };
+    return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", {
+      action: data.event === "plan" ? "translate" : "accept",
+      windowIds: data.windows.map((window) => window.windowId),
+      reviewBlockIds: data.event === "plan"
+        ? data.windows.flatMap((window) => window.blockIds).slice(0, 32)
+        : [],
+      guidance: [], issues: [], reason: "按合成测试的确定性规则推进。",
+    }), { stopReason: "toolUse" });
+  }
   if (prompt.includes("Submit zero to four additional questions")) {
     return fauxAssistantMessage(
       fauxToolCall("submit_questions", { questions: [] }),

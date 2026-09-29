@@ -6,13 +6,16 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.7.2**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.8.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-v1.7.2 adds live model discovery with explicit fallback status, defaults new DeepSeek configurations to `deepseek-flash`, compacts model-facing terminology data, and deduplicates equivalent DeepSeek reasoning strategies. Existing model selections, run identities, and strict audit rules are preserved. See the [patch notes](docs/releases/v1.7.2.md).
+v1.8.0 adds bounded native Pi supervision for source-grounded planning, semantic review and targeted repair; task context shared across model phases; compact terminology receipts; and opt-in external-framework workers. Existing runs keep their recorded backend and supervision policy. See the [release notes](docs/releases/v1.8.0.md).
 
-## What v1.7.2 can do
+- ✓ **Partial mitigation for DeepSeek's mistaken copyright refusals:** caller-supplied source and usage context can now accompany translation, research, repair and supervision through the desktop task-context field or `--task-context-file`. Clear, truthful context helps address refusals based on unsupported assumptions about the task. This is a prompt-context correction, not a change to DeepSeek's policies or a guarantee against future refusals; it does not infer rights or invent authorization.
+
+## What v1.8.0 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
+- Use embedded Pi to approve bounded batches, query source evidence, review selected candidates and request grounded repairs, while the kernel retains budgets, validation and commits.
 - Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
 - Record entity aliases, candidate relationships, and revalidation state with evidence.
 - Freeze terminology anchors for each parallel wave to reduce name drift between sibling windows.
@@ -46,7 +49,7 @@ Both runs passed strict export and audit with no human-required or failed window
 
 - Releases currently include a Windows x64 single-file portable build and a portable ZIP, but they are not code-signed.
 - The local V4 adjudication page and legacy Streamlit page remain in the repository but are not the primary interface.
-- Offline regression tests and live-model one-window and three-window gates are complete; a full-book quality benchmark for the latest architecture has not yet been published.
+- Semantic review is model-based and cannot guarantee literary quality. The historical 100K timings above do not measure the added supervisor's cost or latency.
 - The desktop app supports book import, model compatibility checks, single-fragment trials, full-book start/pause/resume, live terminology review, audited batch term correction, the attention center, and strict export. Paragraph-level manual rewriting and general batch review are still planned.
 - The desktop app includes DeepSeek, Kimi, Alibaba Cloud Model Studio, Volcano Ark, OpenAI, SiliconFlow, and custom OpenAI-compatible endpoints. Model discovery never silently changes the selected model; every model must still pass a live compatibility check. Known retired DeepSeek routes (`deepseek-chat` and `deepseek-reasoner`) are rejected.
 - The Codex worker is currently a CLI/skill workflow, requires a locally installed and signed-in Codex CLI, and intentionally runs with `--max-concurrency 1`. It is not yet exposed in the desktop app.
@@ -115,7 +118,7 @@ The desktop “Terminology & Memory” workbench can save terminology while tran
 
 After saving a rule, open “Terminology Control” to preview its exact impact. Applying the locked plan creates new translation versions for receipt-backed local repairs and schedules the existing sparse model-revalidation path for ambiguous blocks. Planned jobs can be cancelled; completed or attention-required jobs can be rolled back. Queued edits, pending active term impacts, and unfinished retrofit items block strict export.
 
-The same control plane is available to CLI and the private Codex skill:
+The same control plane is available to the CLI and the translation skill:
 
 ```powershell
 npm.cmd run folioloom -- book knowledge queue-status --store <book.db> --run <run-id>
@@ -129,6 +132,26 @@ npm.cmd run folioloom -- book retrofit rollback --store <book.db> --run <run-id>
 ```
 
 Typed term-upsert JSON and the complete safe workflow are documented in [the terminology-control reference](.agents/skills/folioloom-translate/references/terminology-control.md). The CLI and skill never edit SQLite directly.
+
+## Translate with another framework and model
+
+The translation skill can run from any agent host with local file and command access. The
+host and actual translation backend are independent. A versioned external-worker protocol
+accepts arbitrary framework/model IDs; bundled bridge recipes cover OpenCode and Claude Code,
+and other CLIs or SDKs can implement the same contract. No Codex installation is required for
+an external worker. See [external-worker setup and protocol](.agents/skills/folioloom-translate/references/external-workers.md).
+
+From `folioloom`, after import and book doctor:
+
+```text
+npm run folioloom -- book run --manifest <manifest> --store <store> --worker external --worker-profile <profile.json> --max-windows 2 --max-concurrency 1 --output <exports>
+```
+
+The profile selects the real executable/model and conservative planning limits. Resume
+preserves its identity; actual framework usage is audited, and missing usage blocks strict
+export. CLI compatibility, configured account access, and structured-output quality must be
+established for the selected model with a bounded smoke. Worker modes are CLI/skill-only;
+they do not change the desktop provider workflow.
 
 ## Translate with a signed-in Codex CLI
 
@@ -328,6 +351,14 @@ FolioLoom does not try to stuff as much background material as possible into eve
 6. An independent auditor recomputes coverage and ordering from the authenticated source and SQLite state.
 
 Detailed design and implementation records are under [`docs/superpowers/`](docs/superpowers/).
+
+## Bounded native Pi supervisor
+
+New native API runs enable an embedded supervisor for source-grounded batch planning,
+semantic review and local repair. The kernel retains budgets, commits and strict export
+gates; no external coding-agent CLI is involved. Desktop controls and the CLI support a
+private task-context prefix whose identity is preserved on resume. See the
+[supervisor guide](docs/bounded-supervisor.md) for controls and recovery boundaries.
 
 ## Data, credentials, and copyright
 

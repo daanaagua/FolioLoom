@@ -24,6 +24,7 @@ import { MemoryEventLog } from "../kernel/event-log.js";
 import { createProviderRuntime } from "../providers/runtime.js";
 import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import { asKernelTools, type TypedToolSpec } from "../tools/tool-spec.js";
+import { effectiveSystemPrompt } from "./task-context.js";
 
 const ZERO_USAGE: Usage = {
   input: 0,
@@ -42,6 +43,7 @@ const ZERO_USAGE: Usage = {
 };
 
 const SEQUENTIAL_TOOLS = new Set([
+  "submit_supervisor_decision",
   "submit_questions",
   "submit_resolution",
   "finish_research",
@@ -191,6 +193,8 @@ function addUsage(total: Usage, value: Usage): void {
 
 function turnCounter(phase: AgentPhase): BudgetCounter {
   switch (phase) {
+    case "supervision":
+      return "supervisionTurns";
     case "research":
       return "researchTurns";
     case "translation":
@@ -228,6 +232,7 @@ function toAgentTools(specs: readonly TypedToolSpec[]): AgentTool<any>[] {
 export class PiRuntime {
   async run(spec: PiSessionSpec, streamFn: StreamFn): Promise<PiRunResult> {
     spec.signal?.throwIfAborted();
+    const systemPrompt = effectiveSystemPrompt(streamFn, spec.systemPrompt);
     if (spec.deadlineMs !== undefined && (
       !Number.isFinite(spec.deadlineMs) || spec.deadlineMs <= 0
     )) {
@@ -266,7 +271,7 @@ export class PiRuntime {
       .update("\0")
       .update(spec.model.id, "utf8")
       .update("\0")
-      .update(spec.systemPrompt, "utf8")
+      .update(systemPrompt, "utf8")
       .update("\0")
       .update(spec.prompt, "utf8")
       .digest("hex");
@@ -295,7 +300,7 @@ export class PiRuntime {
 
     const agent = new Agent({
       initialState: {
-        systemPrompt: spec.systemPrompt,
+        systemPrompt,
         model: spec.model,
         thinkingLevel: spec.thinkingLevel ?? "high",
         tools: toAgentTools(spec.tools),

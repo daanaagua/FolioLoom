@@ -2,7 +2,7 @@
 
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -10,10 +10,9 @@ const REQUIRED_FILES = [
   "main.py",
   join("folioloom", "package.json"),
   join("folioloom", "src", "cli.ts"),
-  join("folioloom", "src", "agents", "codex-exec-stream.ts"),
 ];
 
-const CODEX_FLAGS = ['"--worker"', '"--codex-model"'];
+const CORE_FLAGS = ['"--worker"'];
 
 function expandHome(candidate) {
   const value = String(candidate ?? "").trim();
@@ -46,9 +45,9 @@ export function validateFolioLoomRoot(candidate) {
 
   const cliSourcePath = join(root, "folioloom", "src", "cli.ts");
   const cliSource = readFileSync(cliSourcePath, "utf8");
-  for (const flag of CODEX_FLAGS) {
+  for (const flag of CORE_FLAGS) {
     if (!cliSource.includes(flag)) {
-      return { ok: false, reason: `Codex worker flag is missing: ${flag}` };
+      return { ok: false, reason: `worker flag is missing: ${flag}` };
     }
   }
 
@@ -58,7 +57,7 @@ export function validateFolioLoomRoot(candidate) {
 function requireValidRoot(label, candidate) {
   const result = validateFolioLoomRoot(candidate);
   if (!result.ok) {
-    throw new Error(`${label} is not a valid Codex-worker FolioLoom checkout (${result.reason}): ${candidate}`);
+    throw new Error(`${label} is not a valid FolioLoom checkout (${result.reason}): ${candidate}`);
   }
   return result;
 }
@@ -150,6 +149,9 @@ function inspectPackage(cliDir) {
 
 export function doctorFolioLoom(options = {}) {
   const resolvedRoot = resolveFolioLoomRoot(options);
+  const backend = options.backend ?? "core";
+  if (!["core", "codex", "external"].includes(backend)) throw new Error("--backend must be core, codex, or external");
+  const run = options.toolRunner ?? runTool;
   const checks = [];
   const warnings = [];
   const addCheck = (name, ok, detail, required = true) => {
@@ -181,14 +183,32 @@ export function doctorFolioLoom(options = {}) {
     hasDependencies ? "folioloom/node_modules is installed" : "folioloom/node_modules is missing or incomplete; run npm ci in cliDir",
   );
 
-  const npm = runTool("npm", ["--version"], resolvedRoot.cliDir);
+  const npm = run("npm", ["--version"], resolvedRoot.cliDir);
   addCheck("npm", npm.ok, npm.detail);
 
-  const codexVersion = runTool("codex", ["--version"], resolvedRoot.cliDir);
-  addCheck("codex-cli", codexVersion.ok, codexVersion.detail);
-
-  const codexLogin = runTool("codex", ["login", "status"], resolvedRoot.cliDir);
-  addCheck("codex-login", codexLogin.ok, codexLogin.detail);
+  if (backend === "codex") {
+    const codexVersion = run("codex", ["--version"], resolvedRoot.cliDir);
+    addCheck("codex-cli", codexVersion.ok, codexVersion.detail);
+    const codexLogin = run("codex", ["login", "status"], resolvedRoot.cliDir);
+    addCheck("codex-login", codexLogin.ok, codexLogin.detail);
+  }
+  if (backend === "external") {
+    const cli = readFileSync(join(resolvedRoot.cliDir, "src", "cli.ts"), "utf8");
+    addCheck("external-worker-support", cli.includes('"--worker-profile"'), "checkout must support --worker external --worker-profile");
+    try {
+      if (!options.workerProfile) throw new Error();
+      const path = resolve(options.workerProfile);
+      const profile = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/u, ""));
+      if (profile.schema !== "folioloom-worker-profile-v1" || typeof profile.command !== "string" || !profile.modelId) throw new Error();
+      const command = profile.command;
+      const paths = /[\\/]/u.test(command) ? [resolve(dirname(path), command)] : (process.env.PATH ?? process.env.Path ?? "").split(delimiter).flatMap(dir => [join(dir, command), join(dir, `${command}.exe`)]);
+      addCheck("worker-executable", !/\.(cmd|bat|ps1)$/iu.test(command) && paths.some(p=>existsSync(p) && statSync(p).isFile()), "native worker executable must exist; use node plus a script instead of a shell shim");
+      addCheck("worker-profile", true, "profile found; book run performs complete schema and resume validation");
+      warnings.push("External authentication and model access are checked by the bounded smoke call; the doctor does not invoke models.");
+    } catch {
+      addCheck("worker-profile", false, "pass a readable --worker-profile with schema, command, and modelId");
+    }
+  }
 
   const gitStatus = runGit(resolvedRoot.root);
   if (!gitStatus.ok) {
@@ -199,12 +219,13 @@ export function doctorFolioLoom(options = {}) {
 
   return {
     schemaVersion: 1,
+    backend,
     ok: checks.every((check) => !check.required || check.ok),
     platform: { os: process.platform, arch: process.arch },
     resolutionSource: resolvedRoot.source,
     root: resolvedRoot.root,
     cliDir: resolvedRoot.cliDir,
-    commands: { node: process.execPath, npm: "npm", codex: "codex" },
+    commands: { node: process.execPath, npm: "npm", ...(backend === "codex" ? {codex: "codex"} : {}) },
     checks,
     warnings,
   };
@@ -223,6 +244,10 @@ function parseArgs(argv) {
       if (index + 1 >= argv.length) throw new Error("--root requires a path");
       parsed.explicitRoot = argv[index + 1];
       index += 2;
+    } else if (argument === "--backend" || argument === "--worker-profile") {
+      if (index + 1 >= argv.length) throw new Error(`${argument} requires a value`);
+      parsed[argument === "--backend" ? "backend" : "workerProfile"] = argv[index + 1];
+      index += 2;
     } else if (argument === "--json") {
       parsed.json = true;
       index += 1;
@@ -239,7 +264,7 @@ function parseArgs(argv) {
 function printHelp() {
   process.stdout.write([
     "Usage:",
-    "  node folioloom_env.mjs doctor [--root <checkout>] [--json]",
+    "  node folioloom_env.mjs doctor [--root <checkout>] [--backend core|codex|external] [--worker-profile <json>] [--json]",
     "  node folioloom_env.mjs resolve [--root <checkout>] [--json]",
     "",
     "Resolution order: --root, FOLIOLOOM_HOME, current-directory ancestors.",
@@ -260,7 +285,7 @@ function main() {
       return;
     }
 
-    const options = { explicitRoot: parsed.explicitRoot };
+    const options = { explicitRoot: parsed.explicitRoot, backend: parsed.backend, workerProfile: parsed.workerProfile };
     if (parsed.command === "resolve") {
       const result = resolveFolioLoomRoot(options);
       if (parsed.json) printJson(result);

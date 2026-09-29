@@ -477,11 +477,12 @@ export function App({ api }: AppProps): JSX.Element {
 
   async function startFullBook(
     optimizationProfile: DesktopOptimizationProfile,
+    executionOptions: { supervisorMode?: "bounded" | "off"; taskContext?: string } = {},
   ): Promise<void> {
     setBusyAction("start-fullbook");
     setFullBookError(undefined);
     try {
-      const result = await desktopApi.startFullBook({ optimizationProfile });
+      const result = await desktopApi.startFullBook({ optimizationProfile, ...executionOptions });
       if (!result.ok) {
         setFullBookError(result.error);
         return;
@@ -644,6 +645,7 @@ export function App({ api }: AppProps): JSX.Element {
           />
         ) : activeWorkspace === "runs" && onboarding.project !== undefined ? (
           <RunWorkspace
+            key={onboarding.project.sourceVersion}
             title={onboarding.project.title}
             modelReady={onboarding.activeModel?.capability === "ready"}
             snapshot={fullBookSnapshot}
@@ -653,7 +655,7 @@ export function App({ api }: AppProps): JSX.Element {
               || busyAction === "resume-fullbook"
               || busyAction === "export-diagnostics"}
             error={fullBookError}
-            onStart={(profile) => { void startFullBook(profile); }}
+            onStart={(profile, executionOptions) => { void startFullBook(profile, executionOptions); }}
             onPause={() => { void pauseFullBook(); }}
             onResume={(runId) => { void resumeFullBook(runId); }}
             onExportDiagnostics={() => { void exportDiagnostics(); }}
