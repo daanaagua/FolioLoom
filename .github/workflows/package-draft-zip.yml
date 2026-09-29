@@ -1,0 +1,123 @@
+name: Package draft portable ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag
+        required: true
+        type: string
+      portable_sha256:
+        description: Verified single-file portable EXE SHA-256
+        required: true
+        type: string
+      application_sha256:
+        description: Verified resources/app.asar SHA-256
+        required: true
+        type: string
+      executable_sha256:
+        description: Verified unpacked FolioLoom.exe SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-zip-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      PORTABLE_SHA256: ${{ inputs.portable_sha256 }}
+      APPLICATION_SHA256: ${{ inputs.application_sha256 }}
+      EXECUTABLE_SHA256: ${{ inputs.executable_sha256 }}
+    steps:
+      - name: Download verified draft EXE
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') { throw 'Invalid release tag' }
+          foreach ($digest in @($env:PORTABLE_SHA256, $env:APPLICATION_SHA256, $env:EXECUTABLE_SHA256)) {
+            if ($digest -notmatch '^[0-9a-fA-F]{64}$') { throw 'Invalid expected digest' }
+          }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GH_REPO --json isDraft,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or !$release.isDraft) { throw 'An existing draft release is required' }
+          $asset = @($release.assets | Where-Object name -eq 'FolioLoom-portable-win-x64.exe')
+          if ($asset.Count -ne 1 -or $asset[0].state -ne 'uploaded' -or $asset[0].digest -ne "sha256:$($env:PORTABLE_SHA256.ToLowerInvariant())") { throw 'Draft EXE identity mismatch' }
+          if ($release.assets.name -contains 'FolioLoom-portable-win-x64.zip') { throw 'ZIP already exists; refusing replacement' }
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'folioloom-draft-zip'
+          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GH_REPO --pattern FolioLoom-portable-win-x64.exe --dir $packageRoot
+          if ($LASTEXITCODE -ne 0) { throw 'EXE download failed' }
+          if ((Get-FileHash (Join-Path $packageRoot 'FolioLoom-portable-win-x64.exe')).Hash -ne $env:PORTABLE_SHA256) { throw 'Downloaded EXE digest mismatch' }
+          "PACKAGE_ROOT=$packageRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore identical payload and build ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip/7z.exe'
+          $stub = Join-Path $env:PACKAGE_ROOT 'nsis'
+          $payload = Join-Path $env:PACKAGE_ROOT 'payload'
+          & $sevenZip x (Join-Path $env:PACKAGE_ROOT 'FolioLoom-portable-win-x64.exe') "-o$stub" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Portable archive extraction failed' }
+          $inner = Join-Path $stub '$PLUGINSDIR/app-64.7z'
+          if (!(Test-Path -LiteralPath $inner -PathType Leaf)) { throw 'Expected portable payload is missing' }
+          & $sevenZip x $inner "-o$payload" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Application extraction failed' }
+          if ((Get-FileHash (Join-Path $payload 'resources/app.asar')).Hash -ne $env:APPLICATION_SHA256) { throw 'Application payload digest mismatch' }
+          if ((Get-FileHash (Join-Path $payload 'FolioLoom.exe')).Hash -ne $env:EXECUTABLE_SHA256) { throw 'Application EXE digest mismatch' }
+          $info = Get-Content -LiteralPath (Join-Path $payload 'resources/folioloom/app-info.json') -Raw | ConvertFrom-Json
+          if ($info.version -ne $env:RELEASE_TAG.Substring(1)) { throw 'Application version mismatch' }
+          $zipPath = Join-Path $env:PACKAGE_ROOT 'FolioLoom-portable-win-x64.zip'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          Add-Type -AssemblyName System.IO.Compression
+          $archive = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
+          try {
+            $prefix = $payload.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            Get-ChildItem -LiteralPath $payload -Recurse -File | ForEach-Object {
+              $entryName = $_.FullName.Substring($prefix.Length).Replace('\', '/')
+              [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            }
+          } finally { $archive.Dispose() }
+          $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            foreach ($name in @('FolioLoom.exe', 'resources/app.asar')) {
+              $entry = $zip.GetEntry($name)
+              if ($null -eq $entry) { throw "ZIP is missing $name" }
+              $stream = $entry.Open()
+              $hasher = [Security.Cryptography.SHA256]::Create()
+              try { $digest = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '') } finally { $stream.Dispose(); $hasher.Dispose() }
+              $expected = if ($name -eq 'FolioLoom.exe') { $env:EXECUTABLE_SHA256 } else { $env:APPLICATION_SHA256 }
+              if ($digest -ne $expected) { throw "ZIP content mismatch: $name" }
+            }
+          } finally { $zip.Dispose() }
+          $zipHash = (Get-FileHash $zipPath).Hash.ToLowerInvariant()
+          $checksums = "$($env:PORTABLE_SHA256.ToLowerInvariant())  FolioLoom-portable-win-x64.exe`n$zipHash  FolioLoom-portable-win-x64.zip`n"
+          [IO.File]::WriteAllText((Join-Path $env:PACKAGE_ROOT 'SHA256SUMS.txt'), $checksums, [Text.UTF8Encoding]::new($false))
+          Write-Output "ZIP_SHA256=$zipHash"
+
+      - name: Upload ZIP and matching checksums to draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = gh release view $env:RELEASE_TAG --repo $env:GH_REPO --json isDraft,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or !$release.isDraft) { throw 'Release is no longer a draft' }
+          $exe = @($release.assets | Where-Object name -eq 'FolioLoom-portable-win-x64.exe')
+          if ($exe.Count -ne 1 -or $exe[0].digest -ne "sha256:$($env:PORTABLE_SHA256.ToLowerInvariant())") { throw 'Draft EXE changed' }
+          if ($release.assets.name -contains 'FolioLoom-portable-win-x64.zip') { throw 'ZIP appeared concurrently; refusing replacement' }
+          gh release upload $env:RELEASE_TAG --repo $env:GH_REPO (Join-Path $env:PACKAGE_ROOT 'FolioLoom-portable-win-x64.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP upload failed' }
+          gh release upload $env:RELEASE_TAG --repo $env:GH_REPO (Join-Path $env:PACKAGE_ROOT 'SHA256SUMS.txt') --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Checksum upload failed' }
