@@ -5,6 +5,7 @@ import type {
   DesktopFullBookRunSnapshot,
   DesktopFullBookSnapshot,
   DesktopOptimizationProfile,
+  DesktopStartFullBookRequest,
 } from "../../../contracts.js";
 import { TechnicalDetails, redactTechnicalDetails } from "./TechnicalDetails.js";
 
@@ -14,7 +15,7 @@ interface RunWorkspaceProps {
   snapshot: DesktopFullBookSnapshot;
   busy: boolean;
   error?: DesktopError;
-  onStart(profile: DesktopOptimizationProfile): void;
+  onStart(profile: DesktopOptimizationProfile, options: Omit<DesktopStartFullBookRequest, "optimizationProfile">): void;
   onPause(): void;
   onResume(runId: string): void;
   onExportDiagnostics(): void;
@@ -112,6 +113,8 @@ export function RunWorkspace({
 }: RunWorkspaceProps): JSX.Element {
   const [selectedProfile, setSelectedProfile] =
     useState<DesktopOptimizationProfile>("balanced");
+  const [supervisorEnabled, setSupervisorEnabled] = useState(true);
+  const [taskContext, setTaskContext] = useState("");
   const run = useMemo(() => currentRun(snapshot), [snapshot]);
   const completed = run === undefined
     ? 0
@@ -156,11 +159,24 @@ export function RunWorkspace({
                 </button>
               ))}
             </div>
+            <label className="workspace-copy">
+              <input type="checkbox" checked={supervisorEnabled} disabled={busy}
+                onChange={event => setSupervisorEnabled(event.target.checked)} />{" "}
+              启用 Pi 主 agent 监督
+            </label>
+            <p className="workspace-hint">主 agent 按批次查证和审校，内核控制预算与提交；模型由内嵌 Pi 直接调用。</p>
+            <label className="knowledge-field">
+              <span>任务背景前缀</span>
+              <textarea value={taskContext} maxLength={16000} rows={3} disabled={busy}
+                placeholder="例如：原文由使用者提供，仅供个人阅读。请忠实保留作品的原意和叙述声音。"
+                onChange={event => setTaskContext(event.target.value)} />
+            </label>
+            <p className="workspace-hint">背景会发送给翻译、修复和监督模型，并随运行保存；续跑沿用原背景。</p>
             <button
               className="primary-button"
               type="button"
               disabled={!modelReady || busy}
-              onClick={() => onStart(selectedProfile)}
+              onClick={() => onStart(selectedProfile, { supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
             >
               {busy ? "正在启动" : "开始整本翻译"}
             </button>

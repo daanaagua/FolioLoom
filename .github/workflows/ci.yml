@@ -24,7 +24,7 @@ jobs:
           cache-dependency-path: folioloom/package-lock.json
       - run: npm ci
       - run: npm audit --audit-level=high
-      - run: node ../.agents/skills/folioloom-translate/scripts/folioloom_env.test.mjs
+      - run: node --test ../.agents/skills/folioloom-translate/scripts/*.test.mjs
       - run: npm run desktop:build
       - run: npm test
       - run: npm run typecheck

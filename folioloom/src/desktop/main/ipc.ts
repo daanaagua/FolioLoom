@@ -1070,7 +1070,7 @@ function startFullBookRequest(value: unknown): DesktopStartFullBookRequest {
   const input = exactRecord(
     value,
     "start-fullbook payload",
-    ["optimizationProfile"],
+    ["optimizationProfile", "supervisorMode", "taskContext"],
   );
   const optimizationProfile = requiredText(
     input.optimizationProfile,
@@ -1083,7 +1083,10 @@ function startFullBookRequest(value: unknown): DesktopStartFullBookRequest {
       "optimizationProfile must be economy, balanced, or speed",
     );
   }
-  return { optimizationProfile };
+  if (input.supervisorMode !== undefined && input.supervisorMode !== "bounded" && input.supervisorMode !== "off") return inputError("supervisorMode must be bounded or off");
+  const taskContext = input.taskContext === undefined ? undefined : boundedText(input.taskContext, "taskContext", 16000);
+  return { optimizationProfile, ...(input.supervisorMode === undefined ? {} : { supervisorMode: input.supervisorMode }),
+    ...(taskContext === undefined ? {} : { taskContext }) };
 }
 
 function resumeFullBookRequest(value: unknown): DesktopResumeFullBookRequest {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 
-import { resolveFolioLoomRoot, validateFolioLoomRoot } from "./folioloom_env.mjs";
+import { doctorFolioLoom, resolveFolioLoomRoot, validateFolioLoomRoot } from "./folioloom_env.mjs";
 
 function createFixture(t, label) {
   const root = mkdtempSync(join(tmpdir(), `folioloom-skill-${label}-`));
@@ -71,4 +71,15 @@ test("discovers a checkout from a current-directory ancestor", (t) => {
   const result = resolveFolioLoomRoot({ envRoot: "", cwd: nested });
   assert.equal(result.root, realpathSync(root));
   assert.equal(result.source, "ancestor");
+});
+
+test("core doctor does not require a Codex executable or login", (t) => {
+  const root = createFixture(t, "neutral-doctor");
+  const calls = [];
+  doctorFolioLoom({explicitRoot: root, toolRunner: (tool, args) => {calls.push([tool, args]); return {ok:true,detail:'fixture'};}});
+  assert.ok(calls.some(([tool])=>tool === 'npm'));
+  assert.ok(calls.every(([tool])=>tool !== 'codex'));
+  calls.length = 0;
+  doctorFolioLoom({explicitRoot: root, backend: 'codex', toolRunner: (tool,args) => {calls.push([tool,args]);return {ok:true,detail:'fixture'};}});
+  assert.ok(calls.some(([tool,args])=>tool === 'codex' && args[0] === 'login'));
 });

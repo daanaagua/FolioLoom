@@ -19,6 +19,16 @@ interface PublicErrorDefinition {
 }
 
 const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.freeze({
+  SUPERVISION_PAUSED: {
+    message: "主 agent 已暂停当前任务",
+    nextAction: "查看监督记录，解决原文或约束问题后释放该检查点；译文和进度保持不变。",
+    retryable: false,
+  },
+  SUPERVISION_EXECUTION_FAILED: {
+    message: "主 agent 请求未能完成",
+    nextAction: "查看模型连接与监督记录；已完成译文仍然保留。",
+    retryable: false,
+  },
   AUTH_INVALID: {
     message: "API Key 无效或已失效",
     nextAction: "请检查密钥是否完整，并确认它属于当前选择的服务商。",

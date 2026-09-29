@@ -369,7 +369,9 @@ test("a full initial reservation produces no immediate dispatch", () => {
 });
 
 test("planner output is deterministic", () => {
-  const fixture = plannerFixture(12);
+  // Compare ordering, not unrelated CPU contention crossing the wall-clock deadline.
+  // Deadline behavior and elapsed performance have dedicated tests below.
+  const fixture = { ...plannerFixture(12), clock: () => 0 };
   assert.deepEqual(
     planRollingHorizon(fixture),
     planRollingHorizon({

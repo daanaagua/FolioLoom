@@ -16,6 +16,7 @@ import type { BookStore } from "./storage/book-store.js";
 import type { LosslessBookStore } from "./storage/lossless-book-store.js";
 import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
 import { optimizationPolicy } from "./fullbook/optimization-policy.js";
+import { summarizeSupervision, supervisionMetadata, type SupervisionSummary } from "./domain/supervision.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -156,6 +157,7 @@ function friendlyBookArtifactFileNames(
 }
 
 export interface LosslessBookAuditReport {
+  supervision?: SupervisionSummary;
   schema: "v5-book-store-audit-1";
   runId: string;
   sourceVersion: string;
@@ -191,6 +193,8 @@ export interface LosslessBookAuditReport {
 }
 
 const KNOWLEDGE_CONVERGENCE_INCIDENTS = new Set([
+  "SUPERVISION_PAUSED",
+  "SUPERVISION_REVIEW_PENDING",
   "STALE_KNOWLEDGE_BINDING",
   "PENDING_KNOWLEDGE_CHANGE",
   "PENDING_TERM_IMPACT",
@@ -553,9 +557,18 @@ export function auditLosslessBookStore(
   if (!knowledgeConverged) {
     incidents.push("STALE_KNOWLEDGE_BINDING");
   }
+  const supervisionPolicy = (state.runMetadata as { supervision?: unknown } | undefined)?.supervision;
+  const supervision = supervisionPolicy === undefined ? undefined
+    : summarizeSupervision("bounded", store.supervisionRecords(runId), store.allWindows(runId), store.activeTranslations(runId));
+  if (supervisionPolicy !== undefined && canonicalJson(supervisionPolicy) !== canonicalJson(supervisionMetadata("bounded"))) incidents.push("SUPERVISION_POLICY_INVALID");
+  if (supervision?.paused.length) incidents.push("SUPERVISION_PAUSED");
+  if (supervision?.pendingReviewWindowIds.length) incidents.push("SUPERVISION_REVIEW_PENDING");
   const incidentCodes = [...new Set(incidents)].sort();
-  const strictExportable = structurallyComplete && knowledgeConverged;
+  const supervisionComplete = supervision === undefined || (!supervision.paused.length && !supervision.pendingReviewWindowIds.length
+    && !incidents.includes("SUPERVISION_POLICY_INVALID"));
+  const strictExportable = structurallyComplete && knowledgeConverged && supervisionComplete;
   return {
+    ...(supervision === undefined ? {} : { supervision }),
     schema: "v5-book-store-audit-1",
     runId: state.runId,
     sourceVersion: state.sourceVersion,
@@ -938,6 +951,7 @@ export function writeLosslessBookArtifacts(
     missingBlockIds: audit.missingBlockIds,
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),
+    ...(audit.supervision === undefined ? {} : { supervision: audit.supervision }),
     scheduler: schedulerMetricsProjection(schedulerReport),
   }, null, 2)}\n`, "utf8");
   const lineageJson = `${JSON.stringify({

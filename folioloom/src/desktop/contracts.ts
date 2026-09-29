@@ -301,6 +301,8 @@ export interface DesktopFullBookSnapshot {
 
 export interface DesktopStartFullBookRequest {
   optimizationProfile: DesktopOptimizationProfile;
+  supervisorMode?: "bounded" | "off";
+  taskContext?: string;
 }
 
 export interface DesktopResumeFullBookRequest {

@@ -6,6 +6,7 @@ import {
 } from "../agents/pi-runtime.js";
 import {
   runTranslationBatch,
+  reviewAndRepairTranslationBatchCandidate,
   validateTranslationBatchCandidate,
   type TranslationBatchResult,
   type TranslationBatchWindowResult,
@@ -436,6 +437,7 @@ function assessPreparedTranslationFragment<
   paragraphUnit?: ParagraphFragmentUnit,
 ): AdmittedRequestFragment<TInput> {
   const assessment = new RequestBudgeter(estimator, {
+    streamFn: runtime.streamFn,
     modelId: runtime.model.id,
     contextWindowTokens: runtime.model.contextWindow,
     maxCompletionTokens: runtime.model.maxTokens,
@@ -1408,6 +1410,9 @@ export async function executePlannedTranslationRequest(
           };
         const result = await runTranslationBatch({
           ...runtimeInput,
+          // Supervisor review belongs to the complete logical candidate, never
+          // to a paragraph transport fragment or an intermediate recovery result.
+          reviewCandidate: undefined,
           model: activeRuntime.model,
           streamFn: activeRuntime.streamFn,
           thinkingLevel: activeRuntime.thinkingLevel,
@@ -1780,6 +1785,7 @@ export async function executePlannedTranslationRequest(
     if (executions.some((item) => item.fragment.paragraphPlan !== undefined)) {
       const checked = await validateTranslationBatchCandidate({
         ...selectedBuildInput(request),
+        reviewCandidate: undefined,
         model: selectedRuntime.model,
         streamFn: selectedRuntime.streamFn,
         thinkingLevel: selectedRuntime.thinkingLevel,
@@ -1789,6 +1795,18 @@ export async function executePlannedTranslationRequest(
         windows: checked.windows,
         responseErrors: checked.responseErrors,
       };
+    }
+    const completeInput = selectedBuildInput(request);
+    if (completeInput.reviewCandidate && result.windows.every(w => w.status !== "failed")) {
+      const checked = await reviewAndRepairTranslationBatchCandidate({
+        ...completeInput, model: selectedRuntime.model, streamFn: selectedRuntime.streamFn,
+        thinkingLevel: selectedRuntime.thinkingLevel, budget, signal, deadlineMs: hardDeadlineMs,
+        repairEnabled: targetedRepairScopeKeys.size < MAX_TARGETED_REPAIRS_PER_REQUEST,
+        repairRuntime: runtimeSet.escalation, onProviderResponse,
+      }, result);
+      observedRuns.push(...checked.repairRuns);
+      if (checked.repairRuns.length) targetedRepairScopeKeys.add(`supervision:${request.requestId}`);
+      result = { windows: checked.windows, responseErrors: checked.responseErrors };
     }
     const failed = result.windows.some((window) =>
       window.status === "failed");

@@ -1,0 +1,84 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { runSupervisor, validateSupervisorDecision, type SupervisorInput } from "../src/agents/supervisor.js";
+import { bindTaskContext } from "../src/agents/task-context.js";
+
+function fixture() {
+  const faux = fauxProvider();
+  const input: SupervisorInput = {
+    event: "plan", windows: [{ windowId: "w1", ordinal: 0, blockIds: ["b1"] }, { windowId: "w2", ordinal: 1, blockIds: ["b2"] }],
+    sources: [{ blockId: "b1", globalIndex: 0, sourceText: "Rose did not leave. She waited for John." },
+      { blockId: "b2", globalIndex: 1, sourceText: "John called Rose his sister." }],
+    terms: [], model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+  };
+  return { faux, input };
+}
+const plan = { action: "translate", windowIds: ["w1", "w2"], reviewBlockIds: ["b1"], guidance: [], issues: [], reason: "先译两个窗口，再检查否定含义。" };
+
+test("supervisor can search evidence then authorize a bounded batch using native Pi", async () => {
+  const { faux, input } = fixture();
+  const seen: string[] = [];
+  const raw = input.streamFn;
+  input.streamFn = bindTaskContext((m, c, o) => { seen.push(c.systemPrompt ?? ""); return raw(m, c, o); }, "仅作个人阅读的测试材料。");
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_source", { query: "sister", limit: 2 }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" }),
+  ]);
+  const result = await runSupervisor(input);
+  assert.equal(result.decision.action, "translate");
+  assert.deepEqual(result.run.toolNames, ["search_source", "submit_supervisor_decision"]);
+  assert.equal(result.run.modelCalls, 2);
+  assert.ok(seen.every(s => s.startsWith("仅作个人阅读的测试材料。")));
+  assert.equal(faux.state.callCount, 2);
+});
+
+test("supervisor cannot skip a window, invent scope, or invent source evidence", () => {
+  const { input } = fixture();
+  assert.throws(() => validateSupervisorDecision({ ...plan, windowIds: ["w2"] }, input), /prefix/u);
+  assert.throws(() => validateSupervisorDecision({ ...plan, windowIds: ["outside"] }, input), /scope|prefix/u);
+  assert.throws(() => validateSupervisorDecision({ ...plan, reviewBlockIds: ["other"] }, input), /scope/u);
+  assert.throws(() => validateSupervisorDecision({ ...plan, guidance: [{ blockId: "b1", sourceQuote: "invented", instruction: "改译" }] }, input), /source quote/u);
+});
+
+test("review decisions must point to supplied source and candidate text", () => {
+  const { input } = fixture();
+  const review: SupervisorInput = { ...input, event: "review", windows: [input.windows[0]!], candidate: [{ blockId: "b1", text: "罗斯离开了。她等着约翰。" }] };
+  const decision = { action: "revise", windowIds: ["w1"], reviewBlockIds: [], guidance: [], reason: "否定意义丢失。", issues: [{ blockId: "b1", sourceQuote: "did not leave", targetQuote: "罗斯离开了", problem: "原文明确否定离开，译文却肯定离开。" }] };
+  assert.equal(validateSupervisorDecision(decision, review).action, "revise");
+  assert.throws(() => validateSupervisorDecision({ ...decision, issues: [{ ...decision.issues[0], targetQuote: "不存在的译文" }] }, review), /target quote/u);
+  assert.throws(() => validateSupervisorDecision({ ...decision, action: "accept" }, review), /accept/u);
+  assert.throws(() => validateSupervisorDecision({ ...plan, action: "translate" }, review), /action/u);
+});
+
+test("supervisor has a hard turn cap and never grants arbitrary file or shell tools", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses(Array.from({ length: 6 }, () => fauxAssistantMessage(fauxToolCall("search_source", { query: "Rose", limit: 1 }), { stopReason: "toolUse" })));
+  await assert.rejects(() => runSupervisor({ ...input, maxTurns: 2 }), /decision|supervisor/u);
+  assert.equal(faux.state.callCount, 2);
+});
+
+test("provider failures are propagated rather than repaired as literary issues", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 Unauthorized" })]);
+  await assert.rejects(() => runSupervisor(input), /provider|Unauthorized/u);
+  assert.equal(faux.state.callCount, 1);
+});
+
+test("review advertises empty plan-only fields in its native tool schema and prompt", async () => {
+  const { faux, input } = fixture();
+  let schema: any;
+  let system = "";
+  faux.setResponses([(context) => {
+    schema = context.tools?.find(tool => tool.name === "submit_supervisor_decision")?.parameters;
+    system = context.systemPrompt ?? "";
+    return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", {
+      action: "accept", windowIds: ["w1"], reviewBlockIds: [], guidance: [], issues: [], reason: "语义一致。",
+    }), { stopReason: "toolUse" });
+  }]);
+  const review: SupervisorInput = { ...input, event: "review", windows: [input.windows[0]!], candidate: [{ blockId: "b1", text: "罗斯没有离开。她等着约翰。" }] };
+  assert.equal((await runSupervisor(review)).decision.action, "accept");
+  assert.equal(schema.properties.reviewBlockIds.maxItems, 0);
+  assert.equal(schema.properties.guidance.maxItems, 0);
+  assert.match(system, /reviewBlockIds.*guidance.*\[\]/u);
+});

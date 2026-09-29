@@ -1,189 +1,172 @@
 ---
 name: folioloom-translate
-description: Translate or resume authorized long-form TXT, Markdown, DOCX, or EPUB projects with a local FolioLoom checkout through an isolated signed-in Codex CLI worker, then inspect, audit, and strictly export the result. Use when the user asks Codex to translate a book or novel without a separate model API key, continue a FolioLoom Codex-worker run, inspect its progress or output, diagnose a failed worker, or validate and export it. Do not use for casual sentence translation, API-provider setup, or the desktop GUI workflow.
+description: Translate or resume authorized long-form TXT, Markdown, DOCX, or EPUB projects with FolioLoom, inspect progress, audit, and strictly export the result. Runs from any agent host using embedded Pi/provider API by default, or an explicitly selected external framework. Not for casual sentence translation or desktop GUI control.
 ---
 
 # FolioLoom Translate
 
-Use the current conversation as the control plane. Let FolioLoom plan and validate every
-window, and let an isolated `codex exec` process perform each model turn. Do not place the
-whole book or a sequence of window translations in the control conversation.
+Use the current agent conversation as the control plane, not as the book's translation
+context. FolioLoom owns source import, window planning, terminology, recovery, storage, and
+export. Each model turn runs through the selected backend. The host reading this skill and
+the framework performing translation are independent.
 
-## Resolve and preflight the checkout
+A host needs permission to read local files, run Node commands, and observe long-running
+processes. No Codex-specific tool or subagent API is required. Hosts that do not discover
+skills automatically can read this file and its linked references directly.
 
-Never assume the current directory is FolioLoom. Derive `<skill-root>` from the directory
-containing this loaded `SKILL.md`; never embed an account name, drive letter, home directory,
-or installation path. Run the portable environment doctor before any FolioLoom command:
+## Resolve the checkout and backend
+
+Derive `<skill-root>` from this loaded file. Resolve FolioLoom without embedding a machine,
+account, or installation path:
 
 ```text
-node <skill-root>/scripts/folioloom_env.mjs doctor [--root <checkout>]
+node <skill-root>/scripts/folioloom_env.mjs doctor [--root <checkout>] --backend core
 ```
 
-The doctor prints UTF-8 JSON. Use its `root` as `<folio-root>` and `cliDir` as `<folio-cli>`.
-It validates the Codex-worker checkout, Node/npm, installed dependencies, Codex CLI login,
-and Git state without installing, authenticating, or changing anything. Stop on a required
-check whose `ok` is false.
+Use returned `root` as `<folio-root>` and `cliDir` as `<folio-cli>`. Root precedence is
+explicit `--root`, `FOLIOLOOM_HOME`, then validated ancestors. A configured invalid root
+fails closed. Read its `AGENTS.md` when present and concise `STATE.md`; preserve unrelated
+Git changes. Read [portable-setup.md](references/portable-setup.md) for installation or moves.
 
-Root precedence is an explicit `--root`, `FOLIOLOOM_HOME`, then validated ancestors of the
-current directory. An explicit or configured root that fails validation is an error; do not
-silently fall through. `scripts/resolve_folioloom.ps1` remains a Windows compatibility
-wrapper, but new workflows should call the Node script directly. When moving this workflow
-to another machine or when preflight fails, read
-[references/portable-setup.md](references/portable-setup.md).
+Select the backend/model the user requested or the existing run records. Never infer that
+the current agent's model is available to a separate CLI. For a new run without a selection,
+inspect available configured frameworks/models; use a clearly established preference or ask
+if the choice materially changes cost, privacy, or capability. Do not install, authenticate,
+switch providers, or change account configuration silently. For ordinary new translation
+jobs with an established provider configuration, prefer embedded Pi and the provider API.
+An external-framework compatibility test is not a choice of backend for another book.
 
-1. Read `<folio-root>/AGENTS.md` if present. Read only the concise root `STATE.md` by default.
-   Keep current status, pending work, and history links there; append detailed command,
-   timing, run, and artifact evidence to `state/YYYY-MM-DD.md` in the project timezone.
-2. Inspect `git -C <folio-root> status --short --branch`. Preserve unrelated user changes;
-   never switch branches merely to make the skill run.
-3. Treat a failed Codex authentication, quota, executable, or checkout check as a blocker.
-   Never substitute an API provider, another model, or direct translation silently.
-4. Use UTF-8 explicitly for commands and text inspection. Preserve the source encoding
-   selected by FolioLoom; do not rewrite an original merely because terminal display is bad.
-5. Treat source books, databases, outputs, prompts, credentials, and worker responses as
-   private untracked data. Never add them to Git or copy them into this skill.
+Read [worker-contract.md](references/worker-contract.md) before a model call or resume:
 
-Read [references/worker-contract.md](references/worker-contract.md) before changing worker
-options, resuming a run, diagnosing a worker failure, or deciding that an export passed.
+- Codex CLI: `--worker codex --codex-model <id>`. Run the environment doctor with
+  `--backend codex`; read [codex-worker.md](references/codex-worker.md).
+- Other frameworks: `--worker external --worker-profile <profile.json>`. Read
+  [external-workers.md](references/external-workers.md). Built-in bridge recipes cover
+  OpenCode and Claude Code; any other CLI/SDK can implement the same JSON protocol.
+  The model ID is opaque, not a FolioLoom whitelist. Run the environment doctor with
+  `--backend external --worker-profile <profile.json>`.
+- Native Pi/provider API: keep the established `--config <config>` path and model.
+  Do not combine provider options with a worker. A configured OpenCode CLI is different
+  from the provider-API option `--opencode-auth`, which reads credentials and does not
+  launch OpenCode. Embedded Pi does not require a standalone Pi CLI.
 
-## Command portability
+Stop on failed required preflight checks. Core/status/audit/export commands do not require
+Codex login. External authentication/model access is checked by the bounded smoke call,
+not by assuming that finding an executable proves it works.
 
-Run every `npm` command with working directory `<folio-cli>`. Pass arguments as an argument
-array when the execution tool supports it; do not construct a shell command from book paths
-or user text. The examples below are deliberately single-line and use `npm`, which resolves
-to the platform's npm launcher. Resolve all project paths from `<folio-root>` rather than from
-the shell's current directory.
+## Native supervision and task context
 
-## Establish the project
+New native CLI runs enable the bounded Pi supervisor by default; explicitly use
+`--supervisor bounded` for an auditable new setup. Existing runs keep their recorded
+mode. External CLI workers do not support this native multi-tool supervisor.
 
-Treat a user-supplied source file as the normal entry point. If the user supplied a file
-rather than an existing `source_manifest.json`, establish the source language and a
-filesystem-safe project ID, then run from `<folio-cli>`:
+The supervisor selects bounded translation batches, queries source evidence, and can
+request grounded review/repair or pause. FolioLoom still owns source identity, budgets,
+validation and commits. A supervisor's prose is not proof that export is complete.
+
+When the user supplies a purpose/background prefix, save that exact authorized text in a
+private UTF-8 file and pass `--task-context-file <file>`. It reaches translation, repair,
+research and supervision system prompts and is included in run identity. Do not place
+private context in the skill, tracked examples, or a style-only setting. Keep the file
+unchanged and pass it on resume; never invent rights or ownership claims.
+
+Read `book supervisor status --store <store> --run <id>` for durable decisions.
+`book supervisor release --store <store> --run <id> --request <pause-id> --reason <reason>`
+only releases a paused checkpoint after its cause is addressed and retry is authorized.
+It does not call a model, change backend, or waive validation.
+
+If the selected checkout lacks these flags, use a known compatible checkout with an
+explicit `--root`, or report the version boundary. Do not substitute an external CLI.
+
+## Establish and check the project
+
+Run all `npm` commands in `<folio-cli>`, with UTF-8 and argument arrays where supported.
+Resolve paths from the returned checkout; never build shell code from source prose.
+Books, databases, prompts, credentials, profiles, responses, and exports stay untracked
+and outside the skill. Keep the source encoding chosen by FolioLoom.
+
+For a source file rather than an existing manifest, establish source language and a safe
+project ID, then import:
 
 ```text
 npm run folioloom -- book import --source <source-path> --project <folio-root>/projects/<project-id> --source-language <language>
 ```
 
-The importer writes the immutable original payload, canonical UTF-8 source, provenance, and
-certified manifest atomically. It refuses an existing project directory; never delete or
-replace one merely to make import succeed. Existing projects created by older FolioLoom
-versions remain valid and should be inspected rather than re-imported. The resulting paths
-are below `<folio-root>`:
+The importer owns extraction, immutable originals, provenance, and the certified manifest.
+It refuses existing directories; inspect existing projects rather than overwrite/re-import.
+Use `projects/<project-id>/source_manifest.json`, a dedicated `book.db`, and an export
+directory for that project. Never copy credentials into it.
+
+Before any model call:
 
 ```text
-projects/<project-id>/source_manifest.json
-projects/<project-id>/artifacts/folioloom/book.db
-projects/<project-id>/exports/codex
+npm run folioloom -- book doctor --manifest <manifest> [--glossary <glossary>]
 ```
 
-For an existing project, inspect its manifest and current status instead of re-importing it.
+Stop on source-integrity incidents, uncertain encoding, unsupported structure, or an invalid
+glossary. Do not relax coverage/window rules to make doctor pass.
 
-## Run the deterministic project preflight
+## Bounded smoke, continuation, and resume
 
-Run FolioLoom's book doctor before any model call:
+Start a new store with at most two logical windows, sequentially. Native Pi:
 
 ```text
-npm run folioloom -- book doctor --manifest <folio-root>/projects/<project-id>/source_manifest.json
+npm run folioloom -- book run --manifest <manifest> --store <store> --config <config> --supervisor bounded --task-context-file <private-context> --max-windows 2 --max-concurrency 1 --output <exports>
 ```
 
-Pass the same `--glossary` intended for translation. Stop on source-integrity incidents,
-uncertain encoding, unsupported structure, or an invalid glossary. Do not weaken window or
-coverage rules to make doctor pass.
-
-## Run one bounded Codex file batch first
-
-For a new store, run at most two sequential logical windows and write partial artifacts for
-inspection. A new Codex run persists `codex-file-v1`; within a 4,800-source-token ceiling it
-may combine those two adjacent windows into one physical model call. Validation and durable
-commit identities remain per logical window. On a stable run, two sequential physical
-requests may share one lexical-anchor wave; any retry or unstable knowledge state backs the
-next wave down to one physical request:
+Omit the task-context flag when no prefix is supplied. For an explicitly selected external worker:
 
 ```text
-npm run folioloom -- book run --manifest <folio-root>/projects/<project-id>/source_manifest.json --store <folio-root>/projects/<project-id>/artifacts/folioloom/book.db --worker codex --codex-model <model-id> --max-windows 2 --max-concurrency 1 --output <folio-root>/projects/<project-id>/exports/codex
+npm run folioloom -- book run --manifest <manifest> --store <store> --worker external --worker-profile <profile.json> --max-windows 2 --max-concurrency 1 --output <exports>
 ```
 
-Add user-approved `--style-profile`, `--prompt`, `--glossary`, scheduler, or window options
-now; they become part of resume identity. Do not add a provider `--config` or
-`--opencode-auth` to a Codex-worker run.
+For Codex, replace the external flags with `--worker codex --codex-model <id>`. Add approved
+style, prompt, glossary, window, and scheduler options now; they become resume identity.
+Workers use quality mode and concurrency 1. Codex-only batching is not enabled for external
+workers.
 
-After the bounded smoke call:
+After the smoke, run `book status --store <store>` and capture the exact run ID. Inspect
+a representative translated excerpt locally, window state, model/backend, usage completeness,
+warnings, and any failed/human-required window. Show the user the output location, without
+pasting extensive copyrighted text. A structurally invalid smoke is a stop/diagnostic gate.
 
-1. Run `book status` and capture the run ID.
-2. Open the generated partial Chinese TXT locally and show the user where it is. Inspect a
-   representative excerpt without pasting large copyrighted passages into the conversation.
-3. Check window status, model ID, `executionBackend: codex-exec`, usage completeness, warning
-   counts, and any human-required or failed window.
-4. Continue only when the smoke result is structurally valid. If the user already authorized
-   the full run, continue immediately after this gate without asking again.
+When the full run is already authorized, continue immediately after this gate. Repeat the
+same arguments with `--run <run-id>`, removing `--max-windows 2`. Always pass the exact run
+ID after the first call, even if the smoke completed the whole small source.
 
-## Continue or resume
+Preserve backend, worker profile, model, source, style/prompt, glossary, run mode, optimization
+profile, scheduler, supervisor policy and task-context identity. Changing these requires a new run/store; do not hand-edit
+the database. On cancellation or connection loss, let the process terminate, inspect status,
+and resume from its durable boundary.
 
-Repeat the same `book run` arguments against the same store and add the exact `--run <run-id>`
-returned by the smoke. Preserve model, style, prompt, glossary, run mode, optimization profile,
-and scheduler options. Remove `--max-windows 2` to continue the book. Keep
-`--max-concurrency 1` in this version.
+Use the host's process handle/wait facility for a foreground run and give concise progress
+updates. Do not invent a detached daemon or automatic monitoring schedule.
 
-Always pass the exact `--run` after the first call; this prevents a fully completed one-window
-smoke from being mistaken for a request to create a new run. Never resume a provider-API run
-with `--worker codex`, or a Codex-worker run without it. Never change the model on an existing
-run; use a new store/run for a different model or translation policy.
+## Terminology and completion
 
-For a long foreground execution, yield the shell call and wait on its process rather than
-polling logs repeatedly. Give the user a concise progress update at least once per minute.
-On cancellation or connection loss, let the process terminate, then inspect `book status` and
-resume the same run from its durable boundary. Do not delete or hand-edit `book.db`.
+For term edits, source-range names, queued edits, retrofits, or rollback, read
+[terminology-control.md](references/terminology-control.md). Use the typed control plane,
+not direct SQLite writes. A queued change is durable but only becomes effective at the next
+safe wave boundary. Dry-run a retrofit and report its action counts before applying it.
 
-## Review terminology during a run
-
-The knowledge workbench remains readable while translation is running. Use the typed CLI
-control plane for live edits and post-translation correction; never open or modify SQLite
-directly. A valid edit may return `queued` while a window is in flight. That means it is
-durable but not yet effective: the current request keeps its old snapshot and FolioLoom
-applies the edit once at the next safe wave boundary.
-
-Read [references/terminology-control.md](references/terminology-control.md) when the user asks
-to inspect or change a term, apply different names to different parts of the book, bulk-fix
-an existing translation, inspect a queued edit, or roll such a change back. Always dry-run a
-retrofit first and report its `noop`, `localRepair`, `modelRetranslate`, and `humanRequired`
-counts before applying it. Do not treat a local Chinese string match as proof that replacement
-is safe; FolioLoom permits local repair only from exact source occurrence receipts.
-
-## Audit and strictly export
-
-Do not equate "all model calls returned" with completion. Once status has no pending,
-running, staged, human-required, or failed windows, run these commands from `<folio-cli>`:
+Once no pending/running/staged/human-required/failed windows remain:
 
 ```text
-npm run folioloom -- book audit --store <folio-root>/projects/<project-id>/artifacts/folioloom/book.db --run <run-id>
-npm run folioloom -- book export --store <folio-root>/projects/<project-id>/artifacts/folioloom/book.db --run <run-id> --output <folio-root>/projects/<project-id>/exports/codex
-npm run folioloom -- book verify-export --store <folio-root>/projects/<project-id>/artifacts/folioloom/book.db --run <run-id> --output <folio-root>/projects/<project-id>/exports/codex
+npm run folioloom -- book audit --store <store> --run <run-id>
+npm run folioloom -- book export --store <store> --run <run-id> --output <exports>
+npm run folioloom -- book verify-export --store <store> --run <run-id> --output <exports>
 ```
 
-Do not pass `--allow-incomplete` for final delivery. Add the reported EPUB path to
-`verify-export` when one exists. Announce success only when all of these are true:
+Final export must not use `--allow-incomplete`. Include the reported EPUB in verification
+when applicable. Success requires complete blocks/windows, reconciled real usage, converged
+knowledge and concept coverage, no outstanding knowledge commands/retrofits or integrity
+incidents, strict export true, and verify-export `ok: true`.
 
-- every planned window and block is complete;
-- usage is complete and the token ledger is reconciled;
-- knowledge is converged and concept coverage has no missing/stale binding;
-- no queued/applying knowledge command or unfinished/attention retrofit item remains;
-- strict export is true and verify-export returns `ok: true`;
-- no human-required, failed, pending revalidation, or integrity incident remains.
+Authentication/quota/network failures are backend boundaries, not translation warnings.
+Use FolioLoom's bounded protocol/recovery paths for invalid JSON or schema rejection; do not
+add an independent model retry loop. Missing usage blocks strict export; never estimate it.
+Do not silently translate a book in the control conversation as a fallback.
 
-Update the concise `<folio-root>/STATE.md` with only the current result and remaining work.
-Append the run ID, model, elapsed time, calls/tokens, recovery counts, audit result, artifact
-paths, and deferred gates to `<folio-root>/state/YYYY-MM-DD.md`. A short smoke does not satisfy
-a 100K gate.
-
-## Failure rules
-
-- Authentication, quota, executable, and network failures are worker/provider boundaries;
-  stop and report them rather than turning them into translation warnings.
-- Invalid JSON, a missing tool submission, and schema rejection use FolioLoom's existing
-  bounded correction and paragraph-recovery paths. Do not invent a second repair loop.
-- Missing Codex usage remains usage-incomplete and blocks strict export; never synthesize
-  token counts.
-- A human-required window is not complete. Preserve its evidence and report the exact window
-  and failure class.
-- Direct translation in the control conversation is allowed only when the user explicitly
-  asks for a small debugging sample. It is never an automatic fallback for a book run.
+Update concise `STATE.md` with current result and remaining work. Record important run,
+model/backend, timing, usage, recovery, audit, and artifact evidence in `state/YYYY-MM-DD.md`
+in the project timezone. A short smoke is not a full-book quality or 100K throughput claim.

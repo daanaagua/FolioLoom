@@ -5,6 +5,9 @@ import { dirname, join, resolve } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
+import { bindTaskContext, taskContextMetadata, validateTaskContextIdentity } from "../agents/task-context.js";
+import { supervisionMetadata, validateSupervisionIdentity, summarizeSupervision, type SupervisionMode, type SupervisionSummary } from "../domain/supervision.js";
+import { SupervisionController, isSupervisionBoundaryError } from "./supervision-controller.js";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
@@ -416,6 +419,8 @@ export interface LosslessBookRunMeta {
 }
 
 export interface LosslessBookRunOptions {
+  taskContext?: string;
+  supervisorMode?: SupervisionMode;
   manifestPath: string;
   legacyV4DbPath?: string;
   storePath: string;
@@ -485,6 +490,7 @@ class RevalidationOutputError extends Error {
 }
 
 export interface LosslessBookRunResult {
+  supervision?: SupervisionSummary;
   outcome: "completed" | "completed_with_warnings" | "human_required" | "partial";
   runId: string;
   processedWindows: number;
@@ -2311,7 +2317,29 @@ async function runLosslessBook(
   options: LosslessBookRunOptions,
 ): Promise<LosslessBookRunResult> {
   const startedAt = performance.now();
-  const runtimeSet = normalizeRuntimeSet(options);
+  const originalRuntimeSet = normalizeRuntimeSet(options);
+  const contextualStreams = new Map<StreamFn, StreamFn>();
+  const contextualRuntime = (runtime: TranslationRuntime): TranslationRuntime => {
+    if (options.taskContext === undefined) return runtime;
+    let streamFn = contextualStreams.get(runtime.streamFn);
+    if (streamFn === undefined) {
+      streamFn = bindTaskContext(runtime.streamFn, options.taskContext);
+      contextualStreams.set(runtime.streamFn, streamFn);
+    }
+    return { ...runtime, streamFn };
+  };
+  const runtimeSet: TranslationRuntimeSet = {
+    ...originalRuntimeSet,
+    primary: contextualRuntime(originalRuntimeSet.primary),
+    escalation: contextualRuntime(originalRuntimeSet.escalation),
+    variants: originalRuntimeSet.variants?.map(contextualRuntime),
+  };
+  const supervisorMode = options.supervisorMode ?? "off";
+  if (supervisorMode !== "off" && supervisorMode !== "bounded") throw new Error("invalid supervisor mode");
+  if (supervisorMode === "bounded" && (runtimeSet.primary.executionPolicy !== undefined
+    || runtimeSet.primary.model.provider.startsWith("external-"))) {
+    throw new Error("bounded supervisor requires the native Pi/provider API backend");
+  }
   const schedulerMode = options.schedulerMode ?? "off";
   if (schedulerMode !== "off"
     && schedulerMode !== "shadow"
@@ -2471,9 +2499,14 @@ async function runLosslessBook(
       context,
       runtimeSet,
     );
+    if (supervisorMode === "bounded") requestedMetadata.supervision = supervisionMetadata(supervisorMode);
+    if (options.taskContext !== undefined) requestedMetadata.taskContext = taskContextMetadata(options.taskContext);
     const existingRun = store.listTranslationRuns().find((item) => item.runId === runId);
     const existingRuntimeMetadata = runtimeMetadata(existingRun?.metadata);
     if (existingRun !== undefined) {
+      const storedMetadata = existingRun.metadata as Record<string, unknown> | undefined;
+      validateTaskContextIdentity(storedMetadata?.taskContext, options.taskContext);
+      validateSupervisionIdentity(storedMetadata?.supervision, supervisorMode);
       if (existingRuntimeMetadata === undefined && runtimeSet.mode !== "quality") {
         throw new Error("legacy translation runs can only resume in quality mode");
       }
@@ -2680,6 +2713,15 @@ async function runLosslessBook(
     };
     let cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
+    const supervisor = supervisorMode === "bounded" ? new SupervisionController({
+      runId, sourceVersion: context.sourceLedger.sourceVersion, windows: planned,
+      sources: context.losslessBlocks.map(b => ({ blockId: b.id, globalIndex: b.globalIndex, sourceText: b.sourceText })),
+      runtime: runtimeSet.primary, admission, store, signal: options.signal, deadlineMs: options.hardDeadlineMs,
+      onResponse: (requestId, observation) => store.appendProviderResponseEvidence({
+        runId, requestId, snapshotId: store.latestKnowledgeSnapshot(runId).id,
+        ...observation, responseProtocol: "typed_tool",
+      }),
+    }) : undefined;
     store.applyQueuedKnowledgeChanges(runId);
     store.syncScopedKnowledge(runId);
     const coverageScan = store.ensureConceptCoverageRevalidationTasks(
@@ -2813,6 +2855,14 @@ async function runLosslessBook(
         selectedRequest: PhysicalRequestPlan,
       ): TranslationRequestInput => ({
         request: selectedRequest,
+        strictIdentifiers: supervisorMode === "bounded",
+        supervisorGuidance: supervisor?.guidanceFor([work.window.windowId]),
+        ...(supervisor === undefined ? {} : { reviewCandidate: async (candidate) => {
+          const replacementById = new Map(candidate.translations.map(t => [t.blockId, t]));
+          const complete = store.activeTranslations(runId).filter(t => work.window.blockIds.includes(t.blockId))
+            .map(t => replacementById.get(t.blockId) ?? t);
+          return supervisor.review(work.window.windowId, complete, terms);
+        } }),
         blocks: context.losslessBlocks,
         stableTerms: terms,
         snapshot,
@@ -3156,6 +3206,13 @@ async function runLosslessBook(
         ...(options.glossary?.stableTerms ?? []),
         ...stableTermsFromKnowledge(snapshot.revisions),
       ], context);
+      if (supervisor !== undefined) {
+        const decision = await supervisor.planFor(selected[0]!.windowId, establishedTerms);
+        const allowed = new Set(decision.windowIds);
+        const count = selected.findIndex(w => !allowed.has(w.windowId));
+        if (count === 0) throw new Error("supervisor approved no dispatchable window");
+        if (count > 0) selected.splice(count);
+      }
       const selectedSourceBlocks = sourceBlocksForWindows(selected, blockById);
       const selectedBlocks = selectedSourceBlocks.map(losslessAsV4);
       const anchorStableTerms = termsForWindows(
@@ -3476,6 +3533,13 @@ async function runLosslessBook(
         context,
       );
       const entityLinkWarnings = unresolvedEntityWarnings(waveAnchorSnapshot);
+      if (supervisor !== undefined && entityLinkWarnings.length > 0) {
+        const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings);
+        const allowed = new Set(decision.windowIds);
+        const count = selected.findIndex(w => !allowed.has(w.windowId));
+        if (count === 0) throw new Error("supervisor approved no conflict-safe window");
+        if (count > 0) selected.splice(count);
+      }
       const coordinator = new CommitCoordinator(
         runId,
         new KnowledgeStore(store.knowledgeRevisions(runId)),
@@ -3491,7 +3555,7 @@ async function runLosslessBook(
         coordinator.bindWindow({ ordinal, windowId: window.windowId, snapshot });
       });
       let retryWindows = selected;
-      let providerFailure: ModelProviderError | undefined;
+      let providerFailure: Error | undefined;
       let firstProviderFailure: ModelProviderError | undefined;
       let freshWaveRequired = false;
       let initialRequestCount = 0;
@@ -3530,6 +3594,11 @@ async function runLosslessBook(
           : runtimeSet.escalation;
         const buildTranslationInput = (request: PhysicalRequestPlan): TranslationRequestInput => ({
           request,
+          strictIdentifiers: supervisorMode === "bounded",
+          supervisorGuidance: supervisor?.guidanceFor(request.windows.map(w => w.windowId)),
+          ...(supervisor === undefined ? {} : {
+            reviewCandidate: async candidate => supervisor.review(candidate.windowId, candidate.translations, activeTerms),
+          }),
           blocks: context.losslessBlocks,
           stableTerms: termsForWindows(
             activeTerms,
@@ -4084,8 +4153,8 @@ async function runLosslessBook(
             const capacityError = completedError instanceof BookRequestCapacityError;
             for (const requestWindow of completed.request.windows) {
               const window = claimed.get(requestWindow.windowId) as PersistedLosslessWindow;
-              const external = !capacityError && completedError instanceof ModelProviderError;
-              if (external && firstProviderFailure === undefined) {
+              const external = !capacityError && (completedError instanceof ModelProviderError || isSupervisionBoundaryError(completedError));
+              if (completedError instanceof ModelProviderError && firstProviderFailure === undefined) {
                 firstProviderFailure = completedError;
               }
               const retry = !capacityError && (external || window.attemptCount < maxAttempts);
@@ -4119,6 +4188,7 @@ async function runLosslessBook(
                 ? completedError
                 : (firstProviderFailure ?? completedError);
             }
+            if (isSupervisionBoundaryError(completedError)) providerFailure = completedError;
             continue;
           }
 
@@ -4276,7 +4346,9 @@ async function runLosslessBook(
     }
 
     const status = store.statusSummary(runId);
+    const supervision = supervisorMode === "bounded" ? summarizeSupervision(supervisorMode, store.supervisionRecords(runId), store.allWindows(runId), store.activeTranslations(runId)) : undefined;
     const outcome: LosslessBookRunResult["outcome"] = status.humanRequiredWindows > 0
+      || (supervision?.paused.length ?? 0) > 0 || (supervision?.pendingReviewWindowIds.length ?? 0) > 0
       ? "human_required"
       : status.pendingWindows > 0 || status.runningWindows > 0 || status.stagedWindows > 0
         ? "partial"
@@ -4286,6 +4358,7 @@ async function runLosslessBook(
     tokenLedger.assertReconciled();
     flushSchedulerProjection();
     return {
+      ...(supervision === undefined ? {} : { supervision }),
       outcome,
       runId,
       processedWindows,

@@ -26,6 +26,7 @@ import {
 } from "../tools/candidate-collector.js";
 import type { ValidationFailure } from "../tools/repair-tools.js";
 import {
+  ModelProviderError,
   PiRuntime,
   type PiAssistantResponseObservation,
   type PiRunResult,
@@ -500,6 +501,8 @@ async function validateAndRepair(
       ...validation.failures,
       ...termFailuresForWindow(window, expectedOccurrences),
       ...(input.additionalValidationFailures?.(window) ?? []),
+      ...(validation.valid && input.paragraphFragment === undefined
+        ? await input.reviewCandidate?.(window) ?? [] : []),
     ]);
   }
   const successfulWindows = initial.windows.filter((window) => window.status !== "failed");
@@ -616,10 +619,11 @@ async function validateAndRepair(
         }),
     });
   } catch (error) {
+    if (error instanceof ModelProviderError && error.kind !== "protocol") throw error;
     const message = error instanceof Error ? error.message : String(error);
     return {
       responseErrors: initial.responseErrors,
-      repairRuns: [],
+      repairRuns: error instanceof ModelProviderError && error.run !== undefined ? [error.run] : [],
       windows: initial.windows.map((window) => invalidIds.has(window.windowId)
         ? {
           ...window,
@@ -668,10 +672,12 @@ async function validateAndRepair(
     input.stableTerms.filter((term) => term.locked).map((term) => term.target),
     new Map(validationBlocks.map((block) => [block.id, block.sourceText])),
   );
-  const validatedWindows = windows.map((window): TranslationBatchWindowResult => {
+  const validatedWindows: TranslationBatchWindowResult[] = [];
+  for (const window of windows) {
     const item = invalidById.get(window.windowId);
     if (item === undefined || window.status === "failed") {
-      return window;
+      validatedWindows.push(window);
+      continue;
     }
     const validation = validator.validate(
       item.blocks,
@@ -681,12 +687,15 @@ async function validateAndRepair(
     const termFailures = termFailuresForWindow(window, expectedOccurrences);
     const additionalFailures =
       input.additionalValidationFailures?.(window) ?? [];
+    const reviewFailures = validation.valid && input.paragraphFragment === undefined
+      ? await input.reviewCandidate?.(window) ?? [] : [];
     if (validation.valid
       && termFailures.length === 0
-      && additionalFailures.length === 0) {
-      return window;
+      && additionalFailures.length === 0 && reviewFailures.length === 0) {
+      validatedWindows.push(window);
+      continue;
     }
-    return {
+    validatedWindows.push({
       ...window,
       status: "failed",
       translations: [],
@@ -697,10 +706,11 @@ async function validateAndRepair(
           ...validation.failures,
           ...termFailures,
           ...additionalFailures,
+          ...reviewFailures,
         ])
       }`,
-    };
-  });
+    });
+  }
   const postRepairWindows = validatedWindows.filter((window) => window.status !== "failed");
   const postRepairCrossValidation = validator.validateCrossBlockAlignment(
     postRepairWindows.flatMap((window) => blocksByWindowId.get(window.windowId) ?? []),
@@ -749,6 +759,13 @@ export async function validateTranslationBatchCandidate(
     { ...input, repairEnabled: false },
     initial,
   );
+}
+
+export async function reviewAndRepairTranslationBatchCandidate(
+  input: TranslationBatchInput,
+  initial: Pick<TranslationBatchResult, "windows" | "responseErrors">,
+): Promise<Pick<TranslationBatchResult, "windows" | "responseErrors" | "repairRuns">> {
+  return validateAndRepair(input, initial);
 }
 
 export async function runTranslationBatch(

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { taskContextMetadata } from "../agents/task-context.js";
 import { existsSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -86,6 +87,8 @@ interface NormalizedProject {
 }
 
 interface FullBookMetadata {
+  supervisorMode?: "bounded" | "off";
+  taskContext?: string;
   schema: typeof FULLBOOK_SCHEMA;
   mode: DesktopTrialMode;
   optimizationProfile: DesktopOptimizationProfile;
@@ -108,6 +111,8 @@ interface RunOverlay {
 }
 
 interface ActiveFullBookTask {
+  supervisorMode?: "bounded" | "off";
+  taskContext?: string;
   owner: DesktopFullBookService;
   project: NormalizedProject;
   runId: string;
@@ -244,6 +249,8 @@ function fullBookMetadata(value: unknown): FullBookMetadata | undefined {
   }
   return {
     schema: FULLBOOK_SCHEMA,
+    ...(item.supervisorMode === "bounded" || item.supervisorMode === "off" ? { supervisorMode: item.supervisorMode } : {}),
+    ...(typeof item.taskContext === "string" ? { taskContext: item.taskContext } : {}),
     mode: item.mode,
     optimizationProfile,
     dynamicScheduler: item.optimizationProfile !== undefined,
@@ -510,6 +517,9 @@ export class DesktopFullBookService {
       request?.optimizationProfile,
     );
     const mode = modeForOptimizationProfile(optimizationProfile);
+    const supervisorMode = request.supervisorMode ?? "bounded";
+    if (supervisorMode !== "bounded" && supervisorMode !== "off") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "invalid supervisor mode");
+    if (request.taskContext !== undefined) taskContextMetadata(request.taskContext);
     const project = normalizeProject(projectRequest);
     const runId = this.#createRunId();
     if (!validRunId(runId)) {
@@ -525,6 +535,8 @@ export class DesktopFullBookService {
       optimizationProfile,
       "active",
     );
+    task.supervisorMode = supervisorMode;
+    task.taskContext = request.taskContext;
     try {
       const beforeVersion = project.sourceVersion;
       const plan = runtimePlan(mode, await this.#runtime.resolve());
@@ -542,6 +554,8 @@ export class DesktopFullBookService {
         optimizationProfile,
         plan.fingerprint,
       );
+      metadata.desktopFullBook.supervisorMode = supervisorMode;
+      if (request.taskContext !== undefined) metadata.desktopFullBook.taskContext = request.taskContext;
       return this.#launch(task, plan, {
         runId,
         protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
@@ -607,6 +621,8 @@ export class DesktopFullBookService {
       metadata.dynamicScheduler ? "active" : "off",
       storedRun.modelId,
     );
+    task.supervisorMode = metadata.supervisorMode ?? "off";
+    task.taskContext = metadata.taskContext;
     try {
       const plan = runtimePlan(metadata.mode, await this.#runtime.resolve());
       task.controller.signal.throwIfAborted();
@@ -787,6 +803,8 @@ export class DesktopFullBookService {
     let running: Promise<LosslessBookRunResult>;
     try {
       running = this.#runBook({
+        supervisorMode: task.supervisorMode ?? "off",
+        ...(task.taskContext === undefined ? {} : { taskContext: task.taskContext }),
         manifestPath: task.project.manifestPath,
         storePath: task.project.storePath,
         runMeta,

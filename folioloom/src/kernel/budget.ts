@@ -1,4 +1,6 @@
 export type BudgetCounter =
+  | "supervisionTurns"
+  | "supervisionToolCalls"
   | "modelCalls"
   | "researchTurns"
   | "researchToolCalls"
@@ -10,6 +12,8 @@ export type BudgetCounter =
   | "recoveryToolCalls";
 
 export const DEFAULT_BUDGET_LIMITS: Readonly<Record<BudgetCounter, number>> = {
+  supervisionTurns: 4,
+  supervisionToolCalls: 8,
   modelCalls: 20,
   researchTurns: 7,
   researchToolCalls: 10,

@@ -71,7 +71,19 @@ describe("RunWorkspace", () => {
 
     await user.click(screen.getByRole("button", { name: "经济" }));
     await user.click(screen.getByRole("button", { name: "开始整本翻译" }));
-    expect(onStart).toHaveBeenCalledWith("economy");
+    expect(onStart).toHaveBeenCalledWith("economy", { supervisorMode: "bounded" });
+  });
+
+  it("sends the selected supervisor mode and private task context with a new run", async () => {
+    const user = userEvent.setup();
+    const onStart = vi.fn();
+    render(<RunWorkspace title="示例小说" modelReady snapshot={snapshot()} busy={false}
+      onStart={onStart} onPause={vi.fn()} onResume={vi.fn()} onExportDiagnostics={vi.fn()} />);
+    expect((screen.getByRole("checkbox", { name: "启用 Pi 主 agent 监督" }) as HTMLInputElement).checked).toBe(true);
+    await user.type(screen.getByLabelText("任务背景前缀"), "材料仅供个人阅读。");
+    await user.click(screen.getByRole("checkbox", { name: "启用 Pi 主 agent 监督" }));
+    await user.click(screen.getByRole("button", { name: "开始整本翻译" }));
+    expect(onStart).toHaveBeenCalledWith("balanced", { supervisorMode: "off", taskContext: "材料仅供个人阅读。" });
   });
 
   it("shows durable progress and only the action allowed by the current phase", async () => {

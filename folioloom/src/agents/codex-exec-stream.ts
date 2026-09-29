@@ -109,7 +109,7 @@ function textFromContent(content: unknown): string {
   }).join("\n");
 }
 
-function serializedMessages(context: Context): unknown[] {
+export function serializedMessages(context: Context): unknown[] {
   return context.messages.map((message) => {
     if (message.role === "user") {
       return { role: "user", text: textFromContent(message.content) };
