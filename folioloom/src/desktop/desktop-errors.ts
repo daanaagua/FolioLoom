@@ -19,6 +19,11 @@ interface PublicErrorDefinition {
 }
 
 const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.freeze({
+  CANDIDATE_RECOVERY_PAUSED: {
+    message: "候选译文的自动修复已暂停",
+    nextAction: "候选已保存。请检查审校问题及术语约束，解决原因后释放对应监督检查点；普通续跑不会重置已用修复额度。",
+    retryable: false,
+  },
   SUPERVISION_PAUSED: {
     message: "主 agent 已暂停当前任务",
     nextAction: "查看监督记录，解决原文或约束问题后释放该检查点；译文和进度保持不变。",

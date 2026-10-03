@@ -65,6 +65,10 @@ export interface TranslationBatchInput extends TranslationRequestInput {
   ) => readonly ValidationFailure[];
   /** A window recovery epoch owns one shared credit; false forbids a model repair. */
   repairEnabled?: boolean;
+  /** Host-owned durable lifecycle hooks; never exposed as model tools. */
+  onCandidate?: (window: TranslationBatchWindowResult, phase: "generated" | "repaired") => void | Promise<void>;
+  beforeRepair?: (windows: readonly TranslationBatchWindowResult[]) => void | Promise<void>;
+  onRepairRun?: (run: PiRunResult) => void;
   onProviderResponse?: (
     evidence: TranslationProviderResponseEvidence,
   ) => void | Promise<void>;
@@ -582,6 +586,7 @@ async function validateAndRepair(
   const failedTranslations = invalid.flatMap((item) => item.window.translations)
     .filter((translation) => repairBlockIds.has(translation.blockId));
   const failures = invalid.flatMap((item) => item.failures);
+  await input.beforeRepair?.(invalid.map(item => item.window));
   let repair: Awaited<ReturnType<Repairer["repairBatch"]>>;
   try {
     const repairRuntime = input.repairRuntime ?? {
@@ -618,7 +623,9 @@ async function validateAndRepair(
             }),
         }),
     });
+    input.onRepairRun?.(repair.run);
   } catch (error) {
+    if (error instanceof ModelProviderError && error.run !== undefined) input.onRepairRun?.(error.run);
     if (error instanceof ModelProviderError && error.kind !== "protocol") throw error;
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -679,6 +686,7 @@ async function validateAndRepair(
       validatedWindows.push(window);
       continue;
     }
+    await input.onCandidate?.(window, "repaired");
     const validation = validator.validate(
       item.blocks,
       candidateFor(window),

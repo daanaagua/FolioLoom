@@ -9,25 +9,46 @@ same explicitly configured model. External workers remain an opt-in compatibilit
 The supervisor can search the registered source, read bounded Unicode-scalar ranges,
 approve a contiguous batch, identify source-grounded translation guidance, and choose
 which blocks need semantic review. Reviews can accept a candidate, request a minimal
-repair with exact source/target quotations, or pause a checkpoint. Candidate quotations
-and block identities are validated by the host before a decision can take effect.
+repair with host-issued source/target reference IDs, or pause a checkpoint. The host
+resolves IDs to exact text and validates block, version and visibility before a decision
+can take effect. Historical quote-based decisions remain strictly validated on read.
 
 The kernel owns window boundaries, scheduling, account/model configuration, budgets,
 validation, database writes, ordered promotion and export. Source text and tool results
 are data, not instructions. No filesystem, shell, SQL or arbitrary delegation tools are
 exposed to the supervisor.
 
-Approvals cover up to four logical windows. A decision has at most four model turns and
+Approvals cover up to four logical windows; the host reduces the batch before dispatch
+when its context estimate exceeds model capacity. A decision has at most four model turns and
 eight tool calls; model completions are capped at 8192 tokens or the model's smaller cap.
 Each checkpoint has two attempts per explicit release generation, and each window has
 at most three review attempts. Ordinary resume cannot bypass a paused checkpoint.
 An explicit release is an operator action, not automatic model recovery.
+Repeated identical tool errors stop after two occurrences. A retry spends the original
+checkpoint baseline instead of adding a new baseline allowance.
 
 The supervisor reads current source and relevant terminology at event boundaries;
 its durable state is an append-only journal, not an indefinitely growing conversation.
-Accepted reviews are tied to the exact candidate text. Requested reviews that are
+Plans are invalidated when their terminology dependency changes. Guidance is selected
+from the latest plan for each window, not accumulated from superseded plans. Scoped
+terminology rules, allowed realizations and revision metadata remain part of the shared
+term projection. An affected committed window receives a host-recorded mandatory review
+when typed terminology changes require revalidation; neighboring plans are not replaced.
+Accepted reviews are tied to the exact candidate text and terminology dependency. Requested reviews that are
 missing or stale block strict export. Structural validation remains mandatory even
 when the supervisor accepts a candidate.
+
+Whole-window candidates are checkpointed before semantic review and after repair. They
+remain separate from active translations and cannot satisfy strict export on their own.
+Resume can reuse a checkpoint only when its source, model, knowledge projection, terms,
+style and guidance dependencies match. Snapshot ancestry alone does not invalidate an
+unchanged knowledge projection. A source or meaningful context change can require a new
+candidate. Cross-request validation rejection explicitly discards a reusable candidate.
+
+Semantic repair credit is durable across restarts. An unchanged repair or an exhausted
+credit pauses the supervised checkpoint, preserving the candidate. The existing explicit
+release command permits another bounded repair after its cause has been addressed; it
+does not automatically retranslate the window or waive review.
 
 ## CLI
 
@@ -88,3 +109,6 @@ Unknown usage remains unknown and blocks strict export; it is never reported as 
 Semantic review is a model judgment, not a guarantee of literary quality. Compare it
 against the stage-only workflow on the same source/model with blind reading, coverage,
 consistency, completion rate, latency and total reported usage.
+
+See [Reliability contracts and gates](reliability.md) for offline failure injection,
+large synthetic runs, and real-provider acceptance criteria.

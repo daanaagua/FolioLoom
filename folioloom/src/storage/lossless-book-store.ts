@@ -18,6 +18,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { gzipSync } from "node:zlib";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
+import { validateCandidateCheckpoint, type CandidateCheckpointRecord } from "../fullbook/candidate-checkpoint.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
 import {
@@ -6504,6 +6505,36 @@ export class LosslessBookStore {
       throw new Error(`conflicting cached wave anchor decision for ${inputHash}`);
     }
     return structuredClone(matches[0]?.decision);
+  }
+
+  candidateCheckpointRecords(runId: string, windowId: string): CandidateCheckpointRecord[] {
+    this.#run(runId);
+    return all<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events WHERE run_id=? AND kind='candidate_checkpoint'
+      AND json_extract(payload_json, '$.windowId')=? ORDER BY sequence
+    `), runId, windowId).map(row => JSON.parse(row.payload_json) as CandidateCheckpointRecord);
+  }
+
+  candidateRecoveryGeneration(runId: string, windowId: string): string {
+    return this.supervisionRecords(runId).findLast(r => r.state === "released" && r.windowIds.includes(windowId))?.id ?? "initial";
+  }
+
+  appendCandidateCheckpoint(runId: string, record: CandidateCheckpointRecord): void {
+    const run = this.#run(runId);
+    validateCandidateCheckpoint(record);
+    const window = this.allWindows(runId).find(w => w.windowId === record.windowId);
+    if (!window || record.sourceVersion !== run.source_version
+      || record.candidate.translations.some(t => !window.blockIds.includes(t.blockId))) {
+      throw new Error("candidate checkpoint outside run scope");
+    }
+    this.#transaction(() => {
+      const existing = this.candidateCheckpointRecords(runId, record.windowId).find(r => r.id === record.id);
+      if (existing) {
+        if (canonicalJson(existing) !== canonicalJson(record)) throw new Error("candidate checkpoint id conflict");
+        return;
+      }
+      this.#appendEvent(runId, "candidate_checkpoint", record);
+    });
   }
 
   supervisionRecords(runId: string): import("../domain/supervision.js").SupervisionRecord[] {

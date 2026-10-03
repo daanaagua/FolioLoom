@@ -15,6 +15,8 @@ export interface SupervisionRecord {
   readonly inputHash: string;
   readonly candidateHash?: string;
   readonly conflictHash?: string;
+  readonly dependencyHash?: string;
+  readonly origin?: "model" | "host_revalidation";
   readonly decision?: SupervisorDecision;
   readonly modelCalls?: number;
   readonly totalTokens?: number;
@@ -61,13 +63,13 @@ export function summarizeSupervision(
   const pendingReviewWindowIds: string[] = [];
   if (mode === "bounded") {
     for (const window of windows.filter(w => w.status === "completed" || w.status === "completed_with_warnings")) {
-      const plans = completed.filter(r => r.event === "plan" && r.decision?.action === "translate" && r.decision.windowIds.includes(window.windowId));
-      if (!plans.length) { pendingReviewWindowIds.push(window.windowId); continue; }
-      const requiresReview = plans.some(r => r.decision!.reviewBlockIds.some(id => window.blockIds.includes(id)));
+      const plan = completed.findLast(r => r.event === "plan" && r.decision?.action === "translate" && r.decision.windowIds.includes(window.windowId));
+      if (!plan) { pendingReviewWindowIds.push(window.windowId); continue; }
+      const requiresReview = plan.decision!.reviewBlockIds.some(id => window.blockIds.includes(id));
       if (!requiresReview) continue;
       const candidateHash = supervisionCandidateHash(active.filter(t => window.blockIds.includes(t.blockId)));
       if (!completed.some(r => r.event === "review" && r.windowIds.includes(window.windowId)
-        && r.candidateHash === candidateHash && r.decision?.action === "accept")) pendingReviewWindowIds.push(window.windowId);
+        && r.dependencyHash === plan.dependencyHash && r.candidateHash === candidateHash && r.decision?.action === "accept")) pendingReviewWindowIds.push(window.windowId);
     }
   }
   return {

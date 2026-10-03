@@ -1,4 +1,4 @@
-import { runSupervisor, supervisorPrompt, supervisorSystemPrompt, validateSupervisorDecision,
+import { SUPERVISOR_PROTOCOL, runSupervisor, supervisorPrompt, supervisorSystemPrompt, validateSupervisorDecision,
   type SupervisorDecision, type SupervisorInput, type SupervisorSource, type SupervisorWindow } from "../agents/supervisor.js";
 import { ModelProviderError, type PiAssistantResponseObservation } from "../agents/pi-runtime.js";
 import { effectiveSystemPrompt } from "../agents/task-context.js";
@@ -49,6 +49,13 @@ export class SupervisionController {
   constructor(private readonly options: SupervisionControllerOptions) {}
 
   #records(): SupervisionRecord[] { return this.options.store.supervisionRecords(this.options.runId); }
+  #dependencyHash(terms: SupervisorInput["terms"]): string {
+    return supervisionHash({ protocol: SUPERVISOR_PROTOCOL, sourceVersion: this.options.sourceVersion, terms });
+  }
+  #requestBounds(input: SupervisorInput): { inputUpper: number; outputUpper: number } {
+    const chars = supervisorPrompt(input).length + effectiveSystemPrompt(input.streamFn, supervisorSystemPrompt()).length;
+    return { inputUpper: chars * 2 + 20_000, outputUpper: Math.min(8192, input.model.maxTokens) };
+  }
   #append(record: SupervisionRecord): void { this.options.store.appendSupervisionRecord(this.options.runId, record); }
   #exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const next = this.#serial.then(operation);
@@ -70,8 +77,9 @@ export class SupervisionController {
     const runtime = this.options.runtime;
     const ids = new Set(windows.flatMap(w => w.blockIds));
     const source = this.options.sources.filter(b => ids.has(b.blockId)).map(b => b.sourceText).join("\n").toLocaleLowerCase();
-    const projectedTerms = terms.filter(t => source.includes(t.sourceForm.toLocaleLowerCase()))
-      .map(t => ({ sourceForm: t.sourceForm, target: t.target, locked: t.locked === true }));
+    const projectedTerms = terms.filter(t => source.includes(t.sourceForm.toLocaleLowerCase())
+      && (!t.applicableBlockIds || t.applicableBlockIds.some(id => ids.has(id))))
+      .map(t => ({ ...t, locked: t.locked === true }));
     return { event, windows, sources: this.options.sources, terms: projectedTerms, model: runtime.model, streamFn: runtime.streamFn,
       maxTurns: SUPERVISION_POLICY.maxTurns, thinkingLevel: runtime.thinkingLevel,
       signal: this.options.signal, deadlineMs: this.options.deadlineMs };
@@ -82,25 +90,47 @@ export class SupervisionController {
       this.options.signal?.throwIfAborted();
       this.#checkPaused(windowId);
       const conflictHash = supervisionHash(conflicts);
+      const dependencyHash = this.#dependencyHash(terms);
       const cached = this.#records().findLast(r => r.event === "plan" && r.state === "completed"
-        && r.conflictHash === conflictHash && r.decision?.action === "translate" && r.decision.windowIds.includes(windowId));
-      if (cached?.decision) {
+        && r.decision?.action === "translate" && r.decision.windowIds.includes(windowId));
+      if (cached?.decision && cached.dependencyHash === dependencyHash && cached.conflictHash === conflictHash) {
         const scope = this.options.windows.filter(w => cached.windowIds.includes(w.windowId));
         return validateSupervisorDecision(cached.decision, this.#input("plan", scope, terms));
       }
       const index = this.options.windows.findIndex(w => w.windowId === windowId);
       if (index < 0) throw new Error("supervisor window outside plan");
-      const windows = this.options.windows.slice(index, index + SUPERVISION_POLICY.batchWindows);
-      return this.#decide({ ...this.#input("plan", windows, terms), conflicts }, conflictHash);
+      let windows = this.options.windows.slice(index, index + SUPERVISION_POLICY.batchWindows);
+      let input = { ...this.#input("plan", windows, terms), conflicts };
+      while (windows.length > 1) {
+        const bounds = this.#requestBounds(input);
+        if (bounds.inputUpper + bounds.outputUpper <= input.model.contextWindow) break;
+        windows = windows.slice(0, -1);
+        input = { ...this.#input("plan", windows, terms), conflicts };
+      }
+      return this.#decide(input, conflictHash, dependencyHash);
     });
   }
 
-  guidanceFor(windowIds: readonly string[]): SupervisorDecision["guidance"] {
+  guidanceFor(windowIds: readonly string[], terms?: SupervisorInput["terms"]): SupervisorDecision["guidance"] {
     const selected = new Set(windowIds);
-    const blocks = new Set(this.options.windows.filter(w => selected.has(w.windowId)).flatMap(w => w.blockIds));
-    const entries = this.#records().filter(r => r.event === "plan" && r.state === "completed" && r.decision?.action === "translate")
-      .flatMap(r => r.decision!.guidance).filter(g => blocks.has(g.blockId));
+    const records = this.#records();
+    const entries = this.options.windows.filter(w => selected.has(w.windowId)).flatMap(window => {
+      const plan = records.findLast(r => r.event === "plan" && r.state === "completed" && r.decision?.action === "translate" && r.decision.windowIds.includes(window.windowId));
+      if (terms !== undefined && plan?.dependencyHash !== this.#dependencyHash(terms)) return [];
+      return plan?.decision?.guidance.filter(g => window.blockIds.includes(g.blockId)) ?? [];
+    });
     return [...new Map(entries.map(g => [`${g.blockId}\0${g.sourceQuote}`, g])).values()];
+  }
+
+  pauseCandidate(windowId: string, reason: string): void {
+    const records = this.#records();
+    const released = new Set(records.filter(r => r.state === "released").map(r => r.key));
+    if (records.some(r => r.state === "paused" && r.windowIds.includes(windowId) && !released.has(r.id))) return;
+    const generation = records.filter(r => r.state === "released" && r.windowIds.includes(windowId)).length;
+    const inputHash = supervisionHash({ sourceVersion: this.options.sourceVersion, windowId, reason });
+    const id = `candidate-recovery:${windowId}:generation-${generation}:${inputHash}`;
+    this.#append({ id, key: id, event: "review", state: "paused", windowIds: [windowId], inputHash,
+      reason: reason.slice(0, 1200), modelCalls: 0, totalTokens: 0, usageComplete: true });
   }
 
   review(windowId: string, candidate: readonly { blockId: string; text: string }[], terms: SupervisorInput["terms"]): Promise<readonly ValidationFailure[]> {
@@ -109,14 +139,28 @@ export class SupervisionController {
       this.#checkPaused(windowId);
       const window = this.options.windows.find(w => w.windowId === windowId);
       if (!window) throw new Error("review window outside supervisor plan");
-      const requested = this.#records().some(r => r.event === "plan" && r.state === "completed"
-        && r.decision?.action === "translate" && r.decision.reviewBlockIds.some(id => window.blockIds.includes(id)));
-      if (!requested) return [];
+      let latestPlan = this.#records().findLast(r => r.event === "plan" && r.state === "completed"
+        && r.decision?.action === "translate" && r.decision.windowIds.includes(windowId));
       if (candidate.length !== window.blockIds.length || window.blockIds.some(id => !candidate.some(t => t.blockId === id))) {
         throw new Error("supervisor review requires the complete logical window");
       }
+      const dependencyHash = this.#dependencyHash(terms);
+      if (latestPlan && latestPlan.dependencyHash !== dependencyHash) {
+        // A typed knowledge change can revalidate an already committed window.
+        // Require a fresh review of that window, without reauthorizing siblings
+        // or carrying guidance authored against an obsolete terminology view.
+        const inputHash = supervisionHash({ origin: "host_revalidation", priorPlan: latestPlan.id, dependencyHash, windowId });
+        latestPlan = { id: `revalidation-plan:${inputHash}`, key: `revalidation-plan:${windowId}`, event: "plan", state: "completed",
+          windowIds: [windowId], inputHash, dependencyHash, origin: "host_revalidation",
+          modelCalls: 0, totalTokens: 0, usageComplete: true,
+          decision: { action: "translate", windowIds: [windowId], reviewBlockIds: window.blockIds, guidance: [], issues: [],
+            reason: "Terminology dependencies changed; review the complete affected candidate." } };
+        this.#append(latestPlan);
+      }
+      const requested = latestPlan?.decision?.reviewBlockIds.some(id => window.blockIds.includes(id));
+      if (!requested) return [];
       const input = { ...this.#input("review", [window], terms), candidate };
-      const decision = await this.#decide(input);
+      const decision = await this.#decide(input, undefined, dependencyHash);
       return decision.issues.map(issue => ({
         code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: issue.blockId, repairable: true,
         message: `原文 ${JSON.stringify(issue.sourceQuote)}；当前译文 ${JSON.stringify(issue.targetQuote)}；问题：${issue.problem}。只修正该实质问题，不改无关内容。`,
@@ -124,18 +168,24 @@ export class SupervisionController {
     });
   }
 
-  async #decide(input: SupervisorInput, conflictHash?: string): Promise<SupervisorDecision> {
-    const inputHash = supervisionHash({ sourceVersion: this.options.sourceVersion, event: input.event, windows: input.windows,
+  async #decide(input: SupervisorInput, conflictHash?: string, dependencyHash?: string): Promise<SupervisorDecision> {
+    const inputHash = supervisionHash({ protocol: SUPERVISOR_PROTOCOL, dependencyHash, sourceVersion: this.options.sourceVersion, event: input.event, windows: input.windows,
       terms: input.terms, candidate: input.candidate, conflicts: input.conflicts });
     const key = `${input.event}:${input.windows[0]!.windowId}:${inputHash}`;
     const cached = this.#records().find(r => r.state === "completed" && r.inputHash === inputHash && r.decision);
-    if (cached?.decision) return validateSupervisorDecision(cached.decision, input);
+    if (cached?.decision) {
+      const decision = validateSupervisorDecision(cached.decision, input);
+      if (input.event === "plan") this.#append({ ...cached,
+        id: `activation:${supervisionHash([cached.id, this.#records().at(-1)?.id])}`,
+        modelCalls: 0, totalTokens: 0, usageComplete: true });
+      return decision;
+    }
     const history = this.#afterRelease(input.windows[0]!.windowId);
     const attempts = history.filter(r => r.key === key && r.state === "started").length;
     const reviews = history.filter(r => r.event === "review" && r.state === "started" && r.windowIds.includes(input.windows[0]!.windowId)).length;
-    const generation = this.#records().filter(r => r.state === "released").length;
+    const generation = this.#records().filter(r => r.state === "released" && r.windowIds.includes(input.windows[0]!.windowId)).length;
     const attemptId = `${key}:generation-${generation}:attempt-${attempts}`;
-    const recordBase = { key, event: input.event, windowIds: input.windows.map(w => w.windowId), inputHash,
+    const recordBase = { key, event: input.event, windowIds: input.windows.map(w => w.windowId), inputHash, dependencyHash,
       ...(input.candidate ? { candidateHash: supervisionCandidateHash(input.candidate) } : {}),
       ...(conflictHash ? { conflictHash } : {}) };
     if (attempts >= SUPERVISION_POLICY.maxAttemptsPerCheckpoint
@@ -144,14 +194,17 @@ export class SupervisionController {
       this.#append({ ...recordBase, id, state: "paused", reason: "bounded supervisor checkpoint budget exhausted", modelCalls: 0, totalTokens: 0, usageComplete: true });
       throw new SupervisionPausedError(id, "bounded supervisor checkpoint budget exhausted");
     }
-    const chars = supervisorPrompt(input).length + effectiveSystemPrompt(input.streamFn, supervisorSystemPrompt()).length;
     // Bounds include tool schemas and all permitted evidence returned in the session.
-    const inputUpper = chars * 2 + 20_000;
-    const outputUpper = Math.min(8192, input.model.maxTokens);
+    const { inputUpper, outputUpper } = this.#requestBounds(input);
     if (inputUpper + outputUpper > input.model.contextWindow) throw new Error("supervisor context capacity exceeded before dispatch");
     const predictedTokens = (inputUpper + outputUpper) * SUPERVISION_POLICY.maxTurns;
-    this.options.admission.addBaseline({ taskIds: [attemptId], baselineTokens: predictedTokens, source: "supervision", reason: input.event });
-    const transaction = this.options.admission.begin({ requestId: attemptId, purpose: "supervision", taskIds: [attemptId], predictedTokens,
+    const baselineId = `supervision:${input.event}:${input.windows[0]!.windowId}:generation-${generation}`;
+    if (!this.options.admission.ledger.state().baselinedTaskIds.has(baselineId)) {
+      this.options.admission.addBaseline({ taskIds: [baselineId],
+        baselineTokens: predictedTokens * (input.event === "review" ? SUPERVISION_POLICY.maxReviewsPerWindow : SUPERVISION_POLICY.maxAttemptsPerCheckpoint),
+        source: "supervision", reason: input.event });
+    }
+    const transaction = this.options.admission.begin({ requestId: attemptId, purpose: "supervision", taskIds: [baselineId], predictedTokens,
       attempt: attempts, conservativeHorizonFloor: 0 });
     this.#append({ ...recordBase, id: `${attemptId}:started`, state: "started" });
     transaction.markDispatched();

@@ -1,17 +1,19 @@
 {
   "name": "folioloom",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "private": true,
   "description": "A continuity-aware translation engine for long-form fiction.",
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
     "test": "node --test --import tsx test/**/*.test.ts",
+    "test:reliability": "node --test --import tsx test/evidence-reference.test.ts test/candidate-checkpoint.test.ts test/supervisor.test.ts test/supervision-controller.test.ts test/supervised-book-runner.test.ts test/reliability-gate.test.ts test/desktop-fullbook-export-flow.test.ts",
     "typecheck": "tsc --noEmit",
     "folioloom": "tsx src/cli.ts",
     "pilot": "tsx src/cli.ts",
     "book": "tsx src/cli.ts book",
     "benchmark:cjk": "tsx src/benchmark/cjk-benchmark.ts",
+    "benchmark:reliability": "tsx src/benchmark/reliability-gate.ts",
     "desktop:dev": "electron-vite dev",
     "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",
     "desktop:typecheck": "tsc --noEmit -p tsconfig.desktop.json",
@@ -23,7 +25,7 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",
     "@earendil-works/pi-ai": "0.80.10",
-    "csv-parse": "7.0.1",
+    "csv-parse": "7.0.3",
     "exceljs": "4.4.0",
     "fast-xml-parser": "^5.10.1",
     "opencc-js": "1.4.1",
@@ -40,13 +42,18 @@
     "@types/react-dom": "19.2.3",
     "@types/yauzl": "^2.10.3",
     "@vitejs/plugin-react": "5.2.0",
-    "electron": "43.2.0",
+    "electron": "43.7.7",
     "electron-builder": "^26.15.3",
     "electron-vite": "5.0.0",
     "jsdom": "29.1.1",
     "tsx": "4.23.1",
     "typescript": "7.0.2",
     "vite": "7.3.6",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "app-builder-lib": {
+      "@electron/get": "5.1.0"
+    }
   }
 }

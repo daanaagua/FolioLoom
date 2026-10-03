@@ -209,13 +209,13 @@ function ready(
   return result;
 }
 
-async function withDeadline<T>(promise: Promise<T>, message: string): Promise<T> {
+async function withDeadline<T>(promise: Promise<T>, message: string | (() => string)): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<T>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), 10_000);
+        timeout = setTimeout(() => reject(new Error(typeof message === "function" ? message() : message)), 10_000);
       }),
     ]);
   } finally {
@@ -281,7 +281,7 @@ test("desktop imports, pauses, resumes, strictly exports, and verifies a Unicode
     await running;
     await withDeadline(
       firstEntered,
-      `provider was not entered: ${JSON.stringify(firstService.snapshot(project))}`,
+      () => `provider was not entered: ${JSON.stringify(firstService.snapshot(project))}`,
     );
     const pausing = firstService.pause();
     releaseFirst();

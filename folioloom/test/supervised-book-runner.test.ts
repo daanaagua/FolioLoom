@@ -9,6 +9,9 @@ import { importSource } from "../src/source/source-importer.js";
 import { runBook } from "../src/fullbook/book-runner.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 import { auditLosslessBookExport } from "../src/report.js";
+import { RuntimeProfileStore } from "../src/storage/runtime-profile-store.js";
+import { runtimeObservationProfileKey } from "../src/fullbook/runtime-telemetry.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 
 function userText(context: Context): string {
   const msg = context.messages.findLast(m => m.role === "user");
@@ -67,45 +70,53 @@ test("native supervised book run persists approvals/reviews, propagates task con
   assert.equal(faux.state.callCount, calls);
 });
 
-for (const scenario of ["repair", "review-auth", "pause"] as const) {
+for (const scenario of ["repair", "review-auth", "repaired-review-auth", "no-progress", "post-repair-revise", "pause"] as const) {
   test(`supervised native integration: ${scenario} preserves scope and exact accounting`, async () => {
     const root = mkdtempSync(join(tmpdir(), "folioloom-supervision-recovery-"));
     const source = join(root, "source.txt");
     writeFileSync(source, "the quiet traveler did not leave the house. he waited by the door until the rain stopped.", "utf8");
     const imported = await importSource({ sourcePath: source, projectDirectory: join(root, "project"), sourceLanguage: "en" });
     const faux = fauxProvider();
+    const profiles = scenario === "review-auth" ? new RuntimeProfileStore(join(root, "profiles.db")) : undefined;
+    const profileKey = runtimeObservationProfileKey({ modelId: faux.getModel().id, languageProfileId: getSourceLanguageProfile("en").id });
     const prefix = "仅供个人阅读的合成测试。";
     const good = "那位安静的旅人没有离开屋子。他守在门边，一直等到外面的雨停了下来。";
     const bad = "那位安静的旅人已经离开了屋子。他守在门边，一直等到外面的雨停了下来。";
     let released = false;
+    let authRecovered = false;
+    let translationCalls = 0;
+    let repairCalls = 0;
+    let repairReleased = false;
     const reply = (context: Context) => {
       assert.ok(context.systemPrompt?.startsWith(prefix));
       const prompt = userText(context);
       const answer = (tool: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: "toolUse" });
       if (context.tools?.some(t => t.name === "submit_supervisor_decision")) {
         const data = JSON.parse(prompt);
-        if (scenario === "review-auth" && data.event === "review") return fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 Unauthorized" });
-        const needsRepair = data.event === "review" && data.candidate.some((t: any) => t.text.includes("已经离开"));
+        if (!authRecovered && data.event === "review" && (scenario === "review-auth" || (scenario === "repaired-review-auth" && repairCalls > 0))) return fauxAssistantMessage("", { stopReason: "error", errorMessage: "401 Unauthorized" });
+        const needsRepair = data.event === "review" && (scenario === "post-repair-revise" || data.candidate.some((t: any) => t.evidence.some((r: any) => r.text.includes("已经离开"))));
         return answer("submit_supervisor_decision", {
           action: scenario === "pause" && !released ? "pause" : data.event === "plan" ? "translate" : needsRepair ? "revise" : "accept",
           windowIds: data.windows.map((w: any) => w.windowId),
           reviewBlockIds: data.event === "plan" && !(scenario === "pause" && !released) ? data.windows.flatMap((w: any) => w.blockIds) : [],
           guidance: [], reason: "核对否定含义。",
-          issues: needsRepair ? [{ blockId: data.candidate[0].blockId, sourceQuote: "did not leave the house", targetQuote: "已经离开了屋子", problem: "译文反转了原文的否定。" }] : [],
+          issues: needsRepair ? [{ blockId: data.candidate[0].blockId, sourceRef: data.source[0].evidence[0].id, targetRef: data.candidate[0].evidence[0].id, problem: "译文反转了原文的否定。" }] : [],
         });
       }
       if (context.tools?.some(t => t.name === "submit_repaired_translation")) {
+        repairCalls += 1;
         const candidate = JSON.parse(/FAILED CANDIDATE\n\n([^\n]+)/u.exec(prompt)![1]!);
-        return answer("submit_repaired_translation", { translations: candidate.map((t: any) => ({ blockId: t.blockId, text: good })), notes: [] });
+        return answer("submit_repaired_translation", { translations: candidate.map((t: any) => ({ blockId: t.blockId, text: scenario === "no-progress" && !repairReleased ? bad : good })), notes: [] });
       }
       const windows = JSON.parse(/WINDOWS\n\n([^\n]+)\n\nSTABLE TERMS/u.exec(prompt)![1]!);
+      translationCalls += 1;
       return answer("finalize_translation_batch", { windows: windows.map((w: any) => ({ windowId: w.windowId,
-        translations: w.blocks.map((b: any) => ({ blockId: b.blockId, text: scenario === "repair" ? bad : good })), notes: [] })) });
+        translations: w.blocks.map((b: any) => ({ blockId: b.blockId, text: ["repair", "repaired-review-auth", "no-progress", "post-repair-revise"].includes(scenario) ? bad : good })), notes: [] })) });
     };
     faux.setResponses(Array.from({ length: 12 }, () => reply));
     const options = { manifestPath: imported.manifestPath, storePath: join(root, "book.db"), runMeta: { runId: "supervised", protocolVersion: "test" },
       model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider), taskContext: prefix, supervisorMode: "bounded" as const,
-      maxConcurrency: 1, maxAttempts: 1, hardDeadlineMs: 10000 };
+      maxConcurrency: 1, maxAttempts: 1, hardDeadlineMs: 10000, runtimeProfileStore: profiles };
     if (scenario === "pause") {
       await assert.rejects(() => runBook(options), /SUPERVISION_PAUSED/u);
       await assert.rejects(() => runBook(options), /SUPERVISION_PAUSED/u);
@@ -119,9 +130,41 @@ for (const scenario of ["repair", "review-auth", "pause"] as const) {
       released = true;
       assert.equal((await runBook(options)).outcome, "completed");
       assert.equal(faux.state.callCount, 4);
-    } else if (scenario === "review-auth") {
+    } else if (scenario === "review-auth" || scenario === "repaired-review-auth") {
       await assert.rejects(() => runBook(options), /SUPERVISION_EXECUTION_FAILED.*Unauthorized/u);
-      assert.equal(faux.state.callCount, 3);
+      assert.equal(faux.state.callCount, scenario === "review-auth" ? 3 : 5);
+      const interrupted = new LosslessBookStore(options.storePath);
+      try {
+        assert.equal(interrupted.statusSummary("supervised").humanRequiredWindows, 0);
+        assert.equal(interrupted.activeTranslations("supervised").length, 0);
+        assert.equal(auditLosslessBookExport(interrupted, "supervised").audit.strictExportable, false);
+      } finally { interrupted.close(); }
+      authRecovered = true;
+      const profileSamples = profiles?.observationsForProfile(profileKey).length;
+      assert.equal((await runBook(options)).outcome, "completed");
+      assert.equal(translationCalls, 1, "resume must review the durable candidate without retranslating it");
+      assert.equal(faux.state.callCount, scenario === "review-auth" ? 4 : 6);
+      assert.equal(repairCalls, scenario === "review-auth" ? 0 : 1);
+      if (profiles) assert.equal(profiles.observationsForProfile(profileKey).length, profileSamples, "checkpoint-only resume must not train provider latency from a local cache hit");
+    } else if (scenario === "no-progress" || scenario === "post-repair-revise") {
+      await assert.rejects(() => runBook(options), /CANDIDATE_RECOVERY_PAUSED/u);
+      const calls = faux.state.callCount;
+      await assert.rejects(() => runBook(options), /CANDIDATE_RECOVERY_PAUSED|SUPERVISION_PAUSED/u);
+      assert.equal(faux.state.callCount, calls, "resume cannot replenish spent repair credit");
+      assert.equal(translationCalls, 1);
+      assert.equal(repairCalls, 1);
+      if (scenario === "no-progress") {
+        const pausedStore = new LosslessBookStore(options.storePath);
+        try {
+          const pause = pausedStore.supervisionRecords("supervised").findLast(r => r.state === "paused");
+          assert.ok(pause, "candidate recovery must expose an operator-releasable checkpoint");
+          pausedStore.releaseSupervisionPause("supervised", pause.id, "The repair constraint has been corrected.");
+        } finally { pausedStore.close(); }
+        repairReleased = true;
+        assert.equal((await runBook(options)).outcome, "completed");
+        assert.equal(translationCalls, 1, "explicit release retains the existing candidate");
+        assert.equal(repairCalls, 2);
+      }
     } else {
       assert.equal((await runBook(options)).outcome, "completed");
       assert.equal(faux.state.callCount, 5);
@@ -135,13 +178,13 @@ for (const scenario of ["repair", "review-auth", "pause"] as const) {
       assert.ok(actual > 0);
       assert.ok(ledger.every(e => e.usageComplete));
       assert.equal(ledger.reduce((n, e) => n + e.actualTokens, 0), actual, "each real response is charged exactly once");
-      if (scenario !== "review-auth") {
+      if (scenario === "post-repair-revise") {
+        assert.equal(store.activeTranslations("supervised").length, 0);
+        assert.equal(auditLosslessBookExport(store, "supervised").audit.strictExportable, false);
+      } else {
         assert.equal(store.activeTranslations("supervised")[0]?.text, good);
         assert.equal(auditLosslessBookExport(store, "supervised").audit.strictExportable, true);
-      } else {
-        assert.equal(store.statusSummary("supervised").humanRequiredWindows, 0);
-        assert.equal(store.activeTranslations("supervised").length, 0);
       }
-    } finally { raw.close(); store.close(); }
+    } finally { raw.close(); store.close(); profiles?.close(); }
   });
 }

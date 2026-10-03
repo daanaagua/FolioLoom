@@ -66,6 +66,8 @@ export interface PiSessionSpec {
   signal?: AbortSignal;
   deadlineMs?: number;
   maxTurns?: number;
+  /** Stop a non-progressing tool-error loop without renewing the turn budget. */
+  maxRepeatedToolErrors?: number;
   eventLog?: MemoryEventLog;
   thinkingLevel?: ThinkingLevel;
   onAssistantResponse?: (
@@ -243,6 +245,9 @@ export class PiRuntime {
     )) {
       throw new TypeError("maxTurns must be a positive integer");
     }
+    if (spec.maxRepeatedToolErrors !== undefined && (!Number.isInteger(spec.maxRepeatedToolErrors) || spec.maxRepeatedToolErrors <= 0)) {
+      throw new TypeError("maxRepeatedToolErrors must be a positive integer");
+    }
 
     const registry = new CapabilityRegistry(asKernelTools(spec.tools));
     const specsByName = new Map(spec.tools.map((tool) => [tool.name, tool]));
@@ -256,6 +261,7 @@ export class PiRuntime {
     const usage = structuredClone(ZERO_USAGE);
     const toolNames: string[] = [];
     const toolErrors: PiToolError[] = [];
+    const repeatedToolErrors = new Map<string, number>();
     let modelCalls = 0;
     let turnStarts = 0;
     let deadlineExceeded = false;
@@ -326,8 +332,17 @@ export class PiRuntime {
           };
         }
       },
-      afterToolCall: async ({ toolCall, isError }) => {
+      afterToolCall: async ({ toolCall, isError, result }) => {
         eventLog.append("tool", { name: toolCall.name, isError });
+        if (isError && spec.maxRepeatedToolErrors !== undefined) {
+          const fingerprint = `${toolCall.name}\0${resultText(result.content)}`;
+          const count = (repeatedToolErrors.get(fingerprint) ?? 0) + 1;
+          repeatedToolErrors.set(fingerprint, count);
+          if (count >= spec.maxRepeatedToolErrors) {
+            eventLog.append("tool", { name: toolCall.name, repeatedErrorLimitReached: true, count });
+            return { terminate: true };
+          }
+        }
         if (terminateTools.has(toolCall.name) && !isError) {
           return { terminate: true };
         }

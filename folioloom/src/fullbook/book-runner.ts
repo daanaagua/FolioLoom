@@ -8,6 +8,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { bindTaskContext, taskContextMetadata, validateTaskContextIdentity } from "../agents/task-context.js";
 import { supervisionMetadata, validateSupervisionIdentity, summarizeSupervision, type SupervisionMode, type SupervisionSummary } from "../domain/supervision.js";
 import { SupervisionController, isSupervisionBoundaryError } from "./supervision-controller.js";
+import { CandidateCheckpointService, CandidateRecoveryPausedError } from "./candidate-checkpoint.js";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
@@ -2856,7 +2857,7 @@ async function runLosslessBook(
       ): TranslationRequestInput => ({
         request: selectedRequest,
         strictIdentifiers: supervisorMode === "bounded",
-        supervisorGuidance: supervisor?.guidanceFor([work.window.windowId]),
+        supervisorGuidance: supervisor?.guidanceFor([work.window.windowId], terms),
         ...(supervisor === undefined ? {} : { reviewCandidate: async (candidate) => {
           const replacementById = new Map(candidate.translations.map(t => [t.blockId, t]));
           const complete = store.activeTranslations(runId).filter(t => work.window.blockIds.includes(t.blockId))
@@ -2993,6 +2994,8 @@ async function runLosslessBook(
       try {
         completed = (await executePlannedTranslationRequest(execution, {
           admission,
+          candidateCheckpoints: new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
+            modelId: runtime.model.id, purpose: `revalidate:${work.task.taskId}`, store }),
           nextLedgerAttemptId,
           runtimeSet,
           estimator,
@@ -3047,6 +3050,7 @@ async function runLosslessBook(
             : "failed",
       });
       if (completed.error !== undefined) {
+        if (completed.error instanceof CandidateRecoveryPausedError) supervisor?.pauseCandidate(completed.error.windowId, completed.error.message);
         throw completed.error;
       }
       const result = completed.result;
@@ -3115,7 +3119,7 @@ async function runLosslessBook(
           || error instanceof BookRequestCapacityError
           || error instanceof RevalidationOutputError,
         isRunBlockingFailure: (error: unknown) =>
-          error instanceof ModelProviderError,
+          error instanceof ModelProviderError || isSupervisionBoundaryError(error) || error instanceof CandidateRecoveryPausedError,
         shouldRetryFailure: (error: unknown) =>
           error instanceof RevalidationOutputError
           || (error instanceof ModelProviderError && error.retryable),
@@ -3595,7 +3599,7 @@ async function runLosslessBook(
         const buildTranslationInput = (request: PhysicalRequestPlan): TranslationRequestInput => ({
           request,
           strictIdentifiers: supervisorMode === "bounded",
-          supervisorGuidance: supervisor?.guidanceFor(request.windows.map(w => w.windowId)),
+          supervisorGuidance: supervisor?.guidanceFor(request.windows.map(w => w.windowId), activeTerms),
           ...(supervisor === undefined ? {} : {
             reviewCandidate: async candidate => supervisor.review(candidate.windowId, candidate.translations, activeTerms),
           }),
@@ -3776,6 +3780,8 @@ async function runLosslessBook(
           admission.markDispatched(ledgerAttemptId);
           return executePlannedTranslationRequest(execution, {
             admission,
+            candidateCheckpoints: new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
+              modelId: execution.runtime.model.id, store }),
             nextLedgerAttemptId,
             runtimeSet,
             estimator,
@@ -3844,6 +3850,7 @@ async function runLosslessBook(
                 telemetry.variant.predicted.totalTokens,
               );
           }
+          if (telemetry.providerOperationStarted === false) return;
           const observationStartedAt = Date.now();
           const recordRuntimeObservation = (
             observation: {
@@ -4147,13 +4154,14 @@ async function runLosslessBook(
         for (const completed of completionOrder) {
           if (completed.error !== undefined) {
             const completedError = completed.error;
+            if (completedError instanceof CandidateRecoveryPausedError) supervisor?.pauseCandidate(completedError.windowId, completedError.message);
             const message = completedError instanceof Error
               ? completedError.message
               : String(completedError);
             const capacityError = completedError instanceof BookRequestCapacityError;
             for (const requestWindow of completed.request.windows) {
               const window = claimed.get(requestWindow.windowId) as PersistedLosslessWindow;
-              const external = !capacityError && (completedError instanceof ModelProviderError || isSupervisionBoundaryError(completedError));
+              const external = !capacityError && (completedError instanceof ModelProviderError || isSupervisionBoundaryError(completedError) || completedError instanceof CandidateRecoveryPausedError);
               if (completedError instanceof ModelProviderError && firstProviderFailure === undefined) {
                 firstProviderFailure = completedError;
               }
@@ -4167,7 +4175,11 @@ async function runLosslessBook(
                   completed.request.windows[0]?.windowId === window.windowId,
                 ),
                 warnings: external
-                  ? ["external model provider failure; run aborted without human task"]
+                  ? [completedError instanceof CandidateRecoveryPausedError
+                    ? "candidate recovery paused; saved candidate retained"
+                    : isSupervisionBoundaryError(completedError)
+                      ? "supervision checkpoint stopped; saved candidate retained when available"
+                      : "external model provider failure; run aborted without human task"]
                   : [message],
               });
               if (!external && retry) {
@@ -4188,7 +4200,7 @@ async function runLosslessBook(
                 ? completedError
                 : (firstProviderFailure ?? completedError);
             }
-            if (isSupervisionBoundaryError(completedError)) providerFailure = completedError;
+            if (isSupervisionBoundaryError(completedError) || completedError instanceof CandidateRecoveryPausedError) providerFailure = completedError;
             continue;
           }
 
@@ -4197,6 +4209,8 @@ async function runLosslessBook(
             const window = claimed.get(windowResult.windowId) as PersistedLosslessWindow;
             const boundaryErrors = boundaryFailuresByWindow.get(window.windowId);
             if (windowResult.status === "failed" || boundaryErrors !== undefined) {
+              if (boundaryErrors !== undefined) new CandidateCheckpointService({ runId,
+                sourceVersion: context.sourceLedger.sourceVersion, modelId: runtimeSet.primary.model.id, store }).discardWindow(window.windowId);
               const error = boundaryErrors === undefined
                 ? windowResult.error ?? "invalid batch window submission"
                 : `cross-request boundary validation failed: ${boundaryErrors.join("; ")}`;
