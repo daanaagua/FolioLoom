@@ -28,6 +28,7 @@ import {
   type WeightedTokenEstimator,
 } from "../source/token-estimator.js";
 import type { SchedulerObservationStatus } from "./adaptive-scheduler.js";
+import { CandidateRecoveryPausedError, type CandidateCheckpointService } from "./candidate-checkpoint.js";
 import {
   AdmissionController,
   BookTokenEnvelopeExceededError,
@@ -140,6 +141,8 @@ export interface CompletedTranslationRequest {
   result?: MergedTranslationResult;
   error?: unknown;
   runtime: {
+    /** False for a checkpoint-only execution; not a provider latency sample. */
+    readonly providerOperationStarted?: boolean;
     readonly durationMs: number;
     readonly usage: NormalizedRuntimeUsage;
     /** Usage charged by the parent attempt; recovery attempts settle separately. */
@@ -164,6 +167,7 @@ export interface ScheduledResult<T> {
 }
 
 export interface TranslationExecutionDeps {
+  readonly candidateCheckpoints?: CandidateCheckpointService;
   readonly admission: AdmissionController;
   /**
    * Allocates a durable request identity that is fresh across process
@@ -928,7 +932,9 @@ export function runtimeUsageForRuns(
 
 function accountingUsageForRuns(
   runs: readonly PiRunResult[],
+  knownNoCalls = false,
 ): NormalizedRuntimeUsage {
+  if (knownNoCalls && runs.length === 0) return normalizeRuntimeUsage({ input: 0, output: 0, totalTokens: 0 });
   const usage = runtimeUsageForRuns(runs);
   return runs.length > 0
     && runs.every((run) =>
@@ -1283,6 +1289,7 @@ export async function executePlannedTranslationRequest(
     retryRound,
     conservativeHorizonFloor,
     onProviderResponse,
+    candidateCheckpoints,
   } = deps;
   const {
     admitted: {
@@ -1297,6 +1304,7 @@ export async function executePlannedTranslationRequest(
   } = execution;
   const requestStartedAt = performance.now();
   const observedRuns: PiRunResult[] = [];
+  let providerOperationStarted = false;
   const secondaryRuns = new Set<PiRunResult>();
   const recoveryRuns = new Set<PiRunResult>();
   const recoveries: Array<{
@@ -1408,6 +1416,7 @@ export async function executePlannedTranslationRequest(
             previousActiveTail:
               acceptedTailByBlockId.get(paragraphScope.blockId) ?? "",
           };
+        providerOperationStarted = true;
         const result = await runTranslationBatch({
           ...runtimeInput,
           // Supervisor review belongs to the complete logical candidate, never
@@ -1780,9 +1789,20 @@ export async function executePlannedTranslationRequest(
     ),
   );
   try {
-    const executions = await executeFragments(fragments);
-    let result = mergeFragmentTranslationResults(request, executions);
-    if (executions.some((item) => item.fragment.paragraphPlan !== undefined)) {
+    const completeInput = selectedBuildInput(request);
+    const restored = new Map(request.windows.flatMap(window => {
+      const candidate = candidateCheckpoints?.load(completeInput, window.windowId);
+      return candidate ? [[window.windowId, candidate] as const] : [];
+    }));
+    const missingWindows = request.windows.filter(w => !restored.has(w.windowId));
+    const pendingRequest = { ...request, windows: missingWindows, sourceTokens: missingWindows.reduce((n, w) => n + w.sourceTokens, 0) };
+    const pendingFragments = restored.size === 0 ? fragments : missingWindows.length === 0 ? []
+      : admitTranslationRequests([pendingRequest], selectedRuntime, estimator, blockById, selectedBuildInput)[0]!.fragments;
+    const executions = await executeFragments(pendingFragments);
+    const generated = mergeFragmentTranslationResults(pendingRequest, executions);
+    let result: MergedTranslationResult = { responseErrors: generated.responseErrors,
+      windows: request.windows.map(w => restored.get(w.windowId) ?? generated.windows.find(g => g.windowId === w.windowId)!) };
+    if (restored.size > 0 || executions.some((item) => item.fragment.paragraphPlan !== undefined)) {
       const checked = await validateTranslationBatchCandidate({
         ...selectedBuildInput(request),
         reviewCandidate: undefined,
@@ -1795,17 +1815,27 @@ export async function executePlannedTranslationRequest(
         windows: checked.windows,
         responseErrors: checked.responseErrors,
       };
+      const failedRestore = checked.windows.find(w => restored.has(w.windowId) && w.status === "failed");
+      if (failedRestore) throw new CandidateRecoveryPausedError(failedRestore.windowId, failedRestore.error ?? "saved candidate no longer passes validation");
     }
-    const completeInput = selectedBuildInput(request);
+    for (const window of result.windows) candidateCheckpoints?.save(completeInput, window);
     if (completeInput.reviewCandidate && result.windows.every(w => w.status !== "failed")) {
       const checked = await reviewAndRepairTranslationBatchCandidate({
         ...completeInput, model: selectedRuntime.model, streamFn: selectedRuntime.streamFn,
         thinkingLevel: selectedRuntime.thinkingLevel, budget, signal, deadlineMs: hardDeadlineMs,
         repairEnabled: targetedRepairScopeKeys.size < MAX_TARGETED_REPAIRS_PER_REQUEST,
         repairRuntime: runtimeSet.escalation, onProviderResponse,
+        onCandidate: (window, phase) => candidateCheckpoints?.save(completeInput, window, phase),
+        beforeRepair: windows => {
+          candidateCheckpoints?.claimRepair(completeInput, windows);
+          providerOperationStarted = true;
+        },
+        onRepairRun: run => { if (!observedRuns.includes(run)) observedRuns.push(run); },
       }, result);
-      observedRuns.push(...checked.repairRuns);
+      for (const run of checked.repairRuns) if (!observedRuns.includes(run)) observedRuns.push(run);
       if (checked.repairRuns.length) targetedRepairScopeKeys.add(`supervision:${request.requestId}`);
+      const rejected = checked.windows.find(w => w.status === "failed");
+      if (candidateCheckpoints && rejected) throw new CandidateRecoveryPausedError(rejected.windowId, rejected.error ?? "review still requires changes after bounded repair");
       result = { windows: checked.windows, responseErrors: checked.responseErrors };
     }
     const failed = result.windows.some((window) =>
@@ -1814,9 +1844,10 @@ export async function executePlannedTranslationRequest(
       ? "failed"
       : observedContextOverflow ? "context" : "success";
     const durationMs = performance.now() - requestStartedAt;
-    const observedUsage = runtimeUsageForRuns(observedRuns);
+    const observedUsage = providerOperationStarted ? runtimeUsageForRuns(observedRuns) : normalizeRuntimeUsage({ input: 0, output: 0, totalTokens: 0 });
     const accountingUsage = accountingUsageForRuns(
       observedRuns.filter((run) => !secondaryRuns.has(run)),
+      !providerOperationStarted,
     );
     const usage = recoveries.some((recovery) =>
       !recovery.usage.complete)
@@ -1828,6 +1859,7 @@ export async function executePlannedTranslationRequest(
         budget: budget.snapshot(),
         result,
         runtime: {
+          providerOperationStarted,
           durationMs,
           usage,
           accountingUsage,
@@ -1854,9 +1886,10 @@ export async function executePlannedTranslationRequest(
     if (failedRun !== undefined && !observedRuns.includes(failedRun)) {
       observedRuns.push(failedRun);
     }
-    const observedUsage = runtimeUsageForRuns(observedRuns);
+    const observedUsage = providerOperationStarted ? runtimeUsageForRuns(observedRuns) : normalizeRuntimeUsage({ input: 0, output: 0, totalTokens: 0 });
     const accountingUsage = accountingUsageForRuns(
       observedRuns.filter((run) => !secondaryRuns.has(run)),
+      !providerOperationStarted,
     );
     const providerUsage = providerErrorUsage(error);
     const usage = (error instanceof ModelProviderError && !providerUsage.complete)
@@ -1871,6 +1904,7 @@ export async function executePlannedTranslationRequest(
         budget: budget.snapshot(),
         error,
         runtime: {
+          providerOperationStarted,
           durationMs,
           usage,
           accountingUsage,

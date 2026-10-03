@@ -6,13 +6,13 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.8.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.8.1**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-v1.8.0 adds bounded native Pi supervision for source-grounded planning, semantic review and targeted repair; task context shared across model phases; compact terminology receipts; and opt-in external-framework workers. Existing runs keep their recorded backend and supervision policy. See the [release notes](docs/releases/v1.8.0.md).
+v1.8.1 strengthens native Pi supervision with host-issued evidence references, durable candidate checkpoints, restart-safe repair limits and dependency-aware review caching. Existing runs keep their recorded backend and supervision policy. See the [release notes](docs/releases/v1.8.1.md) and [reliability contracts](docs/reliability.md).
 
 - ✓ **Partial mitigation for DeepSeek's mistaken copyright refusals:** caller-supplied source and usage context can now accompany translation, research, repair and supervision through the desktop task-context field or `--task-context-file`. Clear, truthful context helps address refusals based on unsupported assumptions about the task. This is a prompt-context correction, not a change to DeepSeek's policies or a guarantee against future refusals; it does not infer rights or invent authorization.
 
-## What v1.8.0 can do
+## What v1.8.1 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Use embedded Pi to approve bounded batches, query source evidence, review selected candidates and request grounded repairs, while the kernel retains budgets, validation and commits.

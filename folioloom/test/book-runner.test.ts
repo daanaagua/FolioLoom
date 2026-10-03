@@ -1386,7 +1386,7 @@ test("shape collapse on a smaller single block routes to typed fragments, not fr
   }
 });
 
-test("resumed paragraph recovery allocates a fresh ledger attempt after a terminal prior attempt", async () => {
+test("legacy paragraph replay without candidate checkpoints allocates a fresh ledger attempt", async () => {
   const sourceParagraphs = Array.from(
     { length: 8 },
     (_, index) =>
@@ -1461,6 +1461,8 @@ test("resumed paragraph recovery allocates a fresh ledger attempt after a termin
 
   const database = new DatabaseSync(fixture.options.storePath);
   try {
+    // Model a pre-checkpoint run while retaining all historical provider charges.
+    database.prepare("DELETE FROM events WHERE run_id=? AND kind='candidate_checkpoint'").run("run-lossless");
     database.prepare(`
       UPDATE window_plans
       SET status='pending', result_status=NULL, snapshot_id=NULL,

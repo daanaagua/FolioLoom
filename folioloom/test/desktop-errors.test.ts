@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { toDesktopError } from "../src/desktop/desktop-errors.js";
+import { CandidateRecoveryPausedError } from "../src/fullbook/candidate-checkpoint.js";
+
+test("candidate recovery pauses explain preserved work without blaming the provider", () => {
+  const error = toDesktopError(new CandidateRecoveryPausedError("window", "repair made no text progress"));
+  assert.equal(error.code, "CANDIDATE_RECOVERY_PAUSED");
+  assert.match(error.message, /候选译文/u);
+  assert.match(error.nextAction ?? "", /已保存/u);
+  assert.equal(error.retryable, false);
+});
 
 test("desktop errors turn provider failures into actionable Chinese messages", () => {
   const error = Object.assign(new Error("request failed"), { code: "AUTH_INVALID" });

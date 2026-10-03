@@ -30,3 +30,4 @@ jobs:
       - run: npm run typecheck
       - run: npm run desktop:test
       - run: npm run desktop:typecheck
+      - run: npm run benchmark:reliability -- --words 10000 --fault-every 3
