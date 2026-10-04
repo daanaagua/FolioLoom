@@ -114,11 +114,12 @@ export function RunWorkspace({
   const [selectedProfile, setSelectedProfile] =
     useState<DesktopOptimizationProfile>("balanced");
   const [supervisorEnabled, setSupervisorEnabled] = useState(true);
+  const [deliveryMode, setDeliveryMode] = useState<"standard" | "strict">("standard");
   const [taskContext, setTaskContext] = useState("");
   const run = useMemo(() => currentRun(snapshot), [snapshot]);
   const completed = run === undefined
     ? 0
-    : run.progress.completedWindows + run.progress.warningWindows;
+    : run.progress.completedWindows;
   const total = run?.progress.totalWindows ?? 0;
   const progressMaximum = Math.max(total, 1);
 
@@ -159,6 +160,14 @@ export function RunWorkspace({
                 </button>
               ))}
             </div>
+            <label className="knowledge-field">
+              <span>交付模式</span>
+              <select value={deliveryMode} disabled={busy} onChange={event => setDeliveryMode(event.target.value as "standard" | "strict")}>
+                <option value="standard">完整译本＋疑点清单（默认）</option>
+                <option value="strict">严格模式：所有审校通过后交付</option>
+              </select>
+            </label>
+            <p className="workspace-hint">普通模式会自动修复、继续翻译并在书末复核；剩余语义疑点随译本列出。两种模式都要求完整覆盖和真实用量记录。</p>
             <label className="workspace-copy">
               <input type="checkbox" checked={supervisorEnabled} disabled={busy}
                 onChange={event => setSupervisorEnabled(event.target.checked)} />{" "}
@@ -176,7 +185,7 @@ export function RunWorkspace({
               className="primary-button"
               type="button"
               disabled={!modelReady || busy}
-              onClick={() => onStart(selectedProfile, { supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
+              onClick={() => onStart(selectedProfile, { deliveryMode, supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
             >
               {busy ? "正在启动" : "开始整本翻译"}
             </button>
@@ -211,6 +220,9 @@ export function RunWorkspace({
               <article><span>警告</span><strong>{run.progress.warningWindows}</strong></article>
               <article><span>需要处理</span><strong>{run.progress.humanRequiredWindows}</strong></article>
             </div>
+            {run.quality ? <p className="workspace-copy">
+              {run.deliveryMode === "standard" ? "完整译本＋疑点清单" : "严格交付"} · 待书末复核 {run.quality.pending} · 已解决 {run.quality.resolved} · 剩余疑点 {run.quality.unresolved}
+            </p> : null}
 
             <div className="scheduler-metrics">
               <article>

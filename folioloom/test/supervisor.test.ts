@@ -65,6 +65,38 @@ test("provider failures are propagated rather than repaired as literary issues",
   assert.equal(faux.state.callCount, 1);
 });
 
+test("the final supervisor turn exposes only the decision tool without increasing the turn cap", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_source", { query: "Rose", limit: 1 }), { stopReason: "toolUse" }),
+    context => {
+      assert.deepEqual(context.tools?.map(tool => tool.name), ["submit_supervisor_decision"]);
+      assert.match(context.systemPrompt ?? "", /必须.*submit_supervisor_decision/u);
+      return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runSupervisor({ ...input, maxTurns: 2 });
+  assert.equal(result.run.modelCalls, 2);
+  assert.equal(result.decision.action, "translate");
+});
+
+test("evidence tools leave one of the existing eight tool credits for a final decision", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([
+    fauxAssistantMessage(Array.from({ length: 7 }, (_, index) => ({
+      ...fauxToolCall("search_source", { query: "Rose", limit: 1 }), id: `search-${index}`,
+    })), { stopReason: "toolUse" }),
+    context => {
+      assert.deepEqual(context.tools?.map(tool => tool.name), ["submit_supervisor_decision"]);
+      return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runSupervisor(input);
+  assert.equal(result.run.modelCalls, 2);
+  assert.equal(result.run.toolNames.length, 8);
+  assert.equal(result.decision.action, "translate");
+});
+
 test("review advertises empty plan-only fields in its native tool schema and prompt", async () => {
   const { faux, input } = fixture();
   let schema: any;
@@ -81,6 +113,20 @@ test("review advertises empty plan-only fields in its native tool schema and pro
   assert.equal(schema.properties.reviewBlockIds.maxItems, 0);
   assert.equal(schema.properties.guidance.maxItems, 0);
   assert.match(system, /reviewBlockIds.*guidance.*\[\]/u);
+});
+
+test("an extra evidence call cannot consume the reserved decision credit", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([fauxAssistantMessage(
+    Array.from({ length: 8 }, (_, index) => ({
+      ...fauxToolCall("search_source", { query: "Rose", limit: 1 }), id: `search-${index}`,
+    })),
+  { stopReason: "toolUse" }), fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" })]);
+  const result = await runSupervisor(input);
+  assert.equal(result.decision.action, "translate");
+  assert.equal(result.run.toolErrors.length, 1);
+  assert.match(result.run.toolErrors[0]!.message, /final tool credit/u);
+  assert.equal(result.run.modelCalls, 2);
 });
 
 test("legacy quote diagnostics identify the faulty issue without weakening exact evidence", () => {

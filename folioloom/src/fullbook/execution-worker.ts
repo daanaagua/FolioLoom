@@ -29,6 +29,8 @@ import {
 } from "../source/token-estimator.js";
 import type { SchedulerObservationStatus } from "./adaptive-scheduler.js";
 import { CandidateRecoveryPausedError, type CandidateCheckpointService } from "./candidate-checkpoint.js";
+import { MAX_SEMANTIC_REPAIR_PASSES } from "./semantic-repair-policy.js";
+import type { AutomaticRecovery } from "./automatic-recovery.js";
 import {
   AdmissionController,
   BookTokenEnvelopeExceededError,
@@ -167,6 +169,7 @@ export interface ScheduledResult<T> {
 }
 
 export interface TranslationExecutionDeps {
+  readonly recovery?: AutomaticRecovery;
   readonly candidateCheckpoints?: CandidateCheckpointService;
   readonly admission: AdmissionController;
   /**
@@ -227,7 +230,8 @@ export function executionBudgetLimits(
     (total, fragment) => total + fragmentTranslationTurnLimit(fragment),
     0,
   );
-  const potentialRepairScopes = legalFragments.length;
+  const potentialRepairScopes = legalFragments.length
+    + (fragments.some(fragment => fragment.input.reviewCandidate) ? MAX_SEMANTIC_REPAIR_PASSES : 0);
   const repairTurns = Math.min(
     MAX_TARGETED_REPAIRS_PER_REQUEST,
     potentialRepairScopes,
@@ -895,7 +899,12 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
       .map((fragment) => fragment.assessment.totalReserved)
       .sort((left, right) => right - left)
       .slice(0, MAX_TARGETED_REPAIRS_PER_REQUEST)
-      .reduce((total, reserve) => total + reserve, 0);
+      .reduce((total, reserve) => total + reserve, 0)
+      // Whole-window semantic repairs can be larger than a transport fragment.
+      // Reserve the complete request envelope before dispatch, never on retry.
+      + (fragments.some(fragment => fragment.input.reviewCandidate)
+        ? MAX_SEMANTIC_REPAIR_PASSES * fragments.reduce((total, fragment) => total + fragment.assessment.totalReserved, 0)
+        : 0);
     return {
       request,
       fragments,
@@ -965,7 +974,7 @@ export function runtimeObservationStatus(
 }
 
 const RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR = /^(?:missing window submission|duplicate windowId|unknown blockId|duplicate blockId|empty translation|block set mismatch|missing block translations while merging context fragments|duplicate block translation while merging context fragments)/u;
-const RECOVERABLE_LOCAL_DEGENERATION_ERROR = /^(?:(?:validation|cross-block validation) failed after one targeted repair|shape collapse):[\s\S]*(?:untranslated_latin|paragraph_count_incompatible|paragraph_length_incompatible|abnormal_block_shortening|insufficient_lexical_content|abnormal_shortening|cross_block_translation_overlap)/u;
+const RECOVERABLE_LOCAL_DEGENERATION_ERROR = /^(?:(?:validation|cross-block validation) failed after (?:one targeted repair|1 targeted repair pass\(es\))|shape collapse):[\s\S]*(?:untranslated_latin|paragraph_count_incompatible|paragraph_length_incompatible|abnormal_block_shortening|insufficient_lexical_content|abnormal_shortening|cross_block_translation_overlap)/u;
 const RECOVERABLE_PARAGRAPH_REFINEMENT_ERROR = /^(?:missing window submission|paragraph count mismatch|empty translation|block set mismatch|shape collapse)/u;
 
 function failedWindowIdsMatching(
@@ -1290,6 +1299,7 @@ export async function executePlannedTranslationRequest(
     conservativeHorizonFloor,
     onProviderResponse,
     candidateCheckpoints,
+    recovery,
   } = deps;
   const {
     admitted: {
@@ -1329,6 +1339,7 @@ export async function executePlannedTranslationRequest(
   const acceptedTailByBlockId = new Map<string, string>();
   const chargeSecondaryFragments = async (
     purpose:
+      | "translate"
       | "repair"
       | "protocol_switch"
       | "context_split"
@@ -1405,6 +1416,7 @@ export async function executePlannedTranslationRequest(
       const fragmentStartedAt = performance.now();
       try {
         throwIfAborted(signal);
+        for (const window of fragment.request.windows) recovery?.assertAvailable(`translate:${window.windowId}`);
         const paragraphScope = fragment.input.paragraphFragment;
         const targetedRepairScopeKey = paragraphScope === undefined
           ? `fragment:${fragment.request.requestId}`
@@ -1690,6 +1702,20 @@ export async function executePlannedTranslationRequest(
           observedRuns.push(failedRun);
           recoveryRuns.add(failedRun);
         }
+        if (recovery && error instanceof ModelProviderError && ["throttled", "timeout", "busy"].includes(error.kind)
+          && admission.ledger.state().tokenUsageComplete && accountingUsageForRuns(observedRuns).complete) {
+          let retry = true;
+          for (const window of fragment.request.windows) {
+            if (!await recovery.providerRetry(`translate:${window.windowId}`, error, { signal })) { retry = false; break; }
+          }
+          if (retry) {
+            recoveries.push({ durationMs: performance.now() - fragmentStartedAt, usage: providerErrorUsage(error),
+              status: "failed", protocol: fragment.input.responseProtocol ?? "typed_tool" });
+            completed.push(...await chargeSecondaryFragments("translate", [fragment],
+              () => executeFragments([fragment], activeRuntime, retryingLocally)));
+            continue;
+          }
+        }
         if (error instanceof ModelProviderError
           && error.kind === "protocol"
           && fragment.paragraphPlan === undefined
@@ -1790,11 +1816,20 @@ export async function executePlannedTranslationRequest(
   );
   try {
     const completeInput = selectedBuildInput(request);
-    const restored = new Map(request.windows.flatMap(window => {
-      const candidate = candidateCheckpoints?.load(completeInput, window.windowId);
-      return candidate ? [[window.windowId, candidate] as const] : [];
-    }));
+    const restored = new Map<string, TranslationBatchWindowResult>();
+    for (const window of request.windows) {
+      const candidate = candidateCheckpoints && recovery
+        ? await candidateCheckpoints.loadValidated(completeInput, window.windowId, async candidate => {
+          const checked = await validateTranslationBatchCandidate({ ...selectedBuildInput({ ...request, windows: [window], sourceTokens: window.sourceTokens }),
+            reviewCandidate: undefined, model: selectedRuntime.model, streamFn: selectedRuntime.streamFn,
+            thinkingLevel: selectedRuntime.thinkingLevel, budget }, { windows: [candidate], responseErrors: [] });
+          return checked.windows.length === 1 && checked.windows[0]!.status !== "failed";
+        }, recovery)
+        : candidateCheckpoints?.load(completeInput, window.windowId);
+      if (candidate) restored.set(window.windowId, candidate);
+    }
     const missingWindows = request.windows.filter(w => !restored.has(w.windowId));
+    for (const window of missingWindows) recovery?.assertAvailable(`translate:${window.windowId}`, true);
     const pendingRequest = { ...request, windows: missingWindows, sourceTokens: missingWindows.reduce((n, w) => n + w.sourceTokens, 0) };
     const pendingFragments = restored.size === 0 ? fragments : missingWindows.length === 0 ? []
       : admitTranslationRequests([pendingRequest], selectedRuntime, estimator, blockById, selectedBuildInput)[0]!.fragments;
@@ -1824,16 +1859,35 @@ export async function executePlannedTranslationRequest(
         ...completeInput, model: selectedRuntime.model, streamFn: selectedRuntime.streamFn,
         thinkingLevel: selectedRuntime.thinkingLevel, budget, signal, deadlineMs: hardDeadlineMs,
         repairEnabled: targetedRepairScopeKeys.size < MAX_TARGETED_REPAIRS_PER_REQUEST,
+        semanticRepairPasses: Math.min(MAX_SEMANTIC_REPAIR_PASSES,
+          Math.max(1, MAX_TARGETED_REPAIRS_PER_REQUEST - targetedRepairScopeKeys.size)) as 1 | 2,
         repairRuntime: runtimeSet.escalation, onProviderResponse,
-        onCandidate: (window, phase) => candidateCheckpoints?.save(completeInput, window, phase),
-        beforeRepair: windows => {
-          candidateCheckpoints?.claimRepair(completeInput, windows);
+        onCandidate: (window, phase) => {
+          try { candidateCheckpoints?.save(completeInput, window, phase); }
+          catch (error) {
+            if (!(completeInput.deliveryMode === "standard" && error instanceof CandidateRecoveryPausedError && error.semanticLimit)) throw error;
+          }
+        },
+        beforeRepair: (windows, failures) => {
+          if (windows.some(window => completeInput.canReviewRepairedCandidate?.(window.windowId) === false)) {
+            if (completeInput.deliveryMode === "standard") return false;
+            throw new CandidateRecoveryPausedError(windows[0]!.windowId, "request repair credit exhausted: no review credit remains", true);
+          }
+          if (targetedRepairScopeKeys.size >= MAX_TARGETED_REPAIRS_PER_REQUEST) {
+            if (completeInput.deliveryMode === "standard") return false;
+            throw new CandidateRecoveryPausedError(windows[0]!.windowId, "request repair credit exhausted", true);
+          }
+          try { candidateCheckpoints?.claimRepair(completeInput, windows, failures); }
+          catch (error) {
+            if (completeInput.deliveryMode === "standard" && error instanceof CandidateRecoveryPausedError && error.semanticLimit) return false;
+            throw error;
+          }
+          targetedRepairScopeKeys.add(`supervision:${request.requestId}:${targetedRepairScopeKeys.size}`);
           providerOperationStarted = true;
         },
         onRepairRun: run => { if (!observedRuns.includes(run)) observedRuns.push(run); },
       }, result);
       for (const run of checked.repairRuns) if (!observedRuns.includes(run)) observedRuns.push(run);
-      if (checked.repairRuns.length) targetedRepairScopeKeys.add(`supervision:${request.requestId}`);
       const rejected = checked.windows.find(w => w.status === "failed");
       if (candidateCheckpoints && rejected) throw new CandidateRecoveryPausedError(rejected.windowId, rejected.error ?? "review still requires changes after bounded repair");
       result = { windows: checked.windows, responseErrors: checked.responseErrors };

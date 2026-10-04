@@ -3,6 +3,19 @@ import test from "node:test";
 
 import { simplifyChineseTranslation } from "../src/style/chinese-script-normalization.js";
 
+test("simplified Chinese characters are not reinterpreted as Japanese shorthand", () => {
+  const text = "予以答复，仍欠三元；赊欠与赐予应保持原样。";
+  assert.equal(simplifyChineseTranslation(text), text);
+  assert.equal(simplifyChineseTranslation(text, ["三元"]), text);
+});
+
+test("mixed-script normalization is idempotent without corrupting Chinese words", () => {
+  const text = "賒欠與賜予，沢黒竜，谨愼地硏究。";
+  const expected = "赊欠与赐予，泽黑龙，谨慎地研究。";
+  assert.equal(simplifyChineseTranslation(text), expected);
+  assert.equal(simplifyChineseTranslation(expected), expected);
+});
+
 test("traditional Chinese prose is normalized to simplified Chinese", () => {
   assert.equal(
     simplifyChineseTranslation("黑殺隊的訓練結束了，後來……"),

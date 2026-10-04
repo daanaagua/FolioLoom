@@ -62,6 +62,7 @@ const SYSTEM = [
   "计划阶段：判断是否需要查证，再批准一个连续前缀批次翻译。普通段落应批量推进，不逐段重新规划；存在具体语义风险时选出需要审校的 blockId。",
   "对人名/称呼、否定、隐喻和叙述视角的实质歧义，可查询原文后提交带 sourceRef 的 guidance。sourceRef/targetRef 必须从对应 blockId 的 evidence 中选择 id，不抄写引文，不计算偏移。证据不足时保留歧义，不编造事实，不覆盖锁定术语。",
   "审校阶段：只检查给定候选与原文的实质意义、漏译、角色指代和语气偏移；不要因个人措辞偏好无限润色。无实质问题则 accept，有明确问题则 revise，并提供对应原文和译文引文。",
+  "每次审校都完整检查所给窗口，一次列出能够证实的问题，包括同一人物与同一场所的译名一致性；不要故意把已发现的问题留到下一轮。以给定 stableTerms 及其适用范围为准，尊重允许译法；普通语境变体不等于错误，不擅自把不同指称合并或强制统一。",
   "审校阶段 reviewBlockIds 和 guidance 必须为 []；它们只用于计划阶段。审校结果使用 action、issues、reason 表达，不重复提交已审校块清单或计划指导。所有数组字段都必须提供，包括空数组。",
   "遗漏内容可以使用空 targetRef，但必须选择确实遗漏的 sourceRef 并说明问题。不得把格式、标点风格或用量账本当文学问题。",
   "只有无法在当前原文、权限或给定约束内合理继续时才 pause。普通歧义优先保留，网络/认证/证书故障由程序处理。",
@@ -159,12 +160,19 @@ export async function runSupervisor(input: SupervisorInput): Promise<{ decision:
     ...(input.candidate ?? []).flatMap(b => evidenceReferences("target", b.blockId, b.text)),
   ].map(r => r.id));
   let submitted: SupervisorDecision | undefined;
+  let decisionOnly = false;
+  const consumeEvidenceCall = (): void => {
+    if (decisionOnly || budget.remaining("supervisionToolCalls") <= 1) {
+      throw new Error("Evidence queries are closed; submit_supervisor_decision retains the final tool credit.");
+    }
+    budget.consume("supervisionToolCalls", 1);
+  };
   const tools: TypedToolSpec<any>[] = [
     {
       name: "search_source", label: "Search source", description: "在本项目已授权原文内做字面查询，只返回有界原文证据。",
       phase: "supervision", parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 160 }), limit: Type.Integer({ minimum: 1, maximum: 4 }) }, { additionalProperties: false }),
       execute: async ({ query, limit }: { query: string; limit: number }) => {
-        budget.consume("supervisionToolCalls", 1);
+        consumeEvidenceCall();
         const hits = input.sources.flatMap(block => {
           const index = block.sourceText.toLocaleLowerCase().indexOf(query.toLocaleLowerCase());
           if (index < 0) return [];
@@ -181,7 +189,7 @@ export async function runSupervisor(input: SupervisorInput): Promise<{ decision:
       name: "read_source", label: "Read source", description: "按本项目 blockId 读取一段原文；start/count 是字符偏移，不能读取文件或其他项目。",
       phase: "supervision", parameters: Type.Object({ blockId: Type.String(), start: Type.Integer({ minimum: 0 }), count: Type.Integer({ minimum: 1, maximum: 4000 }) }, { additionalProperties: false }),
       execute: async ({ blockId, start, count }: { blockId: string; start: number; count: number }) => {
-        budget.consume("supervisionToolCalls", 1);
+        consumeEvidenceCall();
         const block = sourceById.get(blockId);
         if (!block) throw new Error("source block/range outside authorized project");
         const scalars = Array.from(block.sourceText);
@@ -210,9 +218,19 @@ export async function runSupervisor(input: SupervisorInput): Promise<{ decision:
       },
     },
   ];
-  const boundedStream = inheritedTaskContext(input.streamFn, (model, context, options) => input.streamFn(model, context, {
-    ...options, maxTokens: Math.min(8192, model.maxTokens),
-  }));
+  const boundedStream = inheritedTaskContext(input.streamFn, (model, context, options) => {
+    decisionOnly = budget.remaining("supervisionTurns") === 0
+      || budget.remaining("supervisionToolCalls") <= 1
+      || budget.remaining("evidenceChars") === 0;
+    const remaining = `剩余查询调用额度：${Math.max(0, budget.remaining("supervisionToolCalls") - 1)}；剩余后续模型回合：${budget.remaining("supervisionTurns")}。`;
+    return input.streamFn(model, {
+      ...context,
+      systemPrompt: `${context.systemPrompt ?? ""}\n${remaining}${decisionOnly
+        ? "当前必须调用 submit_supervisor_decision，根据已有证据提交决定；不得继续查询，不得编造证据或默认判定通过。"
+        : "必须在额度内提交 submit_supervisor_decision；为决定保留最后一次工具调用。"}`,
+      tools: decisionOnly ? context.tools?.filter(tool => tool.name === "submit_supervisor_decision") : context.tools,
+    }, { ...options, maxTokens: Math.min(8192, model.maxTokens) });
+  });
   const run = await new PiRuntime().run({
     systemPrompt: SYSTEM, prompt: supervisorPrompt(input), phase: "supervision", tools,
     model: input.model, budget, maxTurns, thinkingLevel: input.thinkingLevel,

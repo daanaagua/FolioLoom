@@ -42,6 +42,7 @@ import {
   type FramedTranslationProtocol,
 } from "./framed-translation-protocol.js";
 import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
+import { projectTranslationTerms } from "../knowledge/translation-term-projection.js";
 
 export interface FinalizeTranslationBatchArgs {
   windows: Array<{
@@ -183,10 +184,13 @@ export interface TranslationBatchSnapshot {
  * object is what must be measured before a request can be admitted.
  */
 export interface TranslationRequestInput {
+  /** Host policy, not a model-supplied receipt field. */
+  deliveryMode?: import("../fullbook/delivery-policy.js").DeliveryMode;
   /** New supervised runs use constrained identities and host-owned receipt coordinates. */
   strictIdentifiers?: boolean;
   supervisorGuidance?: readonly import("./supervisor.js").SupervisorGuidance[];
   reviewCandidate?: (window: { windowId: string; translations: Array<{ blockId: string; text: string }> }) => Promise<readonly import("../tools/repair-tools.js").ValidationFailure[]>;
+  canReviewRepairedCandidate?: (windowId: string) => boolean;
   request: PhysicalRequestPlan;
   blocks: readonly LosslessBlock[];
   stableTerms: readonly StableTerm[];
@@ -687,7 +691,6 @@ export function prepareTranslationRequest(
   const requestedBlockIds = new Set(windows.flatMap((window) =>
     window.blocks.map((block) => block.blockId)));
   const termOccurrences = expectedTermOccurrencesForTranslationInput(input);
-  const wireStableTerms = input.stableTerms.map(withoutLocalTermRevision);
   const wireTermOccurrences = termOccurrences.map(withoutLocalTermRevision);
   const knowledgeContext = translationKnowledgeWireContext(input, windows);
   const framedProtocol = responseProtocol === "framed_text"
@@ -723,6 +726,13 @@ export function prepareTranslationRequest(
         }),
     },
   );
+  const wireStableTerms = projectTranslationTerms(input.stableTerms, {
+    blockIds: requestedBlockIds,
+    occurrenceConceptIds: new Set(termOccurrences.map(occurrence => occurrence.conceptId)),
+    context: canonicalJson({ windows, memoryPayload, previousActiveTail: input.previousActiveTail ?? "",
+      guidance: input.supervisorGuidance ?? [], entityLinks: input.entityLinkWarnings ?? [],
+      style: input.effectiveStyleByWindow ?? input.styleState ?? {} }),
+  }).map(withoutLocalTermRevision);
   const termsPayload = {
     stableTerms: wireStableTerms,
     entityLinkWarnings: input.entityLinkWarnings ?? [],

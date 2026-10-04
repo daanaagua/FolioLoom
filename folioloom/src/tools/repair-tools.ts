@@ -12,6 +12,8 @@ import {
 } from "./tool-spec.js";
 
 export interface ValidationFailure {
+  /** Host-owned identity excluding mutable candidate quotations. */
+  issueKey?: string;
   code: string;
   blockId?: string;
   message: string;

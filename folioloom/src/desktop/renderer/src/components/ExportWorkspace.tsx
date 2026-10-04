@@ -136,6 +136,9 @@ export function ExportWorkspace({
                 : candidate.blockers.map((blocker) => <p key={blocker}>{blocker}</p>)}
             </div>
           ) : null}
+          {candidate?.deliveryMode === "standard" ? <p className="workspace-copy">
+            完整译本将附疑点清单。剩余疑点：{candidate.unresolvedQualityItems ?? 0}；这些内容未标记为严格审校通过。
+          </p> : null}
 
           <fieldset className="format-choice" disabled={busy}>
             <legend>文件格式</legend>

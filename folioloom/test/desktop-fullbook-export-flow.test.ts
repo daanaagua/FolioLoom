@@ -344,11 +344,11 @@ test("desktop imports, pauses, resumes, strictly exports, and verifies a Unicode
     });
     assert.deepEqual(
       new Set(result.files.map((file) => file.format)),
-      new Set(["translation_txt", "bilingual_txt", "epub", "audit", "metrics"]),
+      new Set(["translation_txt", "bilingual_txt", "epub", "audit", "metrics", "quality_report"]),
     );
 
     const paths = {
-      ...losslessBookArtifactPaths(result.directory, true, "Unicode Story"),
+      ...losslessBookArtifactPaths(result.directory, true, "Unicode Story", "standard"),
       epub: join(result.directory, "Unicode Story.epub"),
     };
     const storePath = join(

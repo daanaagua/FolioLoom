@@ -305,6 +305,7 @@ test("strict export fails closed when durable provider usage is incomplete", () 
       () => writeLosslessBookArtifacts(item.store, "run-a", item.output),
       /TOKEN_USAGE_INCOMPLETE/u,
     );
+    assert.throws(() => writeLosslessBookArtifacts(item.store, "run-a", item.output, { deliveryMode: "standard" }), /TOKEN_USAGE_INCOMPLETE/u);
     const paths = writeLosslessBookArtifacts(
       item.store,
       "run-a",
@@ -368,6 +369,44 @@ test("verifier checks the EPUB embedded lineage projection", async () => {
     const verification = verifyExport({ ...paths, epub }, item.store, "run-a");
     assert.equal(verification.ok, false);
     assert.ok(verification.incidentCodes.includes("EPUB_LINEAGE_MISMATCH"));
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
+test("verifier validates EPUB 2 NCX navigation without waiving EPUB 3 navigation", async () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
+    const paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
+    const epub = join(item.output, "legacy.epub");
+    await writeLosslessBookEpub(item.store, "run-a", epub, { title: "Legacy", language: "zh-CN" });
+    const original = readStoredZipEntries(epub);
+    const sections = original.filter(entry => /^EPUB\/section-\d+\.xhtml$/u.test(entry.name));
+    const ncx = `<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap>${sections.map((entry, index) => `<navPoint id="n${index}" playOrder="${index + 1}"><navLabel><text>Section</text></navLabel><content src="${entry.name.slice(5)}"/></navPoint>`).join("")}</navMap></ncx>`;
+    const legacy = original.filter(entry => entry.name !== "EPUB/nav.xhtml").map(entry => ({
+      name: entry.name,
+      data: entry.name === "EPUB/package.opf"
+        ? entry.data.toString("utf8").replace('version="3.0"', 'version="2.0"')
+          .replace('<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>', '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>')
+          .replace("<spine>", '<spine toc="ncx">')
+        : entry.data,
+    }));
+    legacy.push({ name: "EPUB/toc.ncx", data: ncx });
+    writeStoredZip(epub, legacy);
+    assert.equal(verifyExport({ ...paths, epub }, item.store, "run-a").ok, true);
+    for (const [path, from, to, incident] of [
+      ["EPUB/package.opf", 'toc="ncx"', 'toc="missing"', "EPUB_PACKAGE_INVALID"],
+      ["EPUB/package.opf", "application/x-dtbncx+xml", "text/plain", "EPUB_PACKAGE_INVALID"],
+      ["EPUB/package.opf", 'version="2.0"', 'version="3.0"', "EPUB_NAVIGATION_INVALID"],
+      ["EPUB/toc.ncx", "section-1.xhtml", "missing.xhtml", "EPUB_NAVIGATION_INVALID"],
+      ["EPUB/toc.ncx", "section-1.xhtml", "section-1.xhtml#missing", "EPUB_NAVIGATION_INVALID"],
+      ["EPUB/toc.ncx", "<navMap>", "<broken>", "EPUB_NAVIGATION_INVALID"],
+    ] as const) {
+      writeStoredZip(epub, legacy.map(entry => ({ ...entry, data: entry.name === path ? entry.data.toString().replace(from, to) : entry.data })));
+      assert.ok(verifyExport({ ...paths, epub }, item.store, "run-a").incidentCodes.includes(incident), `${from} -> ${to}`);
+    }
   } finally {
     item.store.close();
     item.context.close();

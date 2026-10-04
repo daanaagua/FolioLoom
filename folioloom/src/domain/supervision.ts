@@ -16,6 +16,9 @@ export interface SupervisionRecord {
   readonly candidateHash?: string;
   readonly conflictHash?: string;
   readonly dependencyHash?: string;
+  /** Per-window dependency identity for plans spanning independent windows. */
+  readonly windowDependencyHashes?: Readonly<Record<string, string>>;
+  readonly qualityItemId?: string;
   readonly origin?: "model" | "host_revalidation";
   readonly decision?: SupervisorDecision;
   readonly modelCalls?: number;
@@ -69,7 +72,8 @@ export function summarizeSupervision(
       if (!requiresReview) continue;
       const candidateHash = supervisionCandidateHash(active.filter(t => window.blockIds.includes(t.blockId)));
       if (!completed.some(r => r.event === "review" && r.windowIds.includes(window.windowId)
-        && r.dependencyHash === plan.dependencyHash && r.candidateHash === candidateHash && r.decision?.action === "accept")) pendingReviewWindowIds.push(window.windowId);
+        && r.dependencyHash === (plan.windowDependencyHashes?.[window.windowId] ?? plan.dependencyHash)
+        && r.candidateHash === candidateHash && r.decision?.action === "accept")) pendingReviewWindowIds.push(window.windowId);
     }
   }
   return {

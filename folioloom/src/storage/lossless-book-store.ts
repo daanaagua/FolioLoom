@@ -19,6 +19,9 @@ import { gzipSync } from "node:zlib";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import { validateCandidateCheckpoint, type CandidateCheckpointRecord } from "../fullbook/candidate-checkpoint.js";
+import { validateRecoveryRecord, type RecoveryRecord } from "../fullbook/automatic-recovery.js";
+import { QualityQueue, validateQualityRecord, type QualityRecord, type DeliveryMode } from "../fullbook/delivery-policy.js";
+import { supervisionCandidateHash } from "../domain/supervision.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
 import {
@@ -296,6 +299,7 @@ export interface KnowledgeCandidateInput {
 }
 
 export interface WindowStageInput {
+  qualityIssues?: readonly import("../tools/repair-tools.js").ValidationFailure[];
   runId: string;
   windowId: string;
   snapshotId: string;
@@ -2235,6 +2239,13 @@ export class LosslessBookStore {
       }
       const expected = this.#membership(input.runId, input.windowId);
       this.#validateTranslations(input.translations, expected);
+      if (input.qualityIssues?.length) {
+        if (input.knowledgeCandidates.length || input.styleTail) throw new Error("quality-deferred window cannot publish memory or style");
+        new QualityQueue(input.runId, {
+          qualityRecords: runId => this.qualityRecords(runId),
+          appendQualityRecord: (runId, record) => this.#appendQualityRecord(runId, record),
+        }).defer({ windowId: input.windowId, candidateHash: supervisionCandidateHash(input.translations), issues: input.qualityIssues });
+      }
 
       const insertTranslation = this.#database.prepare(`
         INSERT INTO translations(
@@ -6225,6 +6236,52 @@ export class LosslessBookStore {
     }));
   }
 
+  replaceQualityWindow(input: {
+    runId: string; itemId: string; expectedHash: string; snapshotId: string;
+    translations: StagedTranslationInput[]; bindings: WindowConceptBindingsInput;
+    issues: readonly import("../tools/repair-tools.js").ValidationFailure[];
+  }): void {
+    this.#transaction(() => {
+      const queue = new QualityQueue(input.runId, {
+        qualityRecords: runId => this.qualityRecords(runId),
+        appendQualityRecord: (runId, record) => this.#appendQualityRecord(runId, record),
+      });
+      const item = queue.items().find(r => r.itemId === input.itemId && r.state === "reviewing");
+      if (!item) throw new Error("quality replacement requires a claimed item");
+      const window = this.#window(input.runId, item.windowId);
+      if (!window || !["completed", "completed_with_warnings"].includes(window.status)) throw new Error("quality window is not committed");
+      const current = this.activeTranslations(input.runId).filter(t => t.windowId === item.windowId);
+      if (supervisionCandidateHash(current) !== input.expectedHash) throw new Error("quality candidate changed during final review");
+      if (this.latestKnowledgeSnapshot(input.runId).id !== input.snapshotId) throw new Error("quality snapshot changed during final review");
+      this.#validateTranslations(input.translations, this.#membership(input.runId, item.windowId));
+      const newHash = supervisionCandidateHash(input.translations);
+      if (newHash !== input.expectedHash) {
+        const open = one<{ count: number }>(this.#database.prepare(`
+          SELECT COUNT(*) AS count FROM knowledge_revalidation_tasks AS q JOIN translations AS t ON t.translation_id=q.translation_id
+          WHERE q.run_id=? AND t.window_id=? AND q.status IN ('pending', 'validating')
+        `), input.runId, item.windowId)?.count ?? 0;
+        if (open) throw new Error("quality replacement requires completed knowledge revalidation");
+        if (one<{ count: number }>(this.#database.prepare(`SELECT COUNT(*) AS count FROM translations
+          WHERE run_id=? AND window_id=? AND stage_state='staged'`), input.runId, item.windowId)?.count) throw new Error("quality window contains staged translations");
+        const run = this.#run(input.runId);
+        for (const translation of input.translations) {
+          this.#database.prepare(`INSERT INTO translations(run_id, window_id, source_version, block_id, version, source_hash,
+            text, result_status, stage_state, active, snapshot_id) VALUES(?, ?, ?, ?,
+            (SELECT COALESCE(MAX(version), 0)+1 FROM translations WHERE run_id=? AND block_id=?), ?, ?, ?, 'staged', 0, ?)`)
+            .run(input.runId, item.windowId, run.source_version, translation.blockId, input.runId, translation.blockId,
+              translation.sourceHash, translation.text, window.status, input.snapshotId);
+        }
+        this.#writeWindowConceptBindings(input.runId, item.windowId, input.bindings.usages, input.bindings.concepts);
+        this.#database.prepare("UPDATE translations SET active=0 WHERE run_id=? AND window_id=? AND active=1").run(input.runId, item.windowId);
+        const promoted = this.#database.prepare("UPDATE translations SET active=1, stage_state='promoted' WHERE run_id=? AND window_id=? AND stage_state='staged'").run(input.runId, item.windowId);
+        if (Number(promoted.changes) !== current.length) throw new Error("quality replacement coverage mismatch");
+        this.#appendEvent(input.runId, "quality_window_replaced", { itemId: item.itemId, windowId: item.windowId,
+          oldHash: input.expectedHash, newHash, oldVersions: current.map(t => ({ blockId: t.blockId, version: t.version })) });
+      }
+      queue.finish(item.itemId, input.issues.length ? "unresolved" : "resolved", newHash, input.issues);
+    });
+  }
+
   repairTerminalProtocolTail(
     runId: string,
     blockId: string,
@@ -6507,6 +6564,74 @@ export class LosslessBookStore {
     return structuredClone(matches[0]?.decision);
   }
 
+  deliveryMode(runId: string): DeliveryMode | undefined {
+    this.#run(runId);
+    const records = all<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events WHERE run_id=? AND kind='delivery_policy' ORDER BY sequence
+    `), runId).map(row => JSON.parse(row.payload_json) as { mode: DeliveryMode; previous?: DeliveryMode });
+    let previous: DeliveryMode | undefined;
+    for (const record of records) {
+      if (!["standard", "strict"].includes(record.mode) || record.previous !== previous) throw new Error("invalid delivery policy history");
+      previous = record.mode;
+    }
+    return previous;
+  }
+
+  setDeliveryMode(runId: string, mode: DeliveryMode): void {
+    if (!["standard", "strict"].includes(mode)) throw new Error("invalid delivery mode");
+    this.#transaction(() => {
+      const previous = this.deliveryMode(runId);
+      if (previous === mode) return;
+      if (this.allWindows(runId).some(w => w.status === "running" || w.status === "staged")) throw new Error("delivery policy change requires an idle run");
+      this.#appendEvent(runId, "delivery_policy", { mode, ...(previous ? { previous } : {}) });
+    });
+  }
+
+  qualityRecords(runId: string): QualityRecord[] {
+    this.#run(runId);
+    return all<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events WHERE run_id=? AND kind='quality_record' ORDER BY sequence
+    `), runId).map(row => JSON.parse(row.payload_json) as QualityRecord);
+  }
+
+  appendQualityRecord(runId: string, record: QualityRecord): void {
+    this.#transaction(() => this.#appendQualityRecord(runId, record));
+  }
+
+  #appendQualityRecord(runId: string, record: QualityRecord): void {
+      validateQualityRecord(record);
+      const window = this.allWindows(runId).find(w => w.windowId === record.windowId);
+      if (!window || record.issues.some(issue => !window.blockIds.includes(issue.blockId ?? ""))) throw new Error("quality record outside run scope");
+      const records = this.qualityRecords(runId);
+      if (records.some(r => r.id === record.id)) return;
+      new QualityQueue(runId, { qualityRecords: () => [...records, record], appendQualityRecord: () => { throw new Error("read-only validation"); } }).items();
+      this.#appendEvent(runId, "quality_record", record);
+  }
+
+  recoveryRecords(runId: string): RecoveryRecord[] {
+    this.#run(runId);
+    return all<{ payload_json: string }>(this.#database.prepare(
+      "SELECT payload_json FROM events WHERE run_id=? AND kind='automatic_recovery' ORDER BY sequence",
+    ), runId).map(row => {
+      const record = JSON.parse(row.payload_json) as RecoveryRecord;
+      validateRecoveryRecord(record);
+      return record;
+    });
+  }
+
+  appendRecoveryRecord(runId: string, record: RecoveryRecord): void {
+    this.#run(runId);
+    validateRecoveryRecord(record);
+    this.#transaction(() => {
+      const prior = this.recoveryRecords(runId).find(r => r.id === record.id);
+      if (prior) {
+        if (canonicalJson(prior) !== canonicalJson(record)) throw new Error("automatic recovery id conflict");
+        return;
+      }
+      this.#appendEvent(runId, "automatic_recovery", record);
+    });
+  }
+
   candidateCheckpointRecords(runId: string, windowId: string): CandidateCheckpointRecord[] {
     this.#run(runId);
     return all<{ payload_json: string }>(this.#database.prepare(`
@@ -6556,6 +6681,10 @@ export class LosslessBookStore {
     const windows = new Set(this.allWindows(runId).map(w => w.windowId));
     if (!record.windowIds.length || record.windowIds.some(id => !windows.has(id))) {
       throw new Error("supervision record outside run scope");
+    }
+    if (record.windowDependencyHashes !== undefined && (Object.keys(record.windowDependencyHashes).length !== record.windowIds.length
+      || record.windowIds.some(id => !/^[a-f0-9]{64}$/u.test(record.windowDependencyHashes?.[id] ?? "")))) {
+      throw new Error("invalid scoped supervision dependencies");
     }
     const serialized = jsonText(record, "supervision record");
     if (serialized.length > 64_000) throw new Error("supervision record too large");

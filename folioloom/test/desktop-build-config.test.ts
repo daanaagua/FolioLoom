@@ -72,7 +72,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
     apiKeyPolicy: "never-packaged",
     projectDataPolicy: "user-selected",
     translationWritePolicy: "single-window-trial-and-durable-fullbook",
-    exportPolicy: "strict-txt-bilingual-epub",
+    exportPolicy: "complete-or-strict-txt-bilingual-epub",
   });
 
   const gitignore = readText(join(repositoryRoot, ".gitignore"));

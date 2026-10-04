@@ -246,6 +246,7 @@ test("EPUB template round-trip preserves footnotes, backlinks, cross-chapter lin
 <p id="return-1">Read <a epub:type="noteref" href="../notes/notes.xhtml#fn-1">this note</a>.</p>
 <p>Continue to <a href="chapter2.xhtml#part-2">the second chapter</a>.</p>
 <p>Visit <a href="https://example.com/a?x=1&amp;y=2">the example</a>.</p>
+<p>First sentence. Second sentence. Third sentence.</p>
 </body></html>`;
   const notes = `<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Notes</title></head><body>
@@ -310,6 +311,7 @@ test("EPUB template round-trip preserves footnotes, backlinks, cross-chapter lin
       ["Footnote body. ", "脚注正文。"],
       ["Back", "返回"],
       ["Second chapter", "第二章"],
+      ["First sentence. Second sentence. Third sentence.", "第一句。第二句。第三句。"],
     ]);
     for (const window of windows) {
       store.bindWindowsToSnapshot(runId, [window.windowId], snapshot.id);
@@ -360,6 +362,60 @@ test("EPUB template round-trip preserves footnotes, backlinks, cross-chapter lin
     assert.match(translatedNotes, /epub:type="backlink" href="\.\.\/text\/chapter1\.xhtml#return-1">返回<\/a>/u);
     assert.equal(entries.get("OEBPS/content.opf"), packageDocument);
     assert.equal(entries.get("OEBPS/style.css"), "a { color: blue; }\n");
+
+    // Lossless window boundaries can split a plain XHTML paragraph on either side of a space.
+    const splitTranslations = losslessBookTranslations(store, runId).flatMap((translation) => {
+      const boundary = translation.sourceText.indexOf(" Second sentence.");
+      if (boundary < 0) return [translation];
+      const third = translation.sourceText.indexOf("Third sentence.");
+      const targetBoundary = translation.text.indexOf("第二句。");
+      const targetThird = translation.text.indexOf("第三句。");
+      return [
+        { ...translation, sourceText: translation.sourceText.slice(0, boundary), text: translation.text.slice(0, targetBoundary) },
+        { ...translation, sourceText: translation.sourceText.slice(boundary, third), text: translation.text.slice(targetBoundary, targetThird) },
+        { ...translation, sourceText: translation.sourceText.slice(third), text: translation.text.slice(targetThird) },
+      ];
+    }).map((translation, globalIndex) => ({ ...translation, globalIndex }));
+    assert.ok(splitTranslations.some((translation) => translation.sourceText === " Second sentence. "));
+    const splitOutput = join(directory, "split-paragraph.epub");
+    await writeTranslatedEpubTemplate({
+      sourceManifestPath: imported.manifestPath,
+      translations: splitTranslations,
+      lineage: losslessBookLineage(store, runId),
+      outputPath: splitOutput,
+    });
+    assert.match(readStoredZipEntries(splitOutput).find((entry) => entry.name === "OEBPS/text/chapter1.xhtml")!.data.toString("utf8"), /<p>第一句。第二句。第三句。<\/p>/u);
+    // Every interior partition of the same source must reassemble identically,
+    // including boundaries immediately before and after punctuation or whitespace.
+    const phrase = "First sentence. Second sentence. Third sentence.";
+    for (let cut = 1; cut < phrase.length; cut++) {
+      const partitioned = losslessBookTranslations(store, runId).flatMap(translation => {
+        const start = translation.sourceText.indexOf(phrase);
+        if (start < 0) return [translation];
+        const offset = start + cut;
+        const target = translation.text.indexOf("第二句。");
+        const pieces = [
+          { ...translation, sourceText: translation.sourceText.slice(0, offset), text: translation.text.slice(0, target) },
+          { ...translation, sourceText: translation.sourceText.slice(offset), text: translation.text.slice(target) },
+        ];
+        assert.equal(pieces.map(p => p.sourceText).join(""), translation.sourceText);
+        return pieces;
+      }).map((translation, globalIndex) => ({ ...translation, globalIndex }));
+      await writeTranslatedEpubTemplate({ sourceManifestPath: imported.manifestPath, translations: partitioned,
+        lineage: losslessBookLineage(store, runId), outputPath: splitOutput });
+      assert.match(readStoredZipEntries(splitOutput).find(entry => entry.name === "OEBPS/text/chapter1.xhtml")!.data.toString("utf8"),
+        /<p>第一句。第二句。第三句。<\/p>/u, `source partition ${cut}`);
+    }
+    await assert.rejects(writeTranslatedEpubTemplate({
+      sourceManifestPath: imported.manifestPath,
+      translations: splitTranslations.map((translation) => ({
+        ...translation,
+        sourceText: translation.sourceText.replace(" Second sentence. ", " Wrong sentence. "),
+      })),
+      lineage: losslessBookLineage(store, runId),
+      outputPath: join(directory, "wrong-source.epub"),
+    }), /EPUB_STRUCTURAL_SOURCE_MISMATCH/u);
+    assert.equal(existsSync(join(directory, "wrong-source.epub")), false);
 
     const brokenOutput = join(directory, "broken-slot.epub");
     const brokenTranslations = losslessBookTranslations(store, runId).map(

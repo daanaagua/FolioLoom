@@ -23,7 +23,8 @@ import type {
 import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
-import { auditLosslessBookStore } from "../src/report.js";
+import { auditLosslessBookStore, writeLosslessBookArtifacts } from "../src/report.js";
+import { writeLosslessBookEpub } from "../src/export/epub-writer.js";
 import { scalarLength } from "../src/source/types.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
@@ -333,6 +334,32 @@ test("strict export publishes selected friendly artifacts atomically and never o
   } finally {
     cleanup(item);
   }
+});
+
+test("a transient EPUB lock retries only that stage and persists recovery across store reopen", async () => {
+  const item = fixture();
+  try {
+    addRun(item, "ready", { completedWindows: item.context.losslessBlocks.length });
+    let textWrites = 0, epubWrites = 0;
+    const service = new DesktopExportService({
+      writeArtifacts: (...args) => { textWrites++; return writeLosslessBookArtifacts(...args); },
+      writeEpub: async (...args) => {
+        epubWrites++;
+        if (epubWrites === 1) throw Object.assign(new Error("file busy"), { code: "EBUSY" });
+        return writeLosslessBookEpub(...args);
+      },
+    });
+    const destination = service.registerDestination(join(item.directory, "chosen"));
+    const result = await service.export(item.project, { runId: "ready", destinationId: destination.destinationId, formats: ["epub"] });
+    assert.equal(textWrites, 1);
+    assert.equal(epubWrites, 2);
+    assert.ok(existsSync(result.directory));
+    const reopened = LosslessBookStore.openReadOnly(item.storePath);
+    try {
+      assert.equal(reopened.recoveryRecords("ready").filter(r => r.action === "export_retry").length, 1);
+      assert.equal(reopened.allWindows("ready").every(w => w.status === "completed"), true);
+    } finally { reopened.close(); }
+  } finally { cleanup(item); }
 });
 
 test("writer and verifier failures clean temporary state without publishing a final directory", async () => {

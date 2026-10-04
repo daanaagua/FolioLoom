@@ -1,9 +1,9 @@
 import OpenCC from "opencc-js";
 
-// OpenCC's direct jp -> cn route can turn already-correct Chinese forms into
-// archaic variants (for example 翻 -> 飜 and 衛 -> 衞). Normalize the small
-// cross-locale orthographic layer first, then run the complete t -> cn
-// dictionary. This is script normalization, not a book-specific glossary.
+// Do not apply jp -> cn to Chinese prose: it reinterprets valid Chinese
+// characters as Japanese shorthand (欠 -> 缺 and 予 -> 豫). Normalize only
+// explicit compatibility glyphs before the complete t -> cn dictionary.
+// This is script normalization, not a book-specific glossary.
 const compatibilityToChinese = OpenCC.CustomConverter([
   ["覇", "霸"],
   ["飜", "翻"],
@@ -13,11 +13,13 @@ const compatibilityToChinese = OpenCC.CustomConverter([
   ["愼", "慎"],
   ["硏", "研"],
   ["晄", "晃"],
+  ["沢", "澤"],
+  ["黒", "黑"],
+  ["竜", "龍"],
 ]);
-const japaneseToChinese = OpenCC.Converter({ from: "jp", to: "cn" });
 const traditionalToSimplified = OpenCC.Converter({ from: "t", to: "cn" });
 const toSimplified = (text: string): string =>
-  traditionalToSimplified(compatibilityToChinese(japaneseToChinese(text)));
+  traditionalToSimplified(compatibilityToChinese(text));
 
 function protectedForms(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))]

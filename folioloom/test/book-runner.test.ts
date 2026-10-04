@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { auditLosslessBookExport } from "../src/report.js";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -636,7 +637,7 @@ test("a missing framed submission is retried as smaller lossless block fragments
   assert.ok(fixture.faux.state.callCount <= 6);
 });
 
-test("a tx8-shaped single block runs typed paragraph fragments before any framed fallback", async () => {
+test("a tx8-shaped single block runs typed paragraph fragments within peak in-flight capacity", async () => {
   const sourceParagraphs = Array.from(
     { length: 23 },
     (_, index) =>
@@ -695,6 +696,8 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
     maxConcurrency: 1,
     maxWindowsPerRequest: 1,
     maxRequestTokens: 4_000,
+    schedulerMode: "active",
+    maxInFlightTokens: 20_000,
     windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
     runtimeSet: {
       mode: "quality",
@@ -723,6 +726,9 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
       .filter((event) =>
         event.type === "reserved" && event.purpose === "translate");
     assert.equal(translationReservations.length, 1);
+    assert.ok(translationReservations[0]!.type === "reserved"
+      && translationReservations[0]!.predictedTokens > 20_000,
+    JSON.stringify(translationReservations));
   } finally {
     store.close();
   }
@@ -2458,11 +2464,11 @@ test("failed wave promotes no anchor knowledge and resume reuses its cached anch
     }),
     fauxAssistantMessage([], {
       stopReason: "error",
-      errorMessage: "503: fixture provider unavailable",
+      errorMessage: "401: fixture provider unauthorized",
     }),
   ]);
 
-  await assert.rejects(runBook(fixture.options as never), /provider unavailable/i);
+  await assert.rejects(runBook(fixture.options as never), /provider unauthorized/i);
   const failedStore = new LosslessBookStore(fixture.options.storePath);
   assert.deepEqual(failedStore.knowledgeRevisions("run-lossless"), []);
   failedStore.close();
@@ -3217,18 +3223,47 @@ test("one malformed typed window preserves its valid sibling while framed fallba
 
 test("lossless provider errors stay retryable and never become human incidents", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
-  fixture.faux.setResponses([fauxAssistantMessage([], {
+  fixture.faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage([], {
     stopReason: "error",
     errorMessage: "503: fixture provider unavailable",
-  })]);
+  })));
 
   await assert.rejects(runBook(fixture.options as never), /provider unavailable/i);
-  assert.equal(fixture.faux.state.callCount, 1);
+  assert.equal(fixture.faux.state.callCount, 3);
   const store = new LosslessBookStore(fixture.options.storePath);
   const status = store.statusSummary("run-lossless");
   store.close();
   assert.equal(status.humanRequiredWindows, 0);
   assert.equal(status.pendingWindows, 2);
+  await assert.rejects(runBook(fixture.options as never), /AUTOMATIC_RECOVERY_PAUSED/u);
+  assert.equal(fixture.faux.state.callCount, 3, "restarting cannot renew exhausted recovery credits");
+});
+
+test("transient translation failure recovers automatically with exact ledger usage", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 unavailable" }), losslessBatchResponse]);
+  const result = await runBook({ ...fixture.options, maxAttempts: 1 } as never);
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(fixture.faux.state.callCount, 2);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    assert.equal(store.recoveryRecords("run-lossless").filter(r => r.state === "claimed").length, 2);
+    const audit = auditLosslessBookExport(store, "run-lossless");
+    assert.equal(audit.scheduler?.tokenUsageComplete, true);
+    assert.equal(audit.audit.strictExportable, true);
+    assert.equal(store.statusSummary("run-lossless").modelCalls, 2);
+    const raw = new DatabaseSync(fixture.options.storePath, { readOnly: true });
+    try {
+      const evidence = raw.prepare("SELECT payload_json FROM events WHERE run_id=? AND kind='provider_response_evidence'").all("run-lossless") as Array<{ payload_json: string }>;
+      const actual = evidence.reduce((n, r) => n + JSON.parse(r.payload_json).usage.totalTokens, 0);
+      const settlements = store.loadTokenLedgerEvents("run-lossless").filter(e => e.type === "settled");
+      assert.ok(actual > 0);
+      assert.ok(settlements.every(e => e.usageComplete));
+      assert.equal(settlements.reduce((n, e) => n + e.actualTokens, 0), actual);
+    } finally { raw.close(); }
+  } finally { store.close(); }
+  await runBook(fixture.options as never);
+  assert.equal(fixture.faux.state.callCount, 2);
 });
 
 test("fast mode retries an invalid physical request with only the escalation runtime", async () => {

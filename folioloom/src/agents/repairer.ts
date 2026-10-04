@@ -2,7 +2,7 @@ import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { ProvisionalSnapshot } from "../domain/provisional-snapshot.js";
-import type { V4Block } from "../domain/types.js";
+import type { StableTerm, V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import { sourceTextForTranslation } from "../source/layout-separators.js";
 import {
@@ -21,6 +21,7 @@ import {
 } from "./pi-runtime.js";
 
 interface RepairInput {
+  stableTerms?: readonly StableTerm[];
   blocks: readonly V4Block[];
   failedCandidate: TranslationCandidate;
   failures: readonly ValidationFailure[];
@@ -43,6 +44,7 @@ export interface RepairOutcome {
 }
 
 export interface BatchRepairInput {
+  stableTerms?: readonly StableTerm[];
   blocks: readonly V4Block[];
   failedCandidate: TranslationCandidate;
   failures: readonly ValidationFailure[];
@@ -77,6 +79,11 @@ export class Repairer {
       ).join("\n\n"),
       "FAILED CANDIDATE",
       JSON.stringify(input.failedCandidate.translations),
+      "ESTABLISHED TERMINOLOGY",
+      JSON.stringify((input.stableTerms ?? []).filter(term => !term.applicableBlockIds || input.blocks.some(b => term.applicableBlockIds!.includes(b.id))).map(term => ({
+        sourceForm: term.sourceForm, target: term.target, locked: term.locked, policy: term.policy,
+        allowedTargets: term.allowedTargets, semanticClass: term.semanticClass, applicableBlockIds: term.applicableBlockIds,
+      }))),
       "NECESSARY PROVISIONAL FACTS",
       JSON.stringify([
         ...input.snapshot.narrativeFacts,
@@ -88,6 +95,7 @@ export class Repairer {
       systemPrompt: [
         "Repair a Chinese literary translation only for the typed validation failures.",
         "Preserve all unaffected meaning and paragraph structure.",
+        "Retain established names and terminology throughout the corrected blocks. Never override locked targets or scoped allowed forms; soft terms remain contextual, not blanket literal substitutions.",
         ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
         "Do not explain. Call submit_repaired_translation exactly once with the smallest sufficient block patch.",
       ].join("\n"),

@@ -106,6 +106,39 @@ function plannerFixture(
   };
 }
 
+test("sequential fragment cost stays in the envelope but only its peak occupies in-flight capacity", () => {
+  const fixture = plannerFixture(1);
+  const fragmented = { ...variant("task-00", "fragmented", { tokens: 131_911 }), inFlightTokens: 70_000 };
+  const input = { ...fixture, variants: [fragmented], maxConcurrency: 1,
+    maxInFlightTokens: 128_000, runBaselineTotalTokens: 150_000 };
+  const result = planRollingHorizon(input);
+  assert.deepEqual(result.firstDispatch, [{ taskId: "task-00", variantId: "fragmented" }]);
+  assert.equal(result.predictedTotalTokens, 131_911);
+  assert.equal(planRollingHorizon({ ...input, runBaselineTotalTokens: 100_000 }).firstDispatch.length, 0);
+});
+
+test("fragmented tasks cannot exceed the sum of simultaneous peak reservations", () => {
+  const fixture = plannerFixture(2);
+  const input = { ...fixture, variants: fixture.variants.map(v => ({ ...v, inFlightTokens: 70 })),
+    maxInFlightTokens: 100 };
+  assert.equal(planRollingHorizon(input).firstDispatch.length, 1);
+  const running = { taskId: "task-00", variantId: fixture.variants[0]!.variantId,
+    remainingP90DurationMs: 100, reservedTokens: 150, inFlightTokens: 70 };
+  const result = planRollingHorizon({ ...input, running: [running], runningReservedTokens: 150,
+    runBaselineTotalTokens: 300 });
+  assert.equal(result.firstDispatch.length, 0);
+  assert.ok(result.actions.every(action => action.startOffsetMs >= 100));
+});
+
+test("Pareto filtering retains a lower-peak variant even when its cumulative cost is higher", () => {
+  const input = { ...plannerFixture(1), maxInFlightTokens: 100, runBaselineTotalTokens: 300,
+    variants: [
+      { ...variant("task-00", "cheap", { tokens: 120 }), inFlightTokens: 120 },
+      { ...variant("task-00", "sequential", { tokens: 150 }), inFlightTokens: 80 },
+    ] };
+  assert.deepEqual(planRollingHorizon(input).firstDispatch, [{ taskId: "task-00", variantId: "sequential" }]);
+});
+
 interface BruteLabel {
   readonly elapsedMs: number;
   readonly tokens: number;

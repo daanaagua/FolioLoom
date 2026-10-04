@@ -11,6 +11,7 @@ import {
 
 import {
   runTranslationBatch,
+  reviewAndRepairTranslationBatchCandidate,
   translationBatchSystemPrompt,
 } from "../src/agents/translation-batch.js";
 import { prepareTranslationRequest } from "../src/agents/translation-request.js";
@@ -98,6 +99,150 @@ function singleWindowRequest(sourceBlocks: readonly LosslessBlock[]): PhysicalRe
     }],
   };
 }
+
+test("supervised recovery handles novel findings once and carries scoped terms into repair", async () => {
+  const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
+  const req = singleWindowRequest(source);
+  const candidate = { windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed" as const,
+    translations: [{ blockId: "b", text: "守门人进入了高塔，把门关上。" }], termUsages: [], notes: [], memoryCandidates: [] };
+  const faux = fauxProvider();
+  const prompts: string[] = [];
+  faux.setResponses(["守塔人走进高塔，把门关上。", "守塔人走进高塔，关好了大门。"].map(text => (context: Context) => {
+    prompts.push(promptText(context));
+    return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", { translations: [{ blockId: "b", text }], notes: [] }), { stopReason: "toolUse" });
+  }));
+  let reviews = 0;
+  const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source,
+    stableTerms: [{ conceptId: "keeper", lexemeId: "keeper", sourceForm: "keeper", canonicalSource: "keeper", target: "守塔人", locked: false }],
+    snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger({ repairTurns: 2 }), semanticRepairPasses: 2,
+    reviewCandidate: async () => ++reviews <= 2 ? [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true, message: `finding-${reviews}`, issueKey: `issue-${reviews}` }] : [],
+  }, { windows: [candidate], responseErrors: [] });
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(reviews, 3);
+  assert.equal(result.repairRuns.length, 2);
+  for (const prompt of prompts) assert.match(prompt, /ESTABLISHED TERMINOLOGY[\s\S]*守塔人/u);
+});
+
+test("supervised recovery never spends an extra pass on repeated findings", async () => {
+  const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
+  const req = singleWindowRequest(source);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+    translations: [{ blockId: "b", text: "守门人走进了高塔，关上那扇门。" }], notes: [],
+  }), { stopReason: "toolUse" })]);
+  const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source, stableTerms: [],
+    snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger({ repairTurns: 2 }), semanticRepairPasses: 2,
+    reviewCandidate: async () => [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true, message: "the same unresolved issue", issueKey: "same" }],
+  }, { responseErrors: [], windows: [{ windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed",
+    translations: [{ blockId: "b", text: "守门人进入了高塔，把门关上。" }], termUsages: [], notes: [], memoryCandidates: [] }] });
+  assert.equal(result.windows[0]?.status, "failed");
+  assert.equal(faux.state.callCount, 1);
+});
+
+test("standard delivery preserves a complete candidate with unresolved semantic issues only", async () => {
+  const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
+  const req = singleWindowRequest(source);
+  for (const deliveryMode of ["standard", "strict"] as const) {
+    const faux = fauxProvider();
+    const issue = { code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true, message: "The gate may be a door.", issueKey: "gate" };
+    const candidate = { windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed" as const,
+      translations: [{ blockId: "b", text: "守门人走进高塔，关上了大门。" }], termUsages: [], notes: [],
+      memoryCandidates: [{ kind: "fact", subject: "keeper", fact: "uncertain" }] as any[] };
+    const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source, stableTerms: [],
+      snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+      budget: new BudgetLedger(), deliveryMode, repairEnabled: false, reviewCandidate: async () => [issue],
+    }, { windows: [candidate], responseErrors: [] });
+    assert.equal(faux.state.callCount, 0);
+    assert.equal(result.windows[0]?.status, deliveryMode === "standard" ? "completed_with_warnings" : "failed");
+    assert.deepEqual(result.windows[0]?.translations, deliveryMode === "standard" ? candidate.translations : []);
+    assert.deepEqual(result.windows[0]?.memoryCandidates, []);
+    assert.deepEqual(result.windows[0]?.qualityIssues, deliveryMode === "standard" ? [issue] : undefined);
+  }
+});
+
+test("standard delivery never converts structural or locked-term failure into a quality warning", async () => {
+  const faux = fauxProvider();
+  const result = await reviewAndRepairTranslationBatchCandidate({ request: { ...request, windows: [request.windows[0]!] }, blocks,
+    stableTerms: [{ conceptId: "alpha", lexemeId: "alpha", sourceForm: "Alpha", canonicalSource: "Alpha", target: "阿尔法", locked: true }],
+    snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(), deliveryMode: "standard", repairEnabled: false,
+    reviewCandidate: async () => [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "block-0", repairable: true, message: "Uncertain name" }],
+  }, { windows: [{ windowId: "window-0", ordinal: 0, status: "completed", translations: [{ blockId: "block-0", text: "错误译名。" }],
+    termUsages: [], notes: [], memoryCandidates: [] }], responseErrors: [] });
+  assert.equal(result.windows[0]?.status, "failed");
+  assert.equal(result.windows[0]?.qualityIssues, undefined);
+});
+
+test("standard delivery defers repeated semantic findings after one unsuccessful repair", async () => {
+  const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
+  const req = singleWindowRequest(source);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+    translations: [{ blockId: "b", text: "看守走进高塔，关上了大门。" }], notes: [],
+  }), { stopReason: "toolUse" })]);
+  const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source, stableTerms: [],
+    snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger({ repairTurns: 2 }), deliveryMode: "standard", semanticRepairPasses: 2,
+    reviewCandidate: async () => [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true, message: "Uncertain keeper", issueKey: "same" }],
+  }, { windows: [{ windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed", translations: [{ blockId: "b", text: "守门人走进高塔，关上了大门。" }],
+    termUsages: [], notes: [], memoryCandidates: [] }], responseErrors: [] });
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed_with_warnings");
+  assert.equal(result.windows[0]?.translations[0]?.text, "看守走进高塔，关上了大门。");
+  assert.equal(result.windows[0]?.qualityIssues?.length, 1);
+});
+
+test("fresh semantic findings cannot extend recovery beyond two repair passes", async () => {
+  const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
+  const req = singleWindowRequest(source);
+  const faux = fauxProvider();
+  faux.setResponses(["守塔人走进了高塔，关上那扇门。", "守塔人进入高塔，把大门关好了。"].map(text =>
+    fauxAssistantMessage(fauxToolCall("submit_repaired_translation", { translations: [{ blockId: "b", text }], notes: [] }), { stopReason: "toolUse" })));
+  let reviews = 0;
+  const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source, stableTerms: [],
+    snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger({ repairTurns: 2 }), semanticRepairPasses: 2,
+    reviewCandidate: async () => [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true, message: "new issue", issueKey: `issue-${++reviews}` }],
+  }, { responseErrors: [], windows: [{ windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed",
+    translations: [{ blockId: "b", text: "守门人进入了高塔，把门关上。" }], termUsages: [], notes: [], memoryCandidates: [] }] });
+  assert.equal(result.windows[0]?.status, "failed");
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(reviews, 3);
+  assert.equal(result.repairRuns.length, 2);
+});
+
+test("standard delivery rejects a noncompliant semantic repair and retains the last reviewed valid candidate", async () => {
+  const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
+  const req = singleWindowRequest(source);
+  const original = "守门人进入了高塔，把门关上。";
+  const issue = { code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true,
+    message: "The keeper may be a named character.", issueKey: "keeper-name" };
+  for (const deliveryMode of ["standard", "strict"] as const) {
+    const faux = fauxProvider();
+    const saved: string[] = [];
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: [{ blockId: "b", text: "Keeper进入了高塔，把门关上。" }], notes: [],
+    }), { stopReason: "toolUse" })]);
+    let reviews = 0;
+    const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source, stableTerms: [],
+      snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+      budget: new BudgetLedger(), deliveryMode, semanticRepairPasses: 2,
+      reviewCandidate: async () => { reviews++; return [issue]; },
+      onCandidate: candidate => { saved.push(candidate.translations[0]!.text); },
+    }, { responseErrors: [], windows: [{ windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed",
+      translations: [{ blockId: "b", text: original }], termUsages: [], notes: [], memoryCandidates: [] }] });
+    assert.equal(result.windows[0]?.status, deliveryMode === "standard" ? "completed_with_warnings" : "failed");
+    assert.deepEqual(result.windows[0]?.translations, deliveryMode === "standard" ? [{ blockId: "b", text: original }] : []);
+    assert.deepEqual(result.windows[0]?.qualityIssues, deliveryMode === "standard" ? [issue] : undefined);
+    assert.equal(result.repairRuns.length, 1);
+    assert.ok(result.repairRuns[0]!.usage.totalTokens > 0);
+    assert.equal(reviews, 1);
+    assert.deepEqual(saved, [], "invalid repairs must not replace the durable valid candidate");
+  }
+});
 
 test("a rejected repair response retains its real usage and an auth failure stops the run", async () => {
   for (const errorMessage of ["invalid JSON tool call", "401 Unauthorized"]) {

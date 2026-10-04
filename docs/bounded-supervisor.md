@@ -45,7 +45,7 @@ style and guidance dependencies match. Snapshot ancestry alone does not invalida
 unchanged knowledge projection. A source or meaningful context change can require a new
 candidate. Cross-request validation rejection explicitly discards a reusable candidate.
 
-Semantic repair credit is durable across restarts. An unchanged repair or an exhausted
+Semantic repair credit is durable across restarts. In strict mode, an unchanged repair or an exhausted
 credit pauses the supervised checkpoint, preserving the candidate. The existing explicit
 release command permits another bounded repair after its cause has been addressed; it
 does not automatically retranslate the window or waive review.
@@ -62,6 +62,13 @@ New native CLI runs default to `bounded`. Use `--supervisor off` when intentiona
 selecting the deterministic stage-only workflow. Existing runs preserve their recorded
 mode; enabling supervision on an old run requires a new run. Do not combine `bounded`
 with `--worker codex` or `--worker external`.
+
+New runs use `--delivery-mode standard` by default: complete text and a quality report.
+Grounded semantic findings that remain after bounded repair enter a durable queue while
+translation continues. The book-end pass rechecks them with current terminology; remaining
+findings accompany delivery. Choose `--delivery-mode strict` to require all reviews to pass.
+Existing runs retain their recorded delivery policy; an explicit mode change is recorded.
+Both modes require complete coverage, valid provenance, converged knowledge and real usage.
 
 `--task-context-file` is optional. It contains caller-supplied purpose/background in
 UTF-8, up to 16000 characters. The context precedes the existing system instructions
@@ -88,10 +95,24 @@ model request nor relaxes any validation. A subsequent normal run command resume
 
 ## Desktop
 
-The new-run screen offers **Pi 主 agent 监督** and **任务背景前缀**. The selected mode and
+The new-run screen offers **交付模式**, **Pi 主 agent 监督** and **任务背景前缀**. The selected mode and
 private prefix are saved with that run and restored on resume. Older runs keep the
 stage-only policy. Changing a model, task context or supervisor policy cannot silently
 alter an existing run's identity.
+
+## Scoped reuse and bounded overlap
+
+Plan caches include the terminology visible to their source windows, and batch plans
+persist a dependency fingerprint for each window. Changes outside that projection do
+not request another decision; changed local constraints invalidate the affected scope.
+Candidate identity and all review-coverage checks still apply. Legacy cache identities
+are conservatively refreshed on first use without releasing explicit pauses.
+
+Independent windows may be reviewed concurrently, up to three operations and never
+above the run's configured concurrency. An overlapping plan or another review of the
+same window waits in scope order. Concurrent duplicate requests reuse the first valid
+receipt instead of spending another review credit. The default reasoning level and
+the chosen review policy are not reduced by these optimizations.
 
 ## Protocol and accounting
 

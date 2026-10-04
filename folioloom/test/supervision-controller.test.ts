@@ -6,21 +6,142 @@ import { AdmissionController } from "../src/fullbook/admission-controller.js";
 import { TokenLedger } from "../src/fullbook/token-ledger.js";
 import { type SupervisionRecord, summarizeSupervision } from "../src/domain/supervision.js";
 import { evidenceReferences } from "../src/domain/evidence-reference.js";
+import { AutomaticRecovery, type RecoveryRecord } from "../src/fullbook/automatic-recovery.js";
 
-function fixture(options: { sourceText?: string; contextWindow?: number } = {}) {
+function fixture(options: { sourceText?: string; contextWindow?: number; maxConcurrency?: number } = {}) {
   const faux = fauxProvider();
   const records: SupervisionRecord[] = [];
+  const recoveries: RecoveryRecord[] = [];
   const ledger = TokenLedger.create({ mode: "off", profile: "balanced", tokenIncreaseCap: 0.1, enforceDispatchLifecycle: true });
   const controller = new SupervisionController({
+    maxConcurrency: options.maxConcurrency,
     runId: "run", sourceVersion: "source", windows: [{ windowId: "w1", ordinal: 0, blockIds: ["b1"] }, { windowId: "w2", ordinal: 1, blockIds: ["b2"] }],
     sources: [{ blockId: "b1", globalIndex: 0, sourceText: options.sourceText ?? "He did not leave." }, { blockId: "b2", globalIndex: 1, sourceText: options.sourceText ?? "He waited." }],
     runtime: { model: { ...faux.getModel(), ...(options.contextWindow ? { contextWindow: options.contextWindow } : {}) }, streamFn: faux.provider.streamSimple.bind(faux.provider) },
     admission: new AdmissionController({ ledger, mode: "off", persist: event => ledger.apply(event) }),
+    recovery: new AutomaticRecovery({ runId: "run", store: { recoveryRecords: () => recoveries,
+      appendRecoveryRecord: (_run, record) => { recoveries.push(record); } }, sleep: async () => {} }),
     store: { supervisionRecords: () => structuredClone(records), appendSupervisionRecord: (_run, r) => { records.push(structuredClone(r)); } },
   });
-  return { faux, records, ledger, controller };
+  return { faux, records, recoveries, ledger, controller };
 }
 const plan = { action: "translate", windowIds: ["w1", "w2"], reviewBlockIds: ["b1"], guidance: [], issues: [], reason: "审校否定。" };
+
+test("independent reviews overlap while duplicate review shares the completed receipt", { timeout: 3000 }, async () => {
+  const f = fixture({ maxConcurrency: 2 });
+  const release = Promise.withResolvers<void>();
+  const bothStarted = Promise.withResolvers<void>();
+  let active = 0, peak = 0;
+  const review = async (context: import("@earendil-works/pi-ai").Context) => {
+    const message = context.messages.findLast(m => m.role === "user")!;
+    const content = typeof message.content === "string" ? message.content
+      : message.content.filter(c => c.type === "text").map(c => c.text).join("\n");
+    const data = JSON.parse(content);
+    active++; peak = Math.max(peak, active);
+    if (active === 2) bothStarted.resolve();
+    await release.promise;
+    active--;
+    return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", {
+      ...plan, action: "accept", windowIds: data.windows.map((w: { windowId: string }) => w.windowId), reviewBlockIds: [],
+    }), { stopReason: "toolUse" });
+  };
+  f.faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", { ...plan, reviewBlockIds: ["b1", "b2"] }), { stopReason: "toolUse" }), review, review]);
+  await f.controller.planFor("w1", []);
+  const first = f.controller.review("w1", [{ blockId: "b1", text: "他没有离开。" }], []);
+  const duplicate = f.controller.review("w1", [{ blockId: "b1", text: "他没有离开。" }], []);
+  const second = f.controller.review("w2", [{ blockId: "b2", text: "他等着。" }], []);
+  await bothStarted.promise;
+  assert.equal(f.faux.state.callCount, 3);
+  release.resolve();
+  await Promise.all([first, duplicate, second]);
+  assert.equal(peak, 2);
+  assert.equal(f.faux.state.callCount, 3);
+  assert.ok(f.ledger.reconcile().consistent);
+  assert.equal(f.ledger.state().spentTokens, f.records.reduce((n, r) => n + (r.totalTokens ?? 0), 0));
+});
+
+test("unrelated terminology cannot invalidate a cached plan or accepted review", async () => {
+  const f = fixture();
+  const accept = { ...plan, action: "accept", windowIds: ["w1"], reviewBlockIds: [] };
+  f.faux.setResponses([plan, accept].map(value => fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", value), { stopReason: "toolUse" })));
+  const terms = [{ sourceForm: "He", target: "他" }];
+  await f.controller.planFor("w1", terms);
+  const candidate = [{ blockId: "b1", text: "他并没有离开。" }];
+  await f.controller.review("w1", candidate, terms);
+  const changed = [...terms, { sourceForm: "Distant City", target: "远城", locked: true }];
+  assert.equal((await f.controller.planFor("w2", changed)).action, "translate");
+  assert.deepEqual(await f.controller.review("w1", candidate, changed), []);
+  assert.equal(f.faux.state.callCount, 2);
+  assert.deepEqual(summarizeSupervision("bounded", f.records, [{ windowId: "w1", blockIds: ["b1"], status: "completed" }], candidate).pendingReviewWindowIds, []);
+});
+
+test("a sibling's terminology change invalidates its plan without invalidating an unchanged window's review", async () => {
+  const f = fixture();
+  const accept = { ...plan, action: "accept", windowIds: ["w1"], reviewBlockIds: [] };
+  f.faux.setResponses([plan, accept, { ...plan, windowIds: ["w2"], reviewBlockIds: ["b2"] }].map(value => fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", value), { stopReason: "toolUse" })));
+  await f.controller.planFor("w1", []);
+  const candidate = [{ blockId: "b1", text: "他并没有离开。" }];
+  await f.controller.review("w1", candidate, []);
+  const terms = [{ sourceForm: "waited", target: "等待", applicableBlockIds: ["b2"] }];
+  await f.controller.planFor("w2", terms);
+  assert.deepEqual(await f.controller.review("w1", candidate, terms), []);
+  assert.equal(f.faux.state.callCount, 3);
+  assert.deepEqual(summarizeSupervision("bounded", f.records, [{ windowId: "w1", blockIds: ["b1"], status: "completed" }], candidate).pendingReviewWindowIds, []);
+});
+
+test("supervisor retries a transient provider response within the original attempt and token envelope", async () => {
+  const f = fixture();
+  f.faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 service unavailable" }),
+    fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" })]);
+  assert.equal((await f.controller.planFor("w1", [])).action, "translate");
+  assert.equal(f.faux.state.callCount, 2);
+  assert.equal(f.recoveries.filter(r => r.action === "supervisor_retry").length, 1);
+  assert.equal(f.ledger.state().spentTokens, f.records.reduce((n, r) => n + (r.totalTokens ?? 0), 0));
+  assert.ok(f.ledger.reconcile().consistent);
+});
+
+test("missing supervisor receipt receives one automatic protocol retry with exact accounting", async () => {
+  const f = fixture();
+  f.faux.setResponses([fauxAssistantMessage("I checked the passage."),
+    fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" })]);
+  assert.equal((await f.controller.planFor("w1", [])).action, "translate");
+  assert.equal(f.faux.state.callCount, 2);
+  assert.equal(f.records.filter(record => record.state === "failed").length, 1);
+  assert.equal(f.ledger.state().spentTokens, f.records.reduce((sum, record) => sum + (record.totalTokens ?? 0), 0));
+  assert.ok(f.ledger.reconcile().consistent);
+});
+
+test("repeated missing supervisor receipts exhaust the existing checkpoint budget", async () => {
+  const f = fixture();
+  f.faux.setResponses([fauxAssistantMessage("No receipt."), fauxAssistantMessage("Still no receipt.")]);
+  await assert.rejects(() => f.controller.planFor("w1", []), /SUPERVISION_EXECUTION_FAILED/u);
+  assert.equal(f.faux.state.callCount, 2);
+  await assert.rejects(() => f.controller.planFor("w1", []), /SUPERVISION_PAUSED/u);
+  assert.equal(f.faux.state.callCount, 2);
+});
+
+test("final review refreshes changed terminology without inheriting stale approval", async () => {
+  const f = fixture();
+  const accept = { ...plan, action: "accept", windowIds: ["w1"], reviewBlockIds: [] };
+  f.faux.setResponses([plan, accept].map(value => fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", value), { stopReason: "toolUse" })));
+  await f.controller.planFor("w1", [{ sourceForm: "He", target: "他" }]);
+  const candidate = [{ blockId: "b1", text: "旅人没有离开。" }];
+  await f.controller.reviewFinal("a".repeat(64), "w1", candidate, [{ sourceForm: "He", target: "旅人" }]);
+  assert.deepEqual(summarizeSupervision("bounded", f.records, [{ windowId: "w1", blockIds: ["b1"], status: "completed" }], candidate).pendingReviewWindowIds, []);
+});
+
+test("releasing an ordinary pause cannot replenish a final-review epoch", async () => {
+  const f = fixture();
+  const itemId = "b".repeat(64);
+  const accept = { ...plan, action: "accept", windowIds: ["w1"], reviewBlockIds: [] };
+  f.faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", accept), { stopReason: "toolUse" })));
+  for (const text of ["他没有离开。", "他一直没有离开。", "他并没有离开。"]) await f.controller.reviewFinal(itemId, "w1", [{ blockId: "b1", text }], []);
+  assert.equal(f.controller.canReview("w1", itemId), false);
+  f.records.push({ id: "release", key: "unrelated-pause", event: "review", state: "released", windowIds: ["w1"], inputHash: "a".repeat(64) });
+  assert.equal(f.controller.canReview("w1", itemId), false);
+  await assert.rejects(() => f.controller.reviewFinal(itemId, "w1", [{ blockId: "b1", text: "旅人没有离开。" }], []), /SUPERVISION_PAUSED/u);
+  assert.equal(f.faux.state.callCount, 3);
+});
 
 test("batch approvals survive a new controller and do not generate another model call", async () => {
   const f = fixture();

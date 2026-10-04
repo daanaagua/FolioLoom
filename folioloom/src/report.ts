@@ -17,6 +17,8 @@ import type { LosslessBookStore } from "./storage/lossless-book-store.js";
 import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
 import { optimizationPolicy } from "./fullbook/optimization-policy.js";
 import { summarizeSupervision, supervisionMetadata, type SupervisionSummary } from "./domain/supervision.js";
+import { supervisionCandidateHash } from "./domain/supervision.js";
+import { QualityQueue, type QualityRecord, type DeliveryMode } from "./fullbook/delivery-policy.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -95,6 +97,8 @@ export interface BookArtifactPaths {
 }
 
 export interface LosslessBookArtifactPaths extends BookArtifactPaths {
+  qualityReport?: string;
+  qualityText?: string;
   translationLineage: string;
   bilingualLineage: string;
   auditLineage: string;
@@ -109,6 +113,8 @@ export interface LosslessBookLineageBlock {
 }
 
 export interface LosslessBookLineage {
+  deliveryMode?: DeliveryMode;
+  qualityReportHash?: string;
   schema: "v5-book-lineage-1";
   runId: string;
   sourceVersion: string;
@@ -169,6 +175,9 @@ export interface LosslessBookAuditReport {
   structurallyComplete: boolean;
   knowledgeConverged: boolean;
   strictExportable: boolean;
+  deliveryMode: DeliveryMode;
+  deliveryReady: boolean;
+  quality: { pending: number; resolved: number; unresolved: number };
   revalidation: {
     pending: number;
     validating: number;
@@ -200,6 +209,8 @@ const KNOWLEDGE_CONVERGENCE_INCIDENTS = new Set([
   "PENDING_TERM_IMPACT",
   "TERM_RETROFIT_INCOMPLETE",
   "TERM_RETROFIT_INTEGRITY_INVALID",
+  "QUALITY_REVIEW_PENDING",
+  "QUALITY_UNRESOLVED",
 ]);
 
 function sha256(text: string): string {
@@ -566,7 +577,28 @@ export function auditLosslessBookStore(
   const incidentCodes = [...new Set(incidents)].sort();
   const supervisionComplete = supervision === undefined || (!supervision.paused.length && !supervision.pendingReviewWindowIds.length
     && !incidents.includes("SUPERVISION_POLICY_INVALID"));
-  const strictExportable = structurallyComplete && knowledgeConverged && supervisionComplete;
+  let qualityItems: QualityRecord[] = [];
+  let deliveryMode: DeliveryMode = "strict";
+  try {
+    deliveryMode = store.deliveryMode(runId) ?? "strict";
+    qualityItems = new QualityQueue(runId, store).items();
+    const active = store.activeTranslations(runId);
+    for (const item of qualityItems) {
+      if (!windowById.has(item.windowId) || item.issues.some(issue => membershipByBlock.get(issue.blockId ?? "") !== item.windowId)
+        || (["resolved", "unresolved"].includes(item.state) && item.candidateHash !== supervisionCandidateHash(active.filter(t => t.windowId === item.windowId)))) {
+        incidents.push("QUALITY_EVIDENCE_INVALID");
+      }
+    }
+  } catch { incidents.push("QUALITY_EVIDENCE_INVALID"); }
+  const quality = { pending: qualityItems.filter(item => ["pending", "reviewing", "blocked"].includes(item.state)).length,
+    resolved: qualityItems.filter(item => item.state === "resolved").length, unresolved: qualityItems.filter(item => item.state === "unresolved").length };
+  if (quality.pending) incidents.push("QUALITY_REVIEW_PENDING");
+  if (quality.unresolved) incidents.push("QUALITY_UNRESOLVED");
+  const strictExportable = structurallyComplete && knowledgeConverged && supervisionComplete && !quality.pending && !quality.unresolved
+    && !incidents.includes("QUALITY_EVIDENCE_INVALID");
+  const documentedReviews = supervision?.pendingReviewWindowIds.every(id => qualityItems.some(item => item.windowId === id && item.state === "unresolved")) ?? true;
+  const deliveryReady = structurallyComplete && knowledgeConverged && !quality.pending && documentedReviews
+    && incidents.every(code => code === "SUPERVISION_REVIEW_PENDING" || code === "QUALITY_UNRESOLVED");
   return {
     ...(supervision === undefined ? {} : { supervision }),
     schema: "v5-book-store-audit-1",
@@ -580,13 +612,14 @@ export function auditLosslessBookStore(
     structurallyComplete,
     knowledgeConverged,
     strictExportable,
+    deliveryMode, deliveryReady, quality,
     revalidation,
     controlPlane,
     totalBlockCount: blocks.length,
     translatedBlockCount: translatedBlockIds.size,
     missingBlockIds,
     missingBlockCount: missingBlockIds.length,
-    incidentCodes,
+    incidentCodes: [...new Set([...incidentCodes, ...incidents])].sort(),
   };
 }
 
@@ -622,6 +655,28 @@ export function losslessBookLineage(
   };
 }
 
+export function qualityReportJson(store: LosslessBookStore, runId: string): string {
+  const sourceVersion = store.auditState(runId).sourceVersion;
+  return `${JSON.stringify({ schema: "folioloom-quality-report-1", runId, sourceVersion,
+    items: new QualityQueue(runId, store).items() }, null, 2)}\n`;
+}
+
+export function qualityReportText(store: LosslessBookStore, runId: string): string {
+  const items = new QualityQueue(runId, store).items();
+  const unresolved = items.filter(item => item.state !== "resolved");
+  return ["译文疑点清单", `未解决：${unresolved.length}；已解决：${items.length - unresolved.length}`, "",
+    ...unresolved.flatMap((item, index) => [`${index + 1}. ${item.windowId}`, `状态：${item.state}`,
+      ...item.issues.map(issue => `[${issue.blockId}] ${issue.message}`), ""])].join("\n") + "\n";
+}
+
+export function deliveryLineage(store: LosslessBookStore, runId: string, mode?: DeliveryMode): LosslessBookLineage {
+  const audit = auditLosslessBookExport(store, runId).audit;
+  const selected = mode ?? audit.deliveryMode;
+  const lineage = losslessBookLineage(store, runId);
+  return selected === "standard" ? { ...lineage, complete: audit.deliveryReady, deliveryMode: "standard",
+    qualityReportHash: sha256(qualityReportJson(store, runId)) } : { ...lineage, complete: audit.complete };
+}
+
 function lineageFileName(artifactFileName: string): string {
   return `${artifactFileName.replace(/\.(?:txt|json)$/u, "")}.lineage.json`;
 }
@@ -630,6 +685,7 @@ export function losslessBookArtifactPaths(
   outputDirectory: string,
   complete: boolean,
   fileStem?: string,
+  deliveryMode?: DeliveryMode,
 ): LosslessBookArtifactPaths {
   const names = fileStem === undefined
     ? bookArtifactFileNames(complete)
@@ -642,6 +698,8 @@ export function losslessBookArtifactPaths(
     translationLineage: join(outputDirectory, lineageFileName(names.translation)),
     bilingualLineage: join(outputDirectory, lineageFileName(names.bilingual)),
     auditLineage: join(outputDirectory, lineageFileName(names.audit)),
+    ...(deliveryMode === "standard" ? { qualityReport: join(outputDirectory, names.translation.replace(/\.txt$/u, ".quality.json")),
+      qualityText: join(outputDirectory, names.translation.replace(/\.txt$/u, ".quality.txt")) } : {}),
   };
 }
 
@@ -675,6 +733,7 @@ export function losslessBookTranslations(
 }
 
 export interface WriteLosslessBookArtifactsOptions {
+  deliveryMode?: DeliveryMode;
   allowIncomplete?: boolean;
   fileStem?: string;
   scheduler?: SchedulerRunReport;
@@ -883,6 +942,7 @@ export function auditLosslessBookExport(
       ...baseAudit,
       complete: strictExportable,
       strictExportable,
+      deliveryReady: baseAudit.deliveryReady && ledgerIncidents.length === 0,
       incidentCodes,
     },
     scheduler,
@@ -901,13 +961,15 @@ export function writeLosslessBookArtifacts(
     options.scheduler,
   );
   const audit = projection.audit;
+  const deliveryMode = options.deliveryMode ?? audit.deliveryMode;
+  const deliverable = deliveryMode === "standard" ? audit.deliveryReady : audit.strictExportable;
   const integrityIncidents = audit.incidentCodes.filter((code) =>
     !KNOWLEDGE_CONVERGENCE_INCIDENTS.has(code)
     && !TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
   if (integrityIncidents.length > 0) {
     throw new Error(`lossless export audit failed: ${integrityIncidents.join(",")}`);
   }
-  if (!options.allowIncomplete && !audit.strictExportable) {
+  if (!options.allowIncomplete && !deliverable) {
     const ledgerIncidents = audit.incidentCodes.filter((code) =>
       TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
     if (ledgerIncidents.length > 0) {
@@ -928,7 +990,13 @@ export function writeLosslessBookArtifacts(
   }
   const translations = losslessBookTranslations(store, runId);
   mkdirSync(outputDirectory, { recursive: true });
-  const paths = losslessBookArtifactPaths(outputDirectory, audit.complete, options.fileStem);
+  const paths = losslessBookArtifactPaths(outputDirectory, deliverable, options.fileStem);
+  if (deliveryMode === "standard") {
+    paths.qualityReport = paths.translation.replace(/\.txt$/u, ".quality.json");
+    paths.qualityText = paths.translation.replace(/\.txt$/u, ".quality.txt");
+    writeFileSync(paths.qualityReport, qualityReportJson(store, runId), "utf8");
+    writeFileSync(paths.qualityText, qualityReportText(store, runId), "utf8");
+  }
   writeFileSync(paths.translation, renderTranslation(translations, {
     includeChapterMetadata: false,
   }), "utf8");
@@ -946,6 +1014,9 @@ export function writeLosslessBookArtifacts(
     structurallyComplete: audit.structurallyComplete,
     knowledgeConverged: audit.knowledgeConverged,
     strictExportable: audit.strictExportable,
+    deliveryMode,
+    deliveryReady: audit.deliveryReady,
+    quality: audit.quality,
     revalidation: audit.revalidation,
     controlPlane: audit.controlPlane,
     missingBlockIds: audit.missingBlockIds,
@@ -955,8 +1026,7 @@ export function writeLosslessBookArtifacts(
     scheduler: schedulerMetricsProjection(schedulerReport),
   }, null, 2)}\n`, "utf8");
   const lineageJson = `${JSON.stringify({
-    ...losslessBookLineage(store, runId),
-    complete: audit.complete,
+    ...deliveryLineage(store, runId, deliveryMode),
   }, null, 2)}\n`;
   writeFileSync(paths.translationLineage, lineageJson, "utf8");
   writeFileSync(paths.bilingualLineage, lineageJson, "utf8");

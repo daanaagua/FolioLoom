@@ -6,13 +6,13 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.8.1**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.9.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-v1.8.1 strengthens native Pi supervision with host-issued evidence references, durable candidate checkpoints, restart-safe repair limits and dependency-aware review caching. Existing runs keep their recorded backend and supervision policy. See the [release notes](docs/releases/v1.8.1.md) and [reliability contracts](docs/reliability.md).
+v1.9.0 adds complete delivery with a quality-issue report, durable operational recovery, scoped supervision caches, compact terminology payloads and bounded parallel review. Existing runs keep their recorded backend and supervision policy. See the [release notes](docs/releases/v1.9.0.md) and [reliability contracts](docs/reliability.md).
 
 - ✓ **Partial mitigation for DeepSeek's mistaken copyright refusals:** caller-supplied source and usage context can now accompany translation, research, repair and supervision through the desktop task-context field or `--task-context-file`. Clear, truthful context helps address refusals based on unsupported assumptions about the task. This is a prompt-context correction, not a change to DeepSeek's policies or a guarantee against future refusals; it does not infer rights or invent authorization.
 
-## What v1.8.1 can do
+## What v1.9.0 can do
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Use embedded Pi to approve bounded batches, query source evidence, review selected candidates and request grounded repairs, while the kernel retains budgets, validation and commits.
@@ -197,9 +197,9 @@ In the application:
 2. Select a model provider and enter your API key, model name, and raw effort value.
 3. Test the connection, then run a single-fragment trial translation.
 4. Choose quality or fast mode under Translation Run and start the full book. A run can be paused safely and resumed after restarting the app.
-5. Once the translation is complete and the audit passes, export Chinese TXT, bilingual TXT, EPUB, or all three.
+5. Once the translation is complete and the delivery audit passes, export Chinese TXT, bilingual TXT, EPUB, or all three, with a quality report. Choose strict delivery to require every requested semantic review to pass.
 
-API keys never enter the project, logs, UI return values, or installer. When Windows system encryption is available, keys are stored through Electron `safeStorage`; otherwise, they remain only for the current application session. Trial translation always uses one serial window. Full-book runs commit progress and translations to the manuscript's own SQLite state store without modifying the source file. Pausing or closing the app first cancels the active model request and waits for persistent state to settle; resuming preserves the run's model strategy. Export accepts only complete runs that pass strict validation and retains traceable lineage for TXT and EPUB output.
+API keys never enter the project, logs, UI return values, or installer. When Windows system encryption is available, keys are stored through Electron `safeStorage`; otherwise, they remain only for the current application session. Trial translation always uses one serial window. Full-book runs commit progress and translations to the manuscript's own SQLite state store without modifying the source file. Pausing or closing the app first cancels the active model request and waits for persistent state to settle; resuming preserves the run's model strategy. Standard delivery includes complete text and remaining semantic findings; strict delivery requires all reviews to pass. Both modes enforce complete coverage, provenance, knowledge convergence and reconciled usage, and retain traceable lineage for TXT and EPUB output.
 
 When a trial fails, export diagnostic JSON from the error panel or the persistent entry in the sidebar. Strict privacy mode retains only the version, run stage, status, counts, error codes, and redacted error chain. It excludes API keys, Authorization headers, source text, translations, prompts, raw model responses, and complete private paths.
 

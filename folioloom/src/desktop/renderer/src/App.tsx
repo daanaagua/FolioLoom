@@ -477,7 +477,7 @@ export function App({ api }: AppProps): JSX.Element {
 
   async function startFullBook(
     optimizationProfile: DesktopOptimizationProfile,
-    executionOptions: { supervisorMode?: "bounded" | "off"; taskContext?: string } = {},
+    executionOptions: { supervisorMode?: "bounded" | "off"; taskContext?: string; deliveryMode?: "standard" | "strict" } = {},
   ): Promise<void> {
     setBusyAction("start-fullbook");
     setFullBookError(undefined);

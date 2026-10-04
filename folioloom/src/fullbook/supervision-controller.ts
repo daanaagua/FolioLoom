@@ -6,6 +6,9 @@ import { SUPERVISION_POLICY, supervisionCandidateHash, supervisionHash, type Sup
 import type { ValidationFailure } from "../tools/repair-tools.js";
 import type { AdmissionController } from "./admission-controller.js";
 import type { TranslationRuntime } from "./types.js";
+import type { AutomaticRecovery } from "./automatic-recovery.js";
+import { ScopedOperationQueue } from "./scoped-operation-queue.js";
+import { canonicalJson } from "../knowledge/knowledge-store.js";
 
 export class SupervisionPausedError extends Error {
   readonly code = "SUPERVISION_PAUSED";
@@ -31,6 +34,8 @@ interface SupervisionJournal {
   appendSupervisionRecord(runId: string, record: SupervisionRecord): void;
 }
 export interface SupervisionControllerOptions {
+  recovery?: AutomaticRecovery;
+  maxConcurrency?: number;
   runId: string;
   sourceVersion: string;
   windows: readonly SupervisorWindow[];
@@ -45,23 +50,22 @@ export interface SupervisionControllerOptions {
 
 /** The controller authorizes work; only the host kernel can execute/commit it. */
 export class SupervisionController {
-  #serial: Promise<unknown> = Promise.resolve();
-  constructor(private readonly options: SupervisionControllerOptions) {}
+  readonly #operations: ScopedOperationQueue;
+  constructor(private readonly options: SupervisionControllerOptions) {
+    this.#operations = new ScopedOperationQueue(options.maxConcurrency ?? 1);
+  }
 
   #records(): SupervisionRecord[] { return this.options.store.supervisionRecords(this.options.runId); }
-  #dependencyHash(terms: SupervisorInput["terms"]): string {
-    return supervisionHash({ protocol: SUPERVISOR_PROTOCOL, sourceVersion: this.options.sourceVersion, terms });
+  #dependencyHash(terms: SupervisorInput["terms"], windows: readonly SupervisorWindow[]): string {
+    return supervisionHash({ schema: "scoped-supervision-dependencies-1", protocol: SUPERVISOR_PROTOCOL,
+      sourceVersion: this.options.sourceVersion, windows: windows.map(w => ({ windowId: w.windowId, blockIds: w.blockIds })),
+      terms: this.#projectTerms(terms, windows) });
   }
   #requestBounds(input: SupervisorInput): { inputUpper: number; outputUpper: number } {
     const chars = supervisorPrompt(input).length + effectiveSystemPrompt(input.streamFn, supervisorSystemPrompt()).length;
     return { inputUpper: chars * 2 + 20_000, outputUpper: Math.min(8192, input.model.maxTokens) };
   }
   #append(record: SupervisionRecord): void { this.options.store.appendSupervisionRecord(this.options.runId, record); }
-  #exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.#serial.then(operation);
-    this.#serial = next.catch(() => undefined);
-    return next;
-  }
   #checkPaused(windowId: string): void {
     const records = this.#records();
     const released = new Set(records.filter(r => r.state === "released").map(r => r.key));
@@ -73,32 +77,37 @@ export class SupervisionController {
     const index = records.findLastIndex(r => r.state === "released" && r.windowIds.includes(windowId));
     return records.slice(index + 1);
   }
-  #input(event: "plan" | "review", windows: readonly SupervisorWindow[], terms: SupervisorInput["terms"]): SupervisorInput {
-    const runtime = this.options.runtime;
+  #projectTerms(terms: SupervisorInput["terms"], windows: readonly SupervisorWindow[]): SupervisorInput["terms"] {
     const ids = new Set(windows.flatMap(w => w.blockIds));
     const source = this.options.sources.filter(b => ids.has(b.blockId)).map(b => b.sourceText).join("\n").toLocaleLowerCase();
-    const projectedTerms = terms.filter(t => source.includes(t.sourceForm.toLocaleLowerCase())
+    return terms.filter(t => source.includes(t.sourceForm.toLocaleLowerCase())
       && (!t.applicableBlockIds || t.applicableBlockIds.some(id => ids.has(id))))
-      .map(t => ({ ...t, locked: t.locked === true }));
+      .map(t => ({ ...t, locked: t.locked === true }))
+      .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b)));
+  }
+  #input(event: "plan" | "review", windows: readonly SupervisorWindow[], terms: SupervisorInput["terms"]): SupervisorInput {
+    const runtime = this.options.runtime;
+    const projectedTerms = this.#projectTerms(terms, windows);
     return { event, windows, sources: this.options.sources, terms: projectedTerms, model: runtime.model, streamFn: runtime.streamFn,
       maxTurns: SUPERVISION_POLICY.maxTurns, thinkingLevel: runtime.thinkingLevel,
       signal: this.options.signal, deadlineMs: this.options.deadlineMs };
   }
 
   planFor(windowId: string, terms: SupervisorInput["terms"], conflicts: readonly string[] = []): Promise<SupervisorDecision> {
-    return this.#exclusive(async () => {
+    const index = this.options.windows.findIndex(w => w.windowId === windowId);
+    if (index < 0) return Promise.reject(new Error("supervisor window outside plan"));
+    const plannedScope = this.options.windows.slice(index, index + SUPERVISION_POLICY.batchWindows);
+    return this.#operations.run(plannedScope.map(w => w.windowId), async () => {
       this.options.signal?.throwIfAborted();
       this.#checkPaused(windowId);
       const conflictHash = supervisionHash(conflicts);
-      const dependencyHash = this.#dependencyHash(terms);
       const cached = this.#records().findLast(r => r.event === "plan" && r.state === "completed"
         && r.decision?.action === "translate" && r.decision.windowIds.includes(windowId));
-      if (cached?.decision && cached.dependencyHash === dependencyHash && cached.conflictHash === conflictHash) {
+      if (cached?.decision && cached.conflictHash === conflictHash) {
         const scope = this.options.windows.filter(w => cached.windowIds.includes(w.windowId));
-        return validateSupervisorDecision(cached.decision, this.#input("plan", scope, terms));
+        if (cached.dependencyHash === this.#dependencyHash(terms, scope))
+          return validateSupervisorDecision(cached.decision, this.#input("plan", scope, terms));
       }
-      const index = this.options.windows.findIndex(w => w.windowId === windowId);
-      if (index < 0) throw new Error("supervisor window outside plan");
       let windows = this.options.windows.slice(index, index + SUPERVISION_POLICY.batchWindows);
       let input = { ...this.#input("plan", windows, terms), conflicts };
       while (windows.length > 1) {
@@ -107,7 +116,7 @@ export class SupervisionController {
         windows = windows.slice(0, -1);
         input = { ...this.#input("plan", windows, terms), conflicts };
       }
-      return this.#decide(input, conflictHash, dependencyHash);
+      return this.#decide(input, conflictHash, this.#dependencyHash(terms, windows));
     });
   }
 
@@ -116,7 +125,7 @@ export class SupervisionController {
     const records = this.#records();
     const entries = this.options.windows.filter(w => selected.has(w.windowId)).flatMap(window => {
       const plan = records.findLast(r => r.event === "plan" && r.state === "completed" && r.decision?.action === "translate" && r.decision.windowIds.includes(window.windowId));
-      if (terms !== undefined && plan?.dependencyHash !== this.#dependencyHash(terms)) return [];
+      if (terms !== undefined && (plan?.windowDependencyHashes?.[window.windowId] ?? plan?.dependencyHash) !== this.#dependencyHash(terms, [window])) return [];
       return plan?.decision?.guidance.filter(g => window.blockIds.includes(g.blockId)) ?? [];
     });
     return [...new Map(entries.map(g => [`${g.blockId}\0${g.sourceQuote}`, g])).values()];
@@ -134,7 +143,7 @@ export class SupervisionController {
   }
 
   review(windowId: string, candidate: readonly { blockId: string; text: string }[], terms: SupervisorInput["terms"]): Promise<readonly ValidationFailure[]> {
-    return this.#exclusive(async () => {
+    return this.#operations.run([windowId], async () => {
       this.options.signal?.throwIfAborted();
       this.#checkPaused(windowId);
       const window = this.options.windows.find(w => w.windowId === windowId);
@@ -144,8 +153,8 @@ export class SupervisionController {
       if (candidate.length !== window.blockIds.length || window.blockIds.some(id => !candidate.some(t => t.blockId === id))) {
         throw new Error("supervisor review requires the complete logical window");
       }
-      const dependencyHash = this.#dependencyHash(terms);
-      if (latestPlan && latestPlan.dependencyHash !== dependencyHash) {
+      const dependencyHash = this.#dependencyHash(terms, [window]);
+      if (latestPlan && (latestPlan.windowDependencyHashes?.[windowId] ?? latestPlan.dependencyHash) !== dependencyHash) {
         // A typed knowledge change can revalidate an already committed window.
         // Require a fresh review of that window, without reauthorizing siblings
         // or carrying guidance authored against an obsolete terminology view.
@@ -162,14 +171,45 @@ export class SupervisionController {
       const input = { ...this.#input("review", [window], terms), candidate };
       const decision = await this.#decide(input, undefined, dependencyHash);
       return decision.issues.map(issue => ({
+        issueKey: supervisionHash([issue.blockId, issue.sourceQuote.normalize("NFKC").trim(), issue.problem.normalize("NFKC").trim()]),
         code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: issue.blockId, repairable: true,
         message: `原文 ${JSON.stringify(issue.sourceQuote)}；当前译文 ${JSON.stringify(issue.targetQuote)}；问题：${issue.problem}。只修正该实质问题，不改无关内容。`,
       }));
     });
   }
 
-  async #decide(input: SupervisorInput, conflictHash?: string, dependencyHash?: string): Promise<SupervisorDecision> {
-    const inputHash = supervisionHash({ protocol: SUPERVISOR_PROTOCOL, dependencyHash, sourceVersion: this.options.sourceVersion, event: input.event, windows: input.windows,
+  reviewFinal(qualityItemId: string, windowId: string, candidate: readonly { blockId: string; text: string }[], terms: SupervisorInput["terms"]): Promise<readonly ValidationFailure[]> {
+    return this.#operations.run([windowId], async () => {
+      this.options.signal?.throwIfAborted();
+      const window = this.options.windows.find(w => w.windowId === windowId);
+      if (!/^[a-f0-9]{64}$/u.test(qualityItemId) || !window || candidate.length !== window.blockIds.length
+        || window.blockIds.some(id => !candidate.some(t => t.blockId === id))) throw new Error("invalid final quality review scope");
+      const dependencyHash = this.#dependencyHash(terms, [window]);
+      const plan = this.#records().findLast(r => r.event === "plan" && r.state === "completed" && r.decision?.action === "translate" && r.windowIds.includes(windowId));
+      if ((plan?.windowDependencyHashes?.[windowId] ?? plan?.dependencyHash) !== dependencyHash) {
+        const inputHash = supervisionHash({ origin: "host_revalidation", qualityItemId, dependencyHash, windowId });
+        this.#append({ id: `quality-plan:${inputHash}`, key: `quality-plan:${windowId}`, event: "plan", state: "completed",
+          windowIds: [windowId], inputHash, dependencyHash, origin: "host_revalidation", qualityItemId,
+          modelCalls: 0, totalTokens: 0, usageComplete: true,
+          decision: { action: "translate", windowIds: [windowId], reviewBlockIds: window.blockIds, guidance: [], issues: [],
+            reason: "Final quality review uses the current terminology projection." } });
+      }
+      const decision = await this.#decide({ ...this.#input("review", [window], terms), candidate }, undefined, dependencyHash, qualityItemId);
+      return decision.issues.map(issue => ({
+        issueKey: supervisionHash([issue.blockId, issue.sourceQuote.normalize("NFKC").trim(), issue.problem.normalize("NFKC").trim()]),
+        code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: issue.blockId, repairable: true,
+        message: `原文 ${JSON.stringify(issue.sourceQuote)}；当前译文 ${JSON.stringify(issue.targetQuote)}；问题：${issue.problem}。只修正该实质问题，不改无关内容。`,
+      }));
+    });
+  }
+
+  canReview(windowId: string, qualityItemId?: string): boolean {
+    return (qualityItemId ? this.#records() : this.#afterRelease(windowId)).filter(r => r.qualityItemId === qualityItemId
+      && r.event === "review" && r.state === "started" && r.windowIds.includes(windowId)).length < SUPERVISION_POLICY.maxReviewsPerWindow;
+  }
+
+  async #decide(input: SupervisorInput, conflictHash?: string, dependencyHash?: string, qualityItemId?: string): Promise<SupervisorDecision> {
+    const inputHash = supervisionHash({ protocol: SUPERVISOR_PROTOCOL, ...(qualityItemId ? { qualityItemId } : {}), dependencyHash, sourceVersion: this.options.sourceVersion, event: input.event, windows: input.windows,
       terms: input.terms, candidate: input.candidate, conflicts: input.conflicts });
     const key = `${input.event}:${input.windows[0]!.windowId}:${inputHash}`;
     const cached = this.#records().find(r => r.state === "completed" && r.inputHash === inputHash && r.decision);
@@ -180,12 +220,16 @@ export class SupervisionController {
         modelCalls: 0, totalTokens: 0, usageComplete: true });
       return decision;
     }
-    const history = this.#afterRelease(input.windows[0]!.windowId);
+    const recoveryScope = `supervision:${input.event}:${input.windows[0]!.windowId}`;
+    this.options.recovery?.assertAvailable(recoveryScope);
+    const history = (qualityItemId ? this.#records() : this.#afterRelease(input.windows[0]!.windowId)).filter(r => r.qualityItemId === qualityItemId);
     const attempts = history.filter(r => r.key === key && r.state === "started").length;
     const reviews = history.filter(r => r.event === "review" && r.state === "started" && r.windowIds.includes(input.windows[0]!.windowId)).length;
     const generation = this.#records().filter(r => r.state === "released" && r.windowIds.includes(input.windows[0]!.windowId)).length;
     const attemptId = `${key}:generation-${generation}:attempt-${attempts}`;
     const recordBase = { key, event: input.event, windowIds: input.windows.map(w => w.windowId), inputHash, dependencyHash,
+      windowDependencyHashes: Object.fromEntries(input.windows.map(window => [window.windowId, this.#dependencyHash(input.terms, [window])])),
+      ...(qualityItemId ? { qualityItemId } : {}),
       ...(input.candidate ? { candidateHash: supervisionCandidateHash(input.candidate) } : {}),
       ...(conflictHash ? { conflictHash } : {}) };
     if (attempts >= SUPERVISION_POLICY.maxAttemptsPerCheckpoint
@@ -198,7 +242,7 @@ export class SupervisionController {
     const { inputUpper, outputUpper } = this.#requestBounds(input);
     if (inputUpper + outputUpper > input.model.contextWindow) throw new Error("supervisor context capacity exceeded before dispatch");
     const predictedTokens = (inputUpper + outputUpper) * SUPERVISION_POLICY.maxTurns;
-    const baselineId = `supervision:${input.event}:${input.windows[0]!.windowId}:generation-${generation}`;
+    const baselineId = `supervision:${input.event}:${input.windows[0]!.windowId}:generation-${generation}${qualityItemId ? `:quality-${qualityItemId}` : ""}`;
     if (!this.options.admission.ledger.state().baselinedTaskIds.has(baselineId)) {
       this.options.admission.addBaseline({ taskIds: [baselineId],
         baselineTokens: predictedTokens * (input.event === "review" ? SUPERVISION_POLICY.maxReviewsPerWindow : SUPERVISION_POLICY.maxAttemptsPerCheckpoint),
@@ -227,6 +271,15 @@ export class SupervisionController {
         transaction.settle({ actualTokens: run?.usage.totalTokens ?? 0, usageComplete, outcome: "failed" });
         this.#append({ ...recordBase, id: `${attemptId}:failed`, state: "failed", modelCalls: run?.modelCalls ?? 0,
           totalTokens: run?.usage.totalTokens ?? 0, usageComplete, reason: error instanceof Error ? error.message : "supervisor execution failed" });
+      }
+      if (!settled && error instanceof ModelProviderError
+        && this.options.admission.ledger.state().tokenUsageComplete
+        && attempts + 1 < SUPERVISION_POLICY.maxAttemptsPerCheckpoint
+        && (input.event !== "review" || reviews + 1 < SUPERVISION_POLICY.maxReviewsPerWindow)
+        && (this.options.recovery
+          ? await this.options.recovery.providerRetry(recoveryScope, error, { supervisor: true, signal: this.options.signal })
+          : error.kind === "protocol" && error.run && error.run.usage.totalTokens > 0)) {
+        return this.#decide(input, conflictHash, dependencyHash, qualityItemId);
       }
       throw isSupervisionBoundaryError(error) ? error : new SupervisionExecutionError(error);
     }

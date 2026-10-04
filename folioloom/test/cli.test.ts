@@ -30,6 +30,16 @@ import {
 import { auditLosslessBookStore, bookArtifactFileNames } from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
+test("CLI accepts explicit delivery policies without changing defaults on resume", () => {
+  const run = ["book", "run", "--manifest", "source_manifest.json", "--store", "book.db", "--config", "model.json"];
+  assert.equal(parseArgs(run).deliveryMode, undefined);
+  for (const mode of ["standard", "strict"]) {
+    assert.equal(parseArgs([...run, "--delivery-mode", mode]).deliveryMode, mode);
+    assert.equal(parseArgs(["book", "export", "--store", "book.db", "--output", "exports", "--delivery-mode", mode]).deliveryMode, mode);
+  }
+  assert.throws(() => parseArgs([...run, "--delivery-mode", "unchecked"]), /delivery-mode/u);
+});
+
 test("CLI exposes a stable provider failure code without request content", () => {
   assert.deepEqual(
     cliErrorPayload(new ModelProviderError(

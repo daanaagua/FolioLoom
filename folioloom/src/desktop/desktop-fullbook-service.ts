@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { taskContextMetadata } from "../agents/task-context.js";
+import { auditLosslessBookExport } from "../report.js";
 import { existsSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -111,6 +112,7 @@ interface RunOverlay {
 }
 
 interface ActiveFullBookTask {
+  deliveryMode?: "standard" | "strict";
   supervisorMode?: "bounded" | "off";
   taskContext?: string;
   owner: DesktopFullBookService;
@@ -488,7 +490,12 @@ export class DesktopFullBookService {
                 retryAttempted,
               };
           const overlay = this.#overlays.get(run.runId);
-          persisted.push(publicRun(run, metadata, progress, attention, overlay));
+          const publicSnapshot = publicRun(run, metadata, progress, attention, overlay);
+          const audit = auditLosslessBookExport(store, run.runId).audit;
+          publicSnapshot.deliveryMode = audit.deliveryMode;
+          publicSnapshot.quality = audit.quality;
+          publicSnapshot.canExport = publicSnapshot.canExport && (audit.deliveryMode === "standard" ? audit.deliveryReady : audit.strictExportable);
+          persisted.push(publicSnapshot);
           seen.add(run.runId);
         }
       } finally {
@@ -518,6 +525,8 @@ export class DesktopFullBookService {
     );
     const mode = modeForOptimizationProfile(optimizationProfile);
     const supervisorMode = request.supervisorMode ?? "bounded";
+    const deliveryMode = request.deliveryMode ?? "standard";
+    if (deliveryMode !== "standard" && deliveryMode !== "strict") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "invalid delivery mode");
     if (supervisorMode !== "bounded" && supervisorMode !== "off") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "invalid supervisor mode");
     if (request.taskContext !== undefined) taskContextMetadata(request.taskContext);
     const project = normalizeProject(projectRequest);
@@ -536,6 +545,7 @@ export class DesktopFullBookService {
       "active",
     );
     task.supervisorMode = supervisorMode;
+    task.deliveryMode = deliveryMode;
     task.taskContext = request.taskContext;
     try {
       const beforeVersion = project.sourceVersion;
@@ -804,6 +814,7 @@ export class DesktopFullBookService {
     try {
       running = this.#runBook({
         supervisorMode: task.supervisorMode ?? "off",
+        deliveryMode: task.deliveryMode,
         ...(task.taskContext === undefined ? {} : { taskContext: task.taskContext }),
         manifestPath: task.project.manifestPath,
         storePath: task.project.storePath,

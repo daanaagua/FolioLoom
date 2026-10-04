@@ -2,19 +2,23 @@ import type { TranslationBatchWindowResult } from "../agents/translation-batch.j
 import type { TranslationRequestInput } from "../agents/translation-request.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { supervisionHash, supervisionCandidateHash } from "../domain/supervision.js";
+import type { ValidationFailure } from "../tools/repair-tools.js";
+import { hasOnlyNovelSemanticIssues, MAX_SEMANTIC_REPAIR_PASSES, repairIssueKeys } from "./semantic-repair-policy.js";
+import type { AutomaticRecovery } from "./automatic-recovery.js";
 
 export const CANDIDATE_CHECKPOINT_PROTOCOL = "folioloom-candidate-checkpoint-1";
 export interface CandidateCheckpointRecord {
   readonly id: string;
   readonly key: string;
   readonly protocol: typeof CANDIDATE_CHECKPOINT_PROTOCOL;
-  readonly phase: "candidate" | "repair_started" | "discarded";
+  readonly phase: "candidate" | "repair_started" | "discarded" | "rejected";
   readonly windowId: string;
   readonly sourceVersion: string;
   readonly snapshotId: string;
   readonly repairGeneration: string;
   readonly candidateHash: string;
   readonly candidate: TranslationBatchWindowResult;
+  readonly repairIssueKeys?: readonly string[];
 }
 export interface CandidateCheckpointJournal {
   candidateRecoveryGeneration?(runId: string, windowId: string): string;
@@ -24,7 +28,7 @@ export interface CandidateCheckpointJournal {
 export class CandidateRecoveryPausedError extends Error {
   readonly code = "CANDIDATE_RECOVERY_PAUSED";
   readonly retryable = false;
-  constructor(readonly windowId: string, reason: string) {
+  constructor(readonly windowId: string, reason: string, readonly semanticLimit = false) {
     super(`CANDIDATE_RECOVERY_PAUSED: ${windowId}: ${reason}; saved candidate retained`);
     this.name = "CandidateRecoveryPausedError";
   }
@@ -36,7 +40,7 @@ function recordId(record: Omit<CandidateCheckpointRecord, "id">): string { retur
 export function validateCandidateCheckpoint(record: CandidateCheckpointRecord): void {
   const { id, ...payload } = record;
   const candidate = record.candidate;
-  if (record.protocol !== CANDIDATE_CHECKPOINT_PROTOCOL || !["candidate", "repair_started", "discarded"].includes(record.phase)
+  if (record.protocol !== CANDIDATE_CHECKPOINT_PROTOCOL || !["candidate", "repair_started", "discarded", "rejected"].includes(record.phase)
     || !/^[a-f0-9]{64}$/u.test(record.key) || record.id !== recordId(payload)
     || typeof record.snapshotId !== "string" || !record.snapshotId || typeof record.repairGeneration !== "string"
     || record.candidateHash !== digest(candidate) || candidate.windowId !== record.windowId
@@ -44,7 +48,9 @@ export function validateCandidateCheckpoint(record: CandidateCheckpointRecord): 
     || !candidate.translations?.length
     || candidate.translations.some(t => typeof t.blockId !== "string" || typeof t.text !== "string" || !t.text.trim())
     || new Set(candidate.translations.map(t => t.blockId)).size !== candidate.translations.length
-    || !Array.isArray(candidate.termUsages) || !Array.isArray(candidate.notes) || !Array.isArray(candidate.memoryCandidates)) {
+    || !Array.isArray(candidate.termUsages) || !Array.isArray(candidate.notes) || !Array.isArray(candidate.memoryCandidates)
+    || (record.repairIssueKeys !== undefined && (!Array.isArray(record.repairIssueKeys)
+      || record.repairIssueKeys.length > 64 || record.repairIssueKeys.some(key => !/^[a-f0-9]{64}$/u.test(key))))) {
     throw new Error(`invalid candidate checkpoint: ${record.windowId}`);
   }
 }
@@ -87,13 +93,31 @@ export class CandidateCheckpointService {
   }
 
   load(input: TranslationRequestInput, windowId: string): TranslationBatchWindowResult | undefined {
-    const record = this.#records(input, windowId).findLast(r => r.phase !== "repair_started");
+    const records = this.#records(input, windowId);
+    const rejected = new Set(records.filter(r => r.phase === "rejected").map(r => r.candidateHash));
+    const record = records.findLast(r => r.phase === "discarded" || (r.phase === "candidate" && !rejected.has(r.candidateHash)));
     if (!record || record.phase === "discarded") return undefined;
     const ids = input.request.windows.find(w => w.windowId === windowId)!.blockIds;
     if (record.candidate.translations.length !== ids.length || ids.some(id => !record.candidate.translations.some(t => t.blockId === id))) {
       throw new Error(`candidate checkpoint scope mismatch: ${windowId}`);
     }
     return structuredClone(record.candidate);
+  }
+
+  async loadValidated(input: TranslationRequestInput, windowId: string,
+    validate: (candidate: TranslationBatchWindowResult) => boolean | Promise<boolean>, recovery: AutomaticRecovery,
+  ): Promise<TranslationBatchWindowResult | undefined> {
+    const scope = `checkpoint:${this.options.purpose ?? "translate"}:${windowId}`;
+    recovery.assertAvailable(scope);
+    for (;;) {
+      // A malformed/hash-mismatched journal remains a hard error, not a rejected translation.
+      const candidate = this.load(input, windowId);
+      if (!candidate || await validate(candidate)) return candidate;
+      if (!await recovery.claim({ scope, action: "reject_checkpoint", fingerprint: digest(candidate) })) {
+        throw new CandidateRecoveryPausedError(windowId, "checkpoint recovery credit exhausted");
+      }
+      this.#append(input, candidate, "rejected");
+    }
   }
 
   save(input: TranslationRequestInput, candidate: TranslationBatchWindowResult, phase: "generated" | "repaired" = "generated"): void {
@@ -104,18 +128,25 @@ export class CandidateCheckpointService {
     const prior = this.load(input, candidate.windowId);
     const unchanged = prior && supervisionCandidateHash(prior.translations) === supervisionCandidateHash(candidate.translations);
     this.#append(input, candidate, "candidate");
-    if (phase === "repaired" && unchanged) throw new CandidateRecoveryPausedError(candidate.windowId, "repair made no text progress");
+    if (phase === "repaired" && unchanged) throw new CandidateRecoveryPausedError(candidate.windowId, "repair made no text progress", true);
   }
 
-  claimRepair(input: TranslationRequestInput, candidates: readonly TranslationBatchWindowResult[]): void {
+  claimRepair(input: TranslationRequestInput, candidates: readonly TranslationBatchWindowResult[], failures: readonly ValidationFailure[] = []): void {
     for (const candidate of candidates) {
-      if (this.#records(input, candidate.windowId).some(r => r.phase === "repair_started" && r.repairGeneration === this.#generation(candidate.windowId))) {
-        throw new CandidateRecoveryPausedError(candidate.windowId, "durable semantic repair credit exhausted");
+      const prior = this.#records(input, candidate.windowId).filter(r => r.phase === "repair_started" && r.repairGeneration === this.#generation(candidate.windowId));
+      if (prior.length > 0) {
+        const scoped = failures.filter(f => !f.blockId || candidate.translations.some(t => t.blockId === f.blockId));
+        if (prior.length >= MAX_SEMANTIC_REPAIR_PASSES
+          || !hasOnlyNovelSemanticIssues(prior.flatMap(r => r.repairIssueKeys ?? []), scoped)
+          || prior.some(r => supervisionCandidateHash(r.candidate.translations) === supervisionCandidateHash(candidate.translations))) {
+          throw new CandidateRecoveryPausedError(candidate.windowId, "durable semantic repair credit exhausted or repeated issue", true);
+        }
       }
     }
     // All candidates have been checked before any credit is consumed. A crash
     // during this loop can only conservatively spend credit, never renew it.
-    for (const candidate of candidates) this.#append(input, candidate, "repair_started");
+    for (const candidate of candidates) this.#append(input, candidate, "repair_started",
+      repairIssueKeys(failures.filter(f => !f.blockId || candidate.translations.some(t => t.blockId === f.blockId))));
   }
 
   discardWindow(windowId: string): void {
@@ -129,12 +160,12 @@ export class CandidateCheckpointService {
     }
   }
 
-  #append(input: TranslationRequestInput, window: TranslationBatchWindowResult, phase: CandidateCheckpointRecord["phase"]): void {
+  #append(input: TranslationRequestInput, window: TranslationBatchWindowResult, phase: CandidateCheckpointRecord["phase"], issueKeys?: readonly string[]): void {
     const candidate = JSON.parse(JSON.stringify(window)) as TranslationBatchWindowResult;
     const payload: Omit<CandidateCheckpointRecord, "id"> = { protocol: CANDIDATE_CHECKPOINT_PROTOCOL, phase, windowId: candidate.windowId,
       key: this.key(input, candidate.windowId), sourceVersion: this.options.sourceVersion, snapshotId: input.snapshot.id,
       repairGeneration: this.#generation(candidate.windowId),
-      candidateHash: digest(candidate), candidate };
+      candidateHash: digest(candidate), candidate, ...(issueKeys === undefined ? {} : { repairIssueKeys: issueKeys }) };
     const record = { id: recordId(payload), ...payload };
     validateCandidateCheckpoint(record);
     this.options.store.appendCandidateCheckpoint(this.options.runId, record);

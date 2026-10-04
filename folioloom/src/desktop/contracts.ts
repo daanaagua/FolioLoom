@@ -270,6 +270,8 @@ export interface DesktopAttentionSummary {
 }
 
 export interface DesktopFullBookRunSnapshot {
+  deliveryMode?: "standard" | "strict";
+  quality?: { pending: number; resolved: number; unresolved: number };
   runId: string;
   sourceVersion: string;
   modelId: string;
@@ -300,6 +302,7 @@ export interface DesktopFullBookSnapshot {
 }
 
 export interface DesktopStartFullBookRequest {
+  deliveryMode?: "standard" | "strict";
   optimizationProfile: DesktopOptimizationProfile;
   supervisorMode?: "bounded" | "off";
   taskContext?: string;
@@ -324,6 +327,8 @@ export type DesktopExportFormat =
   | "epub";
 
 export interface DesktopExportCandidate {
+  deliveryMode?: "standard" | "strict";
+  unresolvedQualityItems?: number;
   runId: string;
   modelId: string;
   status: "ready" | "incomplete" | "blocked";
@@ -353,7 +358,7 @@ export interface DesktopExportResult {
   runId: string;
   directory: string;
   files: readonly {
-    format: DesktopExportFormat | "audit" | "metrics";
+    format: DesktopExportFormat | "audit" | "metrics" | "quality_report";
     fileName: string;
   }[];
 }
