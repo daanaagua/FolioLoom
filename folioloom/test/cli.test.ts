@@ -540,14 +540,14 @@ test("dual runtime keeps quality effort and creates a non-thinking fast primary"
   const quality = buildTranslationRuntimeSet(source, "quality", factories);
   assert.deepEqual(
     createdEfforts,
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    ["high"],
   );
   assert.equal(quality.mode, "quality");
   assert.equal(quality.primary, quality.escalation);
   assert.equal(quality.primary.effort, "high");
   assert.deepEqual(
     quality.variants?.map((candidate) => candidate.effort),
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    ["high"],
   );
 });
 

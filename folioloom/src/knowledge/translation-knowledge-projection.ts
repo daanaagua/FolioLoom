@@ -5,6 +5,7 @@ import {
   type KnowledgeStatus,
 } from "./knowledge-store.js";
 import { sourceFormsFromRevision } from "./knowledge-source-forms.js";
+import { hasSemanticSurfaceEvidence, surfaceObservationNoiseReason } from "./surface-consistency.js";
 import type { ContextEvidenceBundle } from "../fullbook/context-profile-planner.js";
 import type { RiskDimension } from "../fullbook/task-risk.js";
 import type { SourceLanguageProfile } from "../language/types.js";
@@ -489,6 +490,7 @@ function candidateGroups(
     if (revision === undefined) continue;
     validRevisionIds.add(revision.revisionId);
     if (revision.kind === "lexical_anchor_decision") continue;
+    if (revision.kind === "lexical_surface_observation" && (!hasSemanticSurfaceEvidence(revision.payload) || surfaceObservationNoiseReason(revision.payload))) continue;
     const positionMatch = positionedMemoryMatch(revision, positions);
     const matched = positionMatch.positioned
       ? positionMatch.windowIds.length > 0

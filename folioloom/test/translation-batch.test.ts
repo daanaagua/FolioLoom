@@ -15,6 +15,7 @@ import {
   translationBatchSystemPrompt,
 } from "../src/agents/translation-batch.js";
 import { prepareTranslationRequest } from "../src/agents/translation-request.js";
+import { surfaceMentions } from "../src/knowledge/surface-consistency.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 import {
@@ -334,6 +335,28 @@ test("batch runtime uses the same prepared prompt as complete-request budgeting"
 
   assert.equal(prompt, prepared.prompt);
   assert.deepEqual(result.run.toolNames, prepared.tools.map((tool) => tool.name));
+});
+
+test("translation emits grounded surface receipts in the original call and reserves review before repair", async () => {
+  const sourceBlocks = [block("surface-block", 0, "Copper waited.")];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const mentions = surfaceMentions(sourceBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText })),
+    [{ sourceForm: "Copper", target: "铜铃", mode: "stable", semanticClass: "proper_name", confidence: 0.5 }], [], getSourceLanguageProfile("en"));
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("finalize_translation_batch", { windows: [{ windowId: sourceRequest.windows[0]!.windowId,
+    translations: [{ blockId: "surface-block", text: "小铜等着。" }], surfaceUsages: [{ occurrenceId: mentions[0]!.occurrenceId, targetSurface: "小铜" }] }] }), { stopReason: "toolUse" })]);
+  const input = { request: sourceRequest, blocks: sourceBlocks, stableTerms: [], surfaceMentions: mentions,
+    snapshot: { id: "surface-snapshot", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider), budget: new BudgetLedger() };
+  const generated = await runTranslationBatch(input);
+  const result = await reviewAndRepairTranslationBatchCandidate({ ...input, deliveryMode: "standard", canReviewRepairedCandidate: () => false,
+    reviewCandidate: async candidate => {
+      assert.equal(candidate.surfaceUsages?.[0]?.targetSurface, "小铜");
+      return [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "surface-block", repairable: true, message: "核对称呼。" }];
+    } }, generated);
+  assert.equal(faux.state.callCount, 1, "an unreviewable repair must not be dispatched");
+  assert.equal(result.windows[0]?.status, "completed_with_warnings");
+  assert.equal(result.windows[0]?.surfaceUsages?.[0]?.paragraphIndex, 0);
+  assert.equal(result.windows[0]?.qualityIssues?.length, 1);
 });
 
 test("batch canonicalizes unambiguous single-window metadata placed at the tool envelope", async () => {

@@ -1,4 +1,5 @@
 import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { groundSurfaceUsages } from "../knowledge/surface-consistency.js";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { V4Block } from "../domain/types.js";
@@ -87,6 +88,7 @@ export interface TranslationProviderResponseEvidence
 }
 
 export interface TranslationBatchWindowResult {
+  surfaceUsages?: import("../knowledge/surface-consistency.js").SurfaceUsage[];
   windowId: string;
   ordinal: number;
   status: "completed" | "completed_with_warnings" | "failed";
@@ -219,6 +221,7 @@ function validateSubmission(
       status: notes.length > 0 ? "completed_with_warnings" : "completed",
       translations,
       termUsages: copyTermUsages(candidate.termUsages),
+      surfaceUsages: groundSurfaceUsages(input.surfaceMentions ?? [], candidate.surfaceUsages ?? [], translations),
       notes,
       memoryCandidates: memories.candidates,
       ...(paragraphTranslations === undefined
@@ -593,6 +596,9 @@ async function validateAndRepair(
   const failedTranslations = invalid.flatMap((item) => item.window.translations)
     .filter((translation) => repairBlockIds.has(translation.blockId));
   const failures = invalid.flatMap((item) => item.failures);
+  if (invalid.some(item => input.canReviewRepairedCandidate?.(item.window.windowId) === false)) {
+    return failWithoutRepair("validation failed without reserved post-repair review credit");
+  }
   if (await input.beforeRepair?.(invalid.map(item => item.window), failures) === false) {
     return failWithoutRepair("validation failed after bounded repair credit");
   }
@@ -682,6 +688,7 @@ async function validateAndRepair(
       ),
     ];
     delete repairedWindow.styleObservation;
+    repairedWindow.surfaceUsages = groundSurfaceUsages(input.surfaceMentions ?? [], window.surfaceUsages ?? [], repairedWindow.translations);
     return repairedWindow;
   });
   const windows = normalizeWindowTypography(

@@ -1121,7 +1121,7 @@ export function buildTranslationRuntimeSet(
     );
   }
   const variantsByEffort = new Map(
-    supportedEfforts.map((effort) => [
+    (mode === "quality" ? [qualityConfig.reasoningEffort as ProviderEffort] : supportedEfforts).map((effort) => [
       effort,
       makeRuntime(withReasoningEffort(qualityConfig, effort)),
     ]),

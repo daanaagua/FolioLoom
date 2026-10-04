@@ -81,6 +81,7 @@ export class CandidateCheckpointService {
       styleState: input.styleState ?? null, effectiveStyle: input.effectiveStyleByWindow?.[windowId] ?? null,
       sourceLanguage: input.sourceLanguageProfile?.id ?? null, previousActiveTail: input.previousActiveTail ?? "",
       guidance: input.supervisorGuidance?.filter(g => ids.has(g.blockId)) ?? [], strictIdentifiers: input.strictIdentifiers ?? false,
+      ...(input.surfaceMentions?.length ? { surfaceMentions: input.surfaceMentions.filter(m => ids.has(m.blockId)) } : {}),
     });
   }
 

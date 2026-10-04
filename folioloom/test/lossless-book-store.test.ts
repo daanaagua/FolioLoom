@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { auditLosslessBookExport } from "../src/report.js";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -190,6 +191,35 @@ function initialize(
   store.initializeWindowPlan(runId, windows);
   return runId;
 }
+
+test("derived surface quarantine versions only certified noise, preserves history and is idempotent", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  try {
+    const domain = new KnowledgeStore();
+    const noise = { schema: "surface-observation-1", sourceForm: "E1.0.0", sourceQuote: "⟦E1.0.0⟧Alpha⟦/E1.0.0⟧",
+      proposedTarget: "", observedTarget: null, semanticClass: "unclassified" };
+    domain.reconcileCandidates([{ recordId: "noise", normalizedSubject: "e1.0.0:block", kind: "lexical_surface_observation", payload: noise },
+      { recordId: "keep", normalizedSubject: "alpha", kind: "term", payload: { target: "阿尔法" } }], "legacy");
+    const snapshot = createKnowledgeSnapshot("run-a", domain.projectableRevisions());
+    const run = initialize(store, { ...runMeta("model-a", "a"), initialSnapshot: snapshot, initialSnapshotId: snapshot.id });
+    // Seed a legacy fixture: current staging correctly rejects protocol-only observations.
+    const legacy = new DatabaseSync(path);
+    for (const r of domain.projectableRevisions()) legacy.prepare(`INSERT INTO knowledge_records
+      (run_id,record_id,revision_id,revision,normalized_subject,kind,payload_json,status,active) VALUES(?,?,?,?,?,?,?,?,1)`)
+      .run(run, sha256(`${r.normalizedSubject}\0${r.kind}`), r.revisionId, r.revision, r.normalizedSubject, r.kind, JSON.stringify(r), r.status);
+    legacy.close();
+    const state = store.knowledgeState(run);
+    assert.equal(store.quarantineDerivedSurfaces(run, state.generation, state.snapshotId).revisionIds.length, 1);
+    assert.equal(store.latestKnowledgeSnapshot(run).revisions.length, 1);
+    assert.equal(store.knowledgeRevisions(run).length, 3, "original noise remains in version history");
+    assert.ok(!auditLosslessBookExport(store, run).audit.incidentCodes.includes("KNOWLEDGE_HISTORY_INVALID"));
+    assert.throws(() => store.quarantineDerivedSurfaces(run, state.generation, state.snapshotId), /GENERATION_CONFLICT/u);
+    const next = store.knowledgeState(run);
+    assert.deepEqual(store.quarantineDerivedSurfaces(run, next.generation, next.snapshotId).revisionIds, []);
+    assert.deepEqual(store.knowledgeState(run), next);
+  } finally { store.close(); }
+});
 
 test("provider response evidence is durable, compressed, and raw-body deduplicated", () => {
   const path = fixturePath();

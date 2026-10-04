@@ -11,6 +11,7 @@ import { SupervisionController, isSupervisionBoundaryError } from "./supervision
 import { CandidateCheckpointService, CandidateRecoveryPausedError } from "./candidate-checkpoint.js";
 import { AutomaticRecovery, RecoveryPausedError } from "./automatic-recovery.js";
 import { QualityQueue, resolveDeliveryMode, type DeliveryMode } from "./delivery-policy.js";
+import { readSurfaceObservations, surfaceObservations, surfaceConsistencyEvidence, reconsiderSurfaceCandidates, surfaceMentions } from "../knowledge/surface-consistency.js";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
@@ -966,14 +967,13 @@ function windowSourceText(
     .join("\n\n");
 }
 
-function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[] {
+function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[], currentSource: string, context: BookContext): string[] {
   return revisions.flatMap((raw) => {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
       return [];
     }
     const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
-    if ((revision.kind !== "lexical_anchor_decision"
-      && revision.kind !== "lexical_concept")
+    if ((revision.kind !== "lexical_concept" && revision.kind !== "lexical_anchor_decision")
       || (revision.status !== "active" && revision.status !== "contextual")
       || revision.payload === null
       || typeof revision.payload !== "object"
@@ -983,7 +983,10 @@ function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[
     const payload = revision.payload as {
       sourceForm?: unknown;
       sourceForms?: unknown;
+      semanticClass?: unknown;
     };
+    if (revision.kind === "lexical_anchor_decision" && (payload.semanticClass !== "ordinary_word"
+      || context.languageProfile.hasExplicitEntityNamingCue(currentSource))) return [];
     if (revision.kind === "lexical_concept" && Array.isArray(payload.sourceForms)) {
       return payload.sourceForms.filter((sourceForm): sourceForm is string =>
         typeof sourceForm === "string" && sourceForm.trim().length > 0);
@@ -1069,8 +1072,6 @@ function waveKnowledgeCandidates(
   const entityForms = new Set(outcome.entityLinks
     .filter((link) => link.status === "confirmed")
     .flatMap((link) => link.normalizedForms));
-  const projectedTermForms = new Set(outcome.terms.map((term) =>
-    context.languageProfile.normalizeSourceForm(term.sourceForm)));
   const termsByForm = new Map(outcome.terms.map((term) => [
     context.languageProfile.normalizeSourceForm(term.sourceForm),
     term,
@@ -1111,12 +1112,12 @@ function waveKnowledgeCandidates(
       });
       continue;
     }
-    if (anchor.mode !== "contextual" && !projectedTermForms.has(normalizedSource)) continue;
     const payload = {
       sourceForm: anchor.sourceForm,
       target: simplifyChineseTranslation(anchor.target),
       mode: anchor.mode,
       semanticClass,
+      proposedSemanticClass: anchor.proposedSemanticClass ?? semanticClass,
       confidence: anchor.confidence,
     };
     result.push({
@@ -1640,6 +1641,7 @@ function planningRuntimes(
   executionRuntime: TranslationRuntime,
   retryRound: number,
 ): readonly TranslationRuntime[] {
+  if (runtimeSet.mode === "quality") return [executionRuntime];
   const variants = validateRuntimeVariants([
     executionRuntime,
     ...(runtimeSet.variants ?? []),
@@ -2889,7 +2891,7 @@ async function runLosslessBook(
           const complete = store.activeTranslations(runId).filter(t => work.window.blockIds.includes(t.blockId))
             .map(t => replacementById.get(t.blockId) ?? t);
           return supervisor.review(work.window.windowId, complete, terms);
-        } }),
+        }, canReviewRepairedCandidate: () => supervisor.canReview(work.window.windowId, undefined, terms) }),
         blocks: context.losslessBlocks,
         stableTerms: terms,
         snapshot,
@@ -3186,7 +3188,7 @@ async function runLosslessBook(
           blocks: context.losslessBlocks, stableTerms: terms, snapshot, strictIdentifiers: true,
           styleState: mergeStyleState(options.styleState, persistedStyleFromKnowledge(snapshot.revisions)),
           sourceLanguageProfile: context.languageProfile,
-          reviewCandidate: candidate => supervisor.reviewFinal(item.itemId, candidate.windowId, candidate.translations, terms),
+          reviewCandidate: candidate => supervisor.reviewFinal(item.itemId, candidate.windowId, candidate.translations, terms, item.issues),
           canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, item.itemId),
         });
         const admitted = admitTranslationRequests([request], runtime, estimator, blockById, buildInput)[0]!;
@@ -3228,7 +3230,8 @@ async function runLosslessBook(
         if (!boundary.valid) throw new RevalidationOutputError("final quality repair changed cross-block alignment");
         store.replaceQualityWindow({ runId, itemId: item.itemId, expectedHash: supervisionCandidateHash(current), snapshotId: snapshot.id,
           translations: candidate.translations.map(t => ({ ...t, sourceHash: blockById.get(t.blockId)!.sourceHash })),
-          bindings: { usages: candidate.termUsages, concepts: conceptsFromStableTerms(terms) }, issues: candidate.qualityIssues ?? [] });
+          bindings: { usages: candidate.termUsages, concepts: conceptsFromStableTerms(terms) }, issues: candidate.qualityIssues ?? [],
+          closure: supervisor.finalClosure(item.itemId, candidate.translations) });
         flushSchedulerProjection?.();
       }
     };
@@ -3317,15 +3320,18 @@ async function runLosslessBook(
         options.glossary,
       );
       const corpusBlocks = context.losslessBlocks.map(losslessAsV4);
-      const anchorCandidates = collectWindowAnchorCandidates(
+      const surfaceMemory = readSurfaceObservations(snapshot.revisions, store.activeTranslations(runId));
+      const collectedAnchorCandidates = collectWindowAnchorCandidates(
         selectedBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
         corpusBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
         anchorStableTerms,
-        decidedAnchorFormsFromKnowledge(snapshot.revisions),
+        decidedAnchorFormsFromKnowledge(snapshot.revisions, selectedSourceBlocks.map(b => b.sourceText).join("\n"), context),
         context.languageProfile,
       );
+      const anchorCandidates = reconsiderSurfaceCandidates(collectedAnchorCandidates, surfaceMemory,
+        selectedSourceBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText })), context.languageProfile);
       const anchorBudget = new BudgetLedger();
       let waveAnchorSnapshot: WaveAnchorSnapshot | undefined;
       if (anchorCandidates.length === 1
@@ -3360,7 +3366,8 @@ async function runLosslessBook(
           }
         }
       }
-      if (anchorCandidates.length >= 2) {
+      if (anchorCandidates.length >= 2 || (anchorCandidates.length === 1
+        && surfaceMemory.some(p => p.sourceForm === anchorCandidates[0]!.sourceForm))) {
         const inputHash = waveAnchorInputHash(context, anchorCandidates, anchorStableTerms);
         const cached = store.waveAnchorDecision(runId, inputHash);
         if (cached !== undefined) {
@@ -3626,7 +3633,7 @@ async function runLosslessBook(
         runId,
         waveAnchorSnapshot,
         context,
-      );
+      ).filter(item => !snapshot.revisions.some(revision => revision.candidateIds.includes(item.candidate.recordId)));
       const entityLinkWarnings = unresolvedEntityWarnings(waveAnchorSnapshot);
       if (supervisor !== undefined && entityLinkWarnings.length > 0) {
         const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings);
@@ -3689,12 +3696,20 @@ async function runLosslessBook(
           : runtimeSet.escalation;
         const buildTranslationInput = (request: PhysicalRequestPlan): TranslationRequestInput => ({
           request,
+          surfaceMentions: surfaceMentions(request.windows.flatMap(w => w.blockIds).map(blockId => ({ blockId, sourceText: blockById.get(blockId)!.sourceText })),
+            waveAnchorSnapshot?.anchors ?? [], surfaceMemory, context.languageProfile),
           deliveryMode,
           strictIdentifiers: supervisorMode === "bounded",
           supervisorGuidance: supervisor?.guidanceFor(request.windows.map(w => w.windowId), activeTerms),
           ...(supervisor === undefined ? {} : {
-            reviewCandidate: async candidate => supervisor.review(candidate.windowId, candidate.translations, activeTerms),
-            canReviewRepairedCandidate: windowId => supervisor.canReview(windowId),
+            reviewCandidate: async candidate => supervisor.review(candidate.windowId, candidate.translations, activeTerms,
+              surfaceConsistencyEvidence({ sources: candidate.translations.map(t => ({ blockId: t.blockId, sourceText: blockById.get(t.blockId)!.sourceText })),
+                translations: candidate.translations, observations: [...surfaceMemory, ...surfaceObservations({ windowId: candidate.windowId,
+                  sources: candidate.translations.map(t => ({ blockId: t.blockId, sourceText: blockById.get(t.blockId)!.sourceText })),
+                  translations: candidate.translations, candidates: collectedAnchorCandidates, anchors: waveAnchorSnapshot?.anchors ?? [],
+                  previous: surfaceMemory, profile: context.languageProfile, usages: candidate.surfaceUsages }).map(r => r.payload as import("../knowledge/surface-consistency.js").SurfaceObservation)],
+                terms: termsForWindows(activeTerms, request.windows, context, options.glossary), profile: context.languageProfile })),
+            canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, undefined, activeTerms),
           }),
           blocks: context.losslessBlocks,
           stableTerms: termsForWindows(
@@ -4223,6 +4238,39 @@ async function runLosslessBook(
           boundaryFailuresByWindow.set(windowId, messages);
         }
 
+        // Parallel siblings become visible together at this safe boundary. Check
+        // new sibling evidence here rather than leaking completion-order state
+        // into requests that are still running.
+        const siblingMemory = [...surfaceMemory];
+        const orderedResults = completionOrder.flatMap(c => c.result?.windows ?? [])
+          .filter(w => w.status !== "failed" && !boundaryFailuresByWindow.has(w.windowId))
+          .sort((a, b) => (relativeOrdinal.get(a.windowId) ?? 0) - (relativeOrdinal.get(b.windowId) ?? 0));
+        for (const result of orderedResults) {
+          const sources = result.translations.map(t => ({ blockId: t.blockId, sourceText: blockById.get(t.blockId)!.sourceText }));
+          const terms = termsForWindows(activeTerms, selected.filter(w => w.windowId === result.windowId), context, options.glossary);
+          const evidence = surfaceConsistencyEvidence({ sources, translations: result.translations, observations: siblingMemory, terms, profile: context.languageProfile })
+            .filter(e => e.previous.some(p => currentBlockIds.has(p.blockId)));
+          if (evidence.length && supervisor !== undefined) {
+            const issues = supervisor?.canReview(result.windowId)
+              ? await supervisor.review(result.windowId, result.translations, activeTerms, evidence)
+              : evidence.map(e => ({ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: e.blockId, repairable: true,
+                issueKey: supervisionCandidateHash([{ blockId: e.blockId, text: e.sourceForm }]),
+                evidence: { sourceQuote: e.sourceQuote, targetQuote: e.currentTargetQuote, problem: `核对称呼 ${e.sourceForm} 的跨窗译法；此前实际译法：${e.previous.map(p => p.target ?? "未确定").join("、")}。` },
+                message: `称呼 ${e.sourceForm} 出现跨窗译法变化，尚未排除语境变体。` }));
+            if (issues.length) {
+              if (deliveryMode === "standard") {
+                result.qualityIssues = [...(result.qualityIssues ?? []), ...issues];
+              } else {
+                result.status = "failed";
+                result.error = "Cross-window surface consistency requires semantic review.";
+              }
+            }
+          }
+          siblingMemory.push(...surfaceObservations({ windowId: result.windowId, sources, translations: result.translations,
+            candidates: collectedAnchorCandidates, anchors: waveAnchorSnapshot?.anchors ?? [], previous: siblingMemory,
+            profile: context.languageProfile, usages: result.surfaceUsages }).map(c => c.payload as import("../knowledge/surface-consistency.js").SurfaceObservation));
+        }
+
         const successfulWindowIds = new Set(completionOrder.flatMap((completed) =>
           completed.result?.windows
             .filter((window) => window.status !== "failed"
@@ -4333,14 +4381,18 @@ async function runLosslessBook(
               });
             }
 
-            const candidates = windowResult.qualityIssues?.length ? [] : [
+            const surfaceCandidates = surfaceObservations({ windowId: window.windowId,
+              sources: window.blockIds.map(blockId => ({ blockId, sourceText: blockById.get(blockId)!.sourceText })),
+              translations: windowResult.translations, candidates: collectedAnchorCandidates,
+              anchors: waveAnchorSnapshot?.anchors ?? [], previous: surfaceMemory, profile: context.languageProfile, usages: windowResult.surfaceUsages });
+            const candidates = [...surfaceCandidates, ...(windowResult.qualityIssues?.length ? [] : [
               ...knowledgeCandidatesFor(
                 runId,
                 window.windowId,
                 windowResult.memoryCandidates,
               ),
               ...(assignedWaveKnowledge.get(window.windowId) ?? []),
-            ];
+            ])];
             // Validate domain reconciliation before any durable stage is written.
             coordinator.knowledge.fork().reconcileCandidates(candidates, window.windowId);
             const ordinal = relativeOrdinal.get(window.windowId) as number;

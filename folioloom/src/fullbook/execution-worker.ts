@@ -1194,6 +1194,7 @@ export function mergeFragmentTranslationResults(
       translations: logicalWindow.blockIds.map((blockId) =>
         translationsByBlock.get(blockId) as { blockId: string; text: string }),
       termUsages: parts.flatMap((part) => part.termUsages),
+      surfaceUsages: parts.flatMap(part => part.surfaceUsages ?? []),
       notes: parts.flatMap((part) => part.notes),
       memoryCandidates: parts.flatMap((part) => part.memoryCandidates),
       ...(styleObservation === undefined ? {} : { styleObservation }),

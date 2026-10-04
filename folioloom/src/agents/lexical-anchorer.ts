@@ -4,6 +4,7 @@ import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { StableTerm, V4Block } from "../domain/types.js";
+import { stripEpubStructuralMarkers } from "../source/epub-structure.js";
 import {
   entityLinkAsTerms,
   evaluateEntityLink,
@@ -49,6 +50,8 @@ export type LexicalAnchorSemanticClass =
   | "unclassified";
 
 export interface LexicalAnchor {
+  /** Preserve the model's weak classification without making it an eligible concept. */
+  proposedSemanticClass?: LexicalAnchorSemanticClass;
   sourceForm: string;
   target: string;
   mode: "stable" | "contextual";
@@ -454,8 +457,8 @@ export function collectRepeatedAnchorCandidates(
   profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
   return profile.collectAnchorCandidates({
-    targetTexts: blocks.map((block) => sourceTextForTranslation(block.sourceText)),
-    corpusTexts: blocks.map((block) => sourceTextForTranslation(block.sourceText)),
+    targetTexts: blocks.map((block) => stripEpubStructuralMarkers(sourceTextForTranslation(block.sourceText))),
+    corpusTexts: blocks.map((block) => stripEpubStructuralMarkers(sourceTextForTranslation(block.sourceText))),
     establishedSourceForms: establishedForms(stableTerms),
     limit: 24,
   }).filter((candidate) => candidate.corpusFrequency >= 2)
@@ -486,8 +489,8 @@ export function collectWindowAnchorCandidates(
   profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
   return profile.collectAnchorCandidates({
-    targetTexts: targetBlocks.map((block) => sourceTextForTranslation(block.sourceText)),
-    corpusTexts: corpusBlocks.map((block) => sourceTextForTranslation(block.sourceText)),
+    targetTexts: targetBlocks.map((block) => stripEpubStructuralMarkers(sourceTextForTranslation(block.sourceText))),
+    corpusTexts: corpusBlocks.map((block) => stripEpubStructuralMarkers(sourceTextForTranslation(block.sourceText))),
     establishedSourceForms: [
       ...establishedForms(stableTerms),
       ...decidedSourceForms,
@@ -681,6 +684,7 @@ export class LexicalAnchorer {
             && sourceAuthoredTarget !== undefined;
           return {
             ...anchor,
+            proposedSemanticClass: anchor.semanticClass ?? "unclassified",
             semanticClass,
             lockEligible: false,
             target: simplifyChineseTranslation(

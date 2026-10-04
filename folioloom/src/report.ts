@@ -374,6 +374,16 @@ export function auditLosslessBookStore(
         }
       }
     } else {
+      // A superseding revision is intentionally absent from the projectable
+      // snapshot. Consume its explicit next revision when an existing subject
+      // disappears; omission alone, gaps, or unrelated future rows are not proof.
+      for (const prior of previous.projectableRevisions()) {
+        if (payloadRevisions.some(r => r.normalizedSubject === prior.normalizedSubject && r.kind === prior.kind)) continue;
+        const index = state.knowledgeRevisions.findIndex((row, i) => !consumedKnowledgeRows.has(i)
+          && row.producingWindowId === null && row.normalizedSubject === prior.normalizedSubject && row.kind === prior.kind
+          && row.revision === prior.revision + 1 && row.status === "superseded");
+        if (index >= 0) selected.push({ index, revision: state.knowledgeRevisions[index]!.payload as KnowledgeRevision });
+      }
       for (const targetRevision of payloadRevisions) {
         const previousRevision = previous.latestRevision(
           targetRevision.normalizedSubject,
@@ -664,9 +674,14 @@ export function qualityReportJson(store: LosslessBookStore, runId: string): stri
 export function qualityReportText(store: LosslessBookStore, runId: string): string {
   const items = new QualityQueue(runId, store).items();
   const unresolved = items.filter(item => item.state !== "resolved");
+  const dispositions = items.flatMap(item => item.closure?.dispositions ?? []);
   return ["译文疑点清单", `未解决：${unresolved.length}；已解决：${items.length - unresolved.length}`, "",
+    ...(dispositions.length ? [`逐项结论：实际修复 ${dispositions.filter(d => d.status === "fixed").length}；误报 ${dispositions.filter(d => d.status === "dismissed").length}；合理变体 ${dispositions.filter(d => d.status === "variant").length}；未决 ${dispositions.filter(d => d.status === "unresolved").length}`, ""] : []),
     ...unresolved.flatMap((item, index) => [`${index + 1}. ${item.windowId}`, `状态：${item.state}`,
-      ...item.issues.map(issue => `[${issue.blockId}] ${issue.message}`), ""])].join("\n") + "\n";
+      ...item.issues.map(issue => `[${issue.blockId}] ${issue.message}`), ""]),
+    ...items.filter(item => item.closure).flatMap(item => [`${item.windowId} 逐项结案：`,
+      ...item.closure!.dispositions.map(d => `${d.issueId.slice(0, 12)} [${d.status}] ${d.note}`), ""]),
+  ].join("\n") + "\n";
 }
 
 export function deliveryLineage(store: LosslessBookStore, runId: string, mode?: DeliveryMode): LosslessBookLineage {

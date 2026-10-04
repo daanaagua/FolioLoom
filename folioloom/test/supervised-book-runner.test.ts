@@ -44,6 +44,8 @@ for (const finalRepairSucceeds of [true, false]) {
         const revise = data.event === "review" && data.candidate.some((t: any) => t.evidence.some((r: any) => r.text.includes("已经离开")));
         return answer("submit_supervisor_decision", { action: data.event === "plan" ? "translate" : revise ? "revise" : "accept",
           windowIds: data.windows.map((w: any) => w.windowId), reviewBlockIds: data.event === "plan" ? data.windows.flatMap((w: any) => w.blockIds) : [],
+          ...(data.priorIssues ? { dispositions: data.priorIssues.map((p: any) => ({ issueId: p.issueId, status: revise ? "unresolved" : "fixed",
+            sourceRef: data.source[0].evidence[0].id, targetRef: data.candidate[0].evidence[0].id, note: revise ? "否定仍丢失" : "已恢复否定" })) } : {}),
           guidance: [], reason: "核对否定含义。", issues: revise ? [{ blockId: data.candidate[0].blockId,
             sourceRef: data.source[0].evidence[0].id, targetRef: data.candidate[0].evidence[0].id, problem: "译文反转了原文的否定。" }] : [] });
       }
@@ -72,6 +74,11 @@ for (const finalRepairSucceeds of [true, false]) {
       assert.equal(store.deliveryMode("standard"), "standard");
       const records = store.qualityRecords("standard");
       assert.equal(records.at(-1)?.state, finalRepairSucceeds ? "resolved" : "unresolved");
+      if (finalRepairSucceeds) {
+        assert.equal(records.at(-1)?.closure?.policy, "issue-closure-1");
+        assert.equal(records.at(-1)?.closure?.dispositions[0]?.status, "fixed");
+        assert.ok(records.at(-1)?.closure?.dispositions.every(d => d.note.length <= 160));
+      }
       assert.equal(records.filter(r => r.state === "reviewing").length, 1);
       assert.equal(store.activeTranslations("standard")[0]?.text, finalRepairSucceeds ? good : bad);
       assert.equal(store.styleObservations("standard").length, 0);

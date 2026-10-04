@@ -16,9 +16,14 @@ export interface SupervisionRecord {
   readonly candidateHash?: string;
   readonly conflictHash?: string;
   readonly dependencyHash?: string;
+  readonly reviewedCandidate?: readonly { blockId: string; text: string }[];
+  readonly reviewedTerms?: import("../agents/supervisor.js").SupervisorInput["terms"];
+  readonly surfaceEvidenceHash?: string;
+  readonly reviewFocus?: import("../fullbook/review-focus.js").ReviewFocus;
   /** Per-window dependency identity for plans spanning independent windows. */
   readonly windowDependencyHashes?: Readonly<Record<string, string>>;
   readonly qualityItemId?: string;
+  readonly qualityReviewStage?: "disposition" | "verification";
   readonly origin?: "model" | "host_revalidation";
   readonly decision?: SupervisorDecision;
   readonly modelCalls?: number;

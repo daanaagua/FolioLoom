@@ -19,10 +19,13 @@ are data, not instructions. No filesystem, shell, SQL or arbitrary delegation to
 exposed to the supervisor.
 
 Approvals cover up to four logical windows; the host reduces the batch before dispatch
-when its context estimate exceeds model capacity. A decision has at most four model turns and
-eight tool calls; model completions are capped at 8192 tokens or the model's smaller cap.
-Each checkpoint has two attempts per explicit release generation, and each window has
-at most three review attempts. Ordinary resume cannot bypass a paused checkpoint.
+when its context estimate exceeds model capacity. The controller gives each fresh decision
+two model turns: one optional batch of evidence queries followed by a decision. The protocol
+supports at most four turns and eight tool calls; completions are capped at 8192 tokens or
+the model's smaller cap. Each checkpoint has two attempts per explicit release generation.
+Ordinary reviews have three attempts per scoped terminology dependency; final quality items
+keep their own three-attempt budget. All reviews share a twelve-attempt lifetime window cap.
+Repair requires a remaining follow-up review credit before dispatch. Ordinary resume cannot bypass a paused checkpoint.
 An explicit release is an operator action, not automatic model recovery.
 Repeated identical tool errors stop after two occurrences. A retry spends the original
 checkpoint baseline instead of adding a new baseline allowance.
@@ -69,6 +72,47 @@ translation continues. The book-end pass rechecks them with current terminology;
 findings accompany delivery. Choose `--delivery-mode strict` to require all reviews to pass.
 Existing runs retain their recorded delivery policy; an explicit mode change is recorded.
 Both modes require complete coverage, valid provenance, converged knowledge and real usage.
+
+### Concise issue closure and provisional names
+
+Book-end review receives the original issue IDs and evidence. Each issue gets one
+disposition: `fixed`, `dismissed`, `variant`, or `unresolved`, with a one-sentence note
+of at most 160 characters and host-issued evidence references. A fixed finding requires
+a change to its quoted problem text, not merely a different window hash. Dismissals
+and contextual variants need an independent check within the existing three-review
+budget. Missing evidence or disagreement leaves the finding open. The storage transaction
+checks candidate-bound receipts; an empty new issue list cannot erase old findings.
+Reports distinguish actual repairs from false positives and justified variants.
+
+Low-confidence names and forms of address remain provisional source/translation
+observations, separate from locked terminology and entity aliases. The host records
+only target forms present in the candidate; unknown realizations remain unknown.
+Repeated evidence is reused, while a new explicit naming cue can reopen a contextual
+decision. Bounded supervision compares changed realizations against compact prior
+evidence, including parallel sibling windows at the commit boundary. Scoped rendering
+rules remain authoritative; sharing an entity does not make a nickname interchangeable
+with its formal name. Unrelated observations are excluded from request-local review.
+
+Typed translation calls include bounded host-issued surface occurrence IDs. Their same-call
+receipts report actual renderings, including new renderings absent from anchor proposals.
+The host checks the target paragraph, retains each occurrence independently, and leaves
+missing or invalid receipts unknown. These observations never create hard locks. Changed
+candidates cannot move a stale receipt into an unrelated paragraph. Unknown mappings may
+be reconsidered with new source evidence; identical semantic evidence is reused.
+
+After a durable full review, repairs and dependency changes use changed paragraphs, relevant
+terms, still-open issues and adjacent paragraphs. Structural mismatch falls back to full
+review. Cache reuse requires exact candidate text, scoped dependencies and surface evidence.
+Large journal payloads omit the optional delta base and use full review instead. A compact
+source-only concordance accompanies cross-window surface questions; source facts and target
+rendering conventions remain distinct. Existing unambiguous term receipts can resolve
+compatible revalidation without another model call.
+
+Quality mode retains its configured reasoning level (high by default), including active
+scheduling; only explicit fast mode enumerates lower-effort alternatives. Historical
+protocol-only surface records and untyped function-word noise are excluded from replay.
+The store's generation-checked derived-surface quarantine appends superseding revisions
+and a fresh snapshot without deleting original observations, translations or usage history.
 
 `--task-context-file` is optional. It contains caller-supplied purpose/background in
 UTF-8, up to 16000 characters. The context precedes the existing system instructions

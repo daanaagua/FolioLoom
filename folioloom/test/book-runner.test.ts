@@ -2191,7 +2191,7 @@ test("completed waves persist a contextual role as one closed lexical concept", 
   }
 });
 
-test("a stable anchor below the projection threshold is reconsidered in the next wave", async () => {
+test("a stable anchor below the projection threshold is retained without another call for identical evidence", async () => {
   const source = "Smoky met Edgewood. Smoky left Edgewood.";
   const fixture = losslessFixture(`${source}[[]]${source}`);
   const anchorWaves: string[][] = [];
@@ -2233,9 +2233,77 @@ test("a stable anchor below the projection threshold is reconsidered in the next
   const result = await runBook(runOptions as never);
 
   assert.equal(result.status.completedWindows, 2);
-  assert.equal(anchorWaves.length, 2, JSON.stringify(anchorWaves));
-  assert.ok(anchorWaves[0]?.every((form) => anchorWaves[1]?.includes(form)));
+  assert.equal(anchorWaves.length, 1, JSON.stringify(anchorWaves));
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const observations = store.latestKnowledgeSnapshot("run-lossless").revisions.filter(r => r.kind === "lexical_surface_observation");
+    assert.equal(observations.length, 8);
+    assert.ok(observations.every(r => r.status === "provisional"));
+    assert.ok(observations.every(r => (r.payload as { confidence: number }).confidence === 0.79));
+  } finally { store.close(); }
 });
+
+for (const packed of [false, true]) {
+ test(`unregistered weak nicknames are checked across ${packed ? "packed sibling" : "resumed"} windows`, async () => {
+  const fixture = losslessFixture("They called her Copper. Copper waited for Nara at the gate. Nara arrived before sunset.[[]]Copper returned to the gate with Nara after the rain. Nara opened the door for her.");
+  let surfaceReviews = 0;
+  let anchorCalls = 0;
+  const reply = (context: Context) => {
+    const prompt = userText(context);
+    const answer = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
+    if (context.tools?.some(t => t.name === "submit_supervisor_decision")) {
+      const data = JSON.parse(prompt);
+      if (data.surfaceEvidence?.length) {
+        surfaceReviews++;
+        assert.ok(data.surfaceEvidence.some((e: any) => e.sourceForm === "Copper" && e.previous.some((p: any) => p.target === "铜铃")));
+      }
+      const bad = data.event === "review" && data.candidate.some((b: any) => b.evidence.some((r: any) => r.text.includes("小铜")));
+      return answer("submit_supervisor_decision", { action: data.event === "plan" ? "translate" : bad ? "revise" : "accept",
+        windowIds: data.windows.map((w: any) => w.windowId), reviewBlockIds: [], guidance: [], reason: "核对同一称呼。",
+        issues: bad ? [{ blockId: data.candidate[0].blockId, sourceRef: data.source[0].evidence[0].id,
+          targetRef: data.candidate[0].evidence[0].id, problem: "同一昵称无语境理由改译，应保持铜铃。" }] : [],
+        ...(data.priorIssues ? { dispositions: data.priorIssues.map((p: any) => ({ issueId: p.issueId, status: bad ? "unresolved" : "fixed",
+          sourceRef: data.source[0].evidence[0].id, targetRef: data.candidate[0].evidence[0].id, note: bad ? "昵称仍不一致" : "已统一昵称译法" })) } : {}) });
+    }
+    if (context.tools?.some(t => t.name === "submit_lexical_anchors")) {
+      anchorCalls++;
+      const raw = JSON.parse(/SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE\n\n(\[[\s\S]*?\])\n\nESTABLISHED TERMS/u.exec(prompt)![1]!);
+      return answer("submit_lexical_anchors", { anchors: raw.map((c: any) => ({ sourceForm: c.sourceForm,
+        target: c.sourceForm === "Copper" ? "铜铃" : "娜拉", semanticClass: "proper_name", mode: "stable", confidence: 0.55 })), entityLinks: [] });
+    }
+    if (context.tools?.some(t => t.name === "submit_repaired_translation")) {
+      const candidate = JSON.parse(/FAILED CANDIDATE\n\n([^\n]+)/u.exec(prompt)![1]!);
+      return answer("submit_repaired_translation", { translations: candidate.map((t: any) => ({ ...t, text: t.text.replaceAll("小铜", "铜铃") })), notes: [] });
+    }
+    const windows = JSON.parse(/WINDOWS\n\n([^\n]+)\n\nSTABLE TERMS/u.exec(prompt)![1]!);
+    const surfaceMentions = JSON.parse(/SURFACE MENTIONS\n\n([^\n]+)/u.exec(prompt)?.[1] ?? "[]");
+    return answer("finalize_translation_batch", { windows: windows.map((w: any) => ({ windowId: w.windowId, notes: [],
+      surfaceUsages: surfaceMentions.filter((m: any) => w.blocks.some((b: any) => b.blockId === m.blockId)).map((m: any) => ({ occurrenceId: m.occurrenceId,
+        targetSurface: m.sourceForm === "Copper" ? (w.blocks.some((b: any) => b.sourceText.includes("returned")) ? "小铜" : "铜铃") : "娜拉" })),
+      translations: w.blocks.map((b: any) => ({ blockId: b.blockId, text: b.sourceText.includes("returned")
+        ? "雨后小铜和娜拉回到了门口。娜拉为她打开了大门。" : "人们叫她铜铃。铜铃在门口等待娜拉。日落前，娜拉终于来了。" })) })) });
+  };
+  fixture.faux.setResponses(Array.from({ length: 25 }, () => reply));
+  const options = { ...fixture.options, supervisorMode: "bounded" as const, maxConcurrency: 1,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1000 }, maxRequestTokens: 1000,
+    maxWindowsPerRequest: packed ? 2 : 1, tinyWindowTokens: 1000 };
+  if (!packed) await runBook({ ...options, maxWindows: 1 });
+  await runBook(options);
+  assert.ok(surfaceReviews > 0);
+  assert.equal(anchorCalls, 1);
+  const store = new LosslessBookStore(options.storePath);
+  try {
+    assert.equal(store.activeTranslations("run-lossless").length, 2);
+    assert.ok(store.activeTranslations("run-lossless").every(t => !t.text.includes("小铜")));
+    assert.ok(store.latestKnowledgeSnapshot("run-lossless").revisions.some(r => r.kind === "lexical_surface_observation"));
+    if (packed) assert.equal(store.qualityRecords("run-lossless").at(-1)?.state, "resolved");
+    assert.equal(auditLosslessBookExport(store, "run-lossless").audit.strictExportable, true);
+  } finally { store.close(); }
+  const calls = fixture.faux.state.callCount;
+  await runBook(options);
+  assert.equal(fixture.faux.state.callCount, calls);
+ });
+}
 
 test("adjacent physical requests cannot commit the same ungrounded long translation", async () => {
   const fixture = losslessFixture([
@@ -2758,7 +2826,7 @@ test("low-risk windows use lean context while high-risk windows keep rich eviden
   });
 });
 
-test("active quality runs can select a lower legal effort variant", async () => {
+test("active quality runs retain the selected effort even when cheaper variants are supplied", async () => {
   const fixture = losslessFixture("a quiet room.");
   const low = fauxProvider();
   const high = fauxProvider();
@@ -2802,8 +2870,8 @@ test("active quality runs can select a lower legal effort variant", async () => 
   });
 
   assert.equal(result.status.completedWindows, 1);
-  assert.equal(low.state.callCount, 1);
-  assert.equal(high.state.callCount, 0);
+  assert.equal(low.state.callCount, 0);
+  assert.equal(high.state.callCount, 1);
 });
 
 test("evidence at least twenty-four blocks away forces rich context", async () => {

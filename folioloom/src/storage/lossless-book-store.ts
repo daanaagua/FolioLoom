@@ -21,6 +21,8 @@ import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import { validateCandidateCheckpoint, type CandidateCheckpointRecord } from "../fullbook/candidate-checkpoint.js";
 import { validateRecoveryRecord, type RecoveryRecord } from "../fullbook/automatic-recovery.js";
 import { QualityQueue, validateQualityRecord, type QualityRecord, type DeliveryMode } from "../fullbook/delivery-policy.js";
+import { assertQualityClosure, priorQualityIssues, needsDispositionVerification, type QualityClosure } from "../domain/quality-closure.js";
+import { validateSurfaceObservation, surfaceObservationNoiseReason } from "../knowledge/surface-consistency.js";
 import { supervisionCandidateHash } from "../domain/supervision.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
@@ -2239,8 +2241,17 @@ export class LosslessBookStore {
       }
       const expected = this.#membership(input.runId, input.windowId);
       this.#validateTranslations(input.translations, expected);
+      const surfaceCandidates = input.knowledgeCandidates.filter(c => c.kind === "lexical_surface_observation");
+      if (surfaceCandidates.length) {
+        const sources = all<{ blockId: string; sourceText: string }>(this.#database.prepare(`
+          SELECT b.block_id AS blockId, b.source_text AS sourceText FROM logical_blocks AS b
+          JOIN window_membership AS m ON b.source_version=m.source_version AND b.block_id=m.block_id
+          WHERE m.run_id=? AND m.window_id=?`), input.runId, input.windowId);
+        for (const candidate of surfaceCandidates) validateSurfaceObservation(candidate.payload, input.windowId, sources, input.translations);
+      }
       if (input.qualityIssues?.length) {
-        if (input.knowledgeCandidates.length || input.styleTail) throw new Error("quality-deferred window cannot publish memory or style");
+        if (input.knowledgeCandidates.some(c => c.kind !== "lexical_surface_observation") || input.styleTail)
+          throw new Error("quality-deferred window cannot publish memory or style");
         new QualityQueue(input.runId, {
           qualityRecords: runId => this.qualityRecords(runId),
           appendQualityRecord: (runId, record) => this.#appendQualityRecord(runId, record),
@@ -6151,6 +6162,32 @@ export class LosslessBookStore {
     });
   }
 
+  /** Retire known-invalid derived observations without changing text, usage, approvals or source history. */
+  quarantineDerivedSurfaces(runId: string, expectedGeneration: number, expectedSnapshotId: string): { revisionIds: string[]; snapshotId: string; generation: number } {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) throw new Error("current write schema required");
+    return this.#transaction(() => {
+      const state = this.knowledgeState(runId);
+      if (state.generation !== expectedGeneration || state.snapshotId !== expectedSnapshotId) throw new Error("KNOWLEDGE_GENERATION_CONFLICT");
+      if (this.allWindows(runId).some(w => w.status === "running" || w.status === "staged")) throw new Error("KNOWLEDGE_EDIT_BUSY");
+      const domain = new KnowledgeStore(this.knowledgeRevisions(runId));
+      const invalid = domain.projectableRevisions().filter(r => r.kind === "lexical_surface_observation"
+        && (!r.authority || r.authority.origin === "model") && surfaceObservationNoiseReason(r.payload));
+      if (!invalid.length) return { revisionIds: [], snapshotId: state.snapshotId, generation: state.generation };
+      const revisionIds = invalid.map(r => {
+        const revision = domain.appendRevision({ ...r, status: "superseded" });
+        this.#insertRunKnowledgeRevision(runId, revision, null, [], undefined);
+        return revision.revisionId;
+      });
+      const snapshot = createKnowledgeSnapshot(runId, domain.projectableRevisions(), state.snapshotId);
+      this.#database.prepare(`INSERT INTO knowledge_snapshots(run_id, snapshot_id, parent_snapshot_id, producing_window_id, content_hash, payload_json)
+        VALUES(?, ?, ?, NULL, ?, ?)`).run(runId, snapshot.id, state.snapshotId, snapshot.contentHash, jsonText(snapshot, "derived surface quarantine snapshot"));
+      this.#database.prepare("UPDATE knowledge_state SET generation=generation+1, updated_at=datetime('now') WHERE run_id=? AND generation=?").run(runId, state.generation);
+      this.#appendEvent(runId, "derived_surface_quarantine", { policy: "surface-noise-1", priorSnapshotId: state.snapshotId, snapshotId: snapshot.id,
+        retired: invalid.map(r => ({ revisionId: r.revisionId, reason: surfaceObservationNoiseReason(r.payload) })), revisionIds });
+      return { revisionIds, snapshotId: snapshot.id, generation: state.generation + 1 };
+    });
+  }
+
   latestKnowledgeSnapshot(runId: string): KnowledgeSnapshot {
     this.#run(runId);
     const row = one<{ snapshot_id: string; payload_json: string }>(
@@ -6240,6 +6277,7 @@ export class LosslessBookStore {
     runId: string; itemId: string; expectedHash: string; snapshotId: string;
     translations: StagedTranslationInput[]; bindings: WindowConceptBindingsInput;
     issues: readonly import("../tools/repair-tools.js").ValidationFailure[];
+    closure?: QualityClosure;
   }): void {
     this.#transaction(() => {
       const queue = new QualityQueue(input.runId, {
@@ -6255,6 +6293,28 @@ export class LosslessBookStore {
       if (this.latestKnowledgeSnapshot(input.runId).id !== input.snapshotId) throw new Error("quality snapshot changed during final review");
       this.#validateTranslations(input.translations, this.#membership(input.runId, item.windowId));
       const newHash = supervisionCandidateHash(input.translations);
+      const prior = priorQualityIssues(item.issues);
+      const closure = input.closure;
+      if (closure) {
+        assertQualityClosure(prior, closure, newHash);
+        const records = this.supervisionRecords(input.runId);
+        const main = records.find(r => r.id === closure.decisionId && r.state === "completed"
+          && r.qualityItemId === item.itemId && r.candidateHash === newHash && r.qualityReviewStage === "disposition");
+        const verification = records.find(r => r.id === closure.verificationDecisionId && r.state === "completed"
+          && r.qualityItemId === item.itemId && r.candidateHash === newHash && r.qualityReviewStage === "verification");
+        for (const d of closure.dispositions.filter(d => d.status !== "unresolved")) {
+          const original = prior.find(p => p.issueId === d.issueId)!;
+          if (!main?.decision?.dispositions?.some(p => canonicalJson(p) === canonicalJson(d))) throw new Error("quality closure has no recorded decision");
+          if (needsDispositionVerification(d) && (!verification?.decision?.dispositions?.some(p => p.issueId === d.issueId && p.status === d.status)
+            || verification.decision.issues.length)) throw new Error("quality closure has no independent verification");
+          const target = input.translations.find(t => t.blockId === original.blockId)?.text;
+          if (!target?.includes(d.targetQuote) || (d.status === "fixed" && (!original.targetQuote || target.includes(original.targetQuote))))
+            throw new Error("quality closure does not match changed issue evidence");
+        }
+      }
+      // Missing/stale receipts retain the old issues, even if a worker returned an empty list.
+      const openPrior = prior.flatMap((p, index) => closure?.dispositions.some(d => d.issueId === p.issueId && d.status !== "unresolved") ? [] : [item.issues[index]!]);
+      const remaining = [...new Map([...openPrior, ...input.issues].map(i => [i.issueKey ?? i.message, i])).values()];
       if (newHash !== input.expectedHash) {
         const open = one<{ count: number }>(this.#database.prepare(`
           SELECT COUNT(*) AS count FROM knowledge_revalidation_tasks AS q JOIN translations AS t ON t.translation_id=q.translation_id
@@ -6278,7 +6338,7 @@ export class LosslessBookStore {
         this.#appendEvent(input.runId, "quality_window_replaced", { itemId: item.itemId, windowId: item.windowId,
           oldHash: input.expectedHash, newHash, oldVersions: current.map(t => ({ blockId: t.blockId, version: t.version })) });
       }
-      queue.finish(item.itemId, input.issues.length ? "unresolved" : "resolved", newHash, input.issues);
+      queue.finish(item.itemId, remaining.length ? "unresolved" : "resolved", newHash, remaining, undefined, closure);
     });
   }
 

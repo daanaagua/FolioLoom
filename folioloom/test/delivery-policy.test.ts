@@ -48,9 +48,9 @@ test("queue cannot waive hard validation or replace evidence after finalization"
   const item = f.queue().defer(f.input);
   assert.throws(() => f.queue().finish(item.itemId, "resolved", f.input.candidateHash, []), /not reviewing/u);
   f.queue().claimFinal(item.itemId);
-  f.queue().finish(item.itemId, "resolved", "b".repeat(64), []);
-  assert.equal(f.queue().items()[0]?.candidateHash, "b".repeat(64));
-  assert.equal(f.queue().items()[0]?.state, "resolved");
+  assert.throws(() => f.queue().finish(item.itemId, "resolved", "b".repeat(64), []), /closure/u);
+  f.queue().finish(item.itemId, "unresolved", "b".repeat(64), f.input.issues);
+  assert.equal(f.queue().items()[0]?.state, "unresolved");
   assert.throws(() => f.queue().finish(item.itemId, "unresolved", f.input.candidateHash, f.input.issues), /not reviewing/u);
 });
 

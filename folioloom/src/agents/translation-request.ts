@@ -1,4 +1,5 @@
 import type { StableTerm } from "../domain/types.js";
+import type { SurfaceMention, SurfaceUsage, SurfaceUsageSubmission } from "../knowledge/surface-consistency.js";
 import type { ParagraphFragmentExecutionScope } from "../fullbook/paragraph-fragment.js";
 import type { PhysicalRequestPlan } from "../fullbook/types.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
@@ -49,6 +50,7 @@ export interface FinalizeTranslationBatchArgs {
     windowId: string;
     translations: Array<{ blockId: string; text: string }>;
     termUsages?: TermUsageSubmission[];
+    surfaceUsages?: SurfaceUsageSubmission[];
     notes: string[];
     memoryCandidates?: TranslationMemoryCandidate[];
     styleObservation?: StyleObservationSubmission;
@@ -69,6 +71,7 @@ interface FinalizeTranslationBatchWireArgs {
     translations: FinalizeTranslationWireTranslation[];
   }>;
   termUsages?: TermUsageSubmission[];
+  surfaceUsages?: SurfaceUsageSubmission[];
   notes?: string[];
   memoryCandidates?: TranslationMemoryCandidate[];
   styleObservation?: StyleObservationSubmission;
@@ -79,6 +82,7 @@ interface FinalizeParagraphFragmentWireArgs {
 }
 
 const FINALIZER_METADATA_KEYS = [
+  "surfaceUsages",
   "termUsages",
   "notes",
   "memoryCandidates",
@@ -184,12 +188,13 @@ export interface TranslationBatchSnapshot {
  * object is what must be measured before a request can be admitted.
  */
 export interface TranslationRequestInput {
+  surfaceMentions?: readonly SurfaceMention[];
   /** Host policy, not a model-supplied receipt field. */
   deliveryMode?: import("../fullbook/delivery-policy.js").DeliveryMode;
   /** New supervised runs use constrained identities and host-owned receipt coordinates. */
   strictIdentifiers?: boolean;
   supervisorGuidance?: readonly import("./supervisor.js").SupervisorGuidance[];
-  reviewCandidate?: (window: { windowId: string; translations: Array<{ blockId: string; text: string }> }) => Promise<readonly import("../tools/repair-tools.js").ValidationFailure[]>;
+  reviewCandidate?: (window: { windowId: string; translations: Array<{ blockId: string; text: string }>; surfaceUsages?: SurfaceUsage[] }) => Promise<readonly import("../tools/repair-tools.js").ValidationFailure[]>;
   canReviewRepairedCandidate?: (windowId: string) => boolean;
   request: PhysicalRequestPlan;
   blocks: readonly LosslessBlock[];
@@ -262,6 +267,7 @@ function finalizerTool(
   expectedWindowId?: string,
   sourceLanguageProfile: SourceLanguageProfile = getSourceLanguageProfile("en"),
   strictScope?: { windowIds: readonly string[]; blockIds: readonly string[]; occurrences: readonly ExpectedTermOccurrence[] },
+  surfaceMentions: readonly SurfaceMention[] = [],
 ): TypedToolSpec<any> {
   const onFinalize = requireFinalizer(hooks);
   if (paragraphFragment !== undefined && expectedWindowId === undefined) {
@@ -323,6 +329,11 @@ function finalizerTool(
     targetSurface: Type.String(),
   }, { additionalProperties: false }), { maxItems: strictScope === undefined ? 512 : strictScope.occurrences.length });
   const notesSchema = Type.Array(Type.String());
+  const surfaceProperties: Parameters<typeof Type.Object>[0] = surfaceMentions.length && paragraphFragment === undefined ? {
+    surfaceUsages: Type.Optional(Type.Array(Type.Object({
+      occurrenceId: Type.String({ enum: surfaceMentions.map(m => m.occurrenceId) }), targetSurface: Type.String({ maxLength: 120 }),
+    }, { additionalProperties: false }), { maxItems: surfaceMentions.length })),
+  } : {};
   const memoryCandidatesSchema = Type.Array(Type.Object({
     kind: Type.Union(
       TRANSLATION_MEMORY_KINDS.map((kind) => Type.Literal(kind)),
@@ -386,6 +397,7 @@ function finalizerTool(
     };
   }
   const wholeWindowProperties = {
+    ...surfaceProperties,
     windowId: paragraphFragment === undefined
       ? Type.String(strictScope === undefined ? {} : { enum: [...strictScope.windowIds] })
       : Type.Literal(expectedWindowId!),
@@ -420,6 +432,7 @@ function finalizerTool(
     phase: "translation",
     parameters: paragraphFragment === undefined
       ? Type.Object({
+        ...surfaceProperties,
         windows: Type.Array(Type.Object(
           wholeWindowProperties,
           { additionalProperties: false },
@@ -691,6 +704,8 @@ export function prepareTranslationRequest(
   const requestedBlockIds = new Set(windows.flatMap((window) =>
     window.blocks.map((block) => block.blockId)));
   const termOccurrences = expectedTermOccurrencesForTranslationInput(input);
+  const surfaceMentions = input.paragraphFragment === undefined && responseProtocol === "typed_tool"
+    ? (input.surfaceMentions ?? []).filter(m => requestedBlockIds.has(m.blockId)) : [];
   const wireTermOccurrences = termOccurrences.map(withoutLocalTermRevision);
   const knowledgeContext = translationKnowledgeWireContext(input, windows);
   const framedProtocol = responseProtocol === "framed_text"
@@ -833,6 +848,7 @@ export function prepareTranslationRequest(
         blockIds: input.request.windows.flatMap(w => w.blockIds),
         occurrences: termOccurrences,
       } : undefined,
+      surfaceMentions,
     )]
     : [];
   if (input.supervisorGuidance?.length) {
@@ -843,6 +859,13 @@ export function prepareTranslationRequest(
       jsonPayload: guidance,
     });
   }
+  if (surfaceMentions.length) sections.splice(sections.length - 1, 0, {
+    kind: "terms", jsonPayload: surfaceMentions,
+    text: ["SURFACE MENTIONS", JSON.stringify(surfaceMentions.map(({ sourceQuote: _quote, sourceStart: _start, ...m }) => ({ ...m,
+      occurrenceInParagraph: surfaceMentions.filter(n => n.blockId === m.blockId && n.paragraphIndex === m.paragraphIndex && n.sourceForm === m.sourceForm)
+        .findIndex(n => n.occurrenceId === m.occurrenceId) + 1 }))),
+      "Return surfaceUsages [{occurrenceId,targetSurface}] in the owning window, using the exact actual rendering for each listed occurrence in its corresponding target paragraph. Use an empty surface only when no explicit rendering exists. These are provisional observations, not locked terms or identity aliases. preferredTarget is a scoped continuity preference; preserve distinct names, nicknames, ambiguity and contextual meanings."].join("\n\n"),
+  });
   const schemas = tools.map(serializableToolSchema);
   return {
     systemPrompt: translationBatchSystemPrompt(

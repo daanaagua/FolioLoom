@@ -14,6 +14,7 @@ import {
 export interface ValidationFailure {
   /** Host-owned identity excluding mutable candidate quotations. */
   issueKey?: string;
+  evidence?: { sourceQuote: string; targetQuote: string; problem: string };
   code: string;
   blockId?: string;
   message: string;

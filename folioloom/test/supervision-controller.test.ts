@@ -27,6 +27,35 @@ function fixture(options: { sourceText?: string; contextWindow?: number; maxConc
 }
 const plan = { action: "translate", windowIds: ["w1", "w2"], reviewBlockIds: ["b1"], guidance: [], issues: [], reason: "审校否定。" };
 
+for (const confirms of [true, false]) {
+  test(`unchanged candidate dismissal needs one independent bounded receipt (confirmed: ${confirms})`, async () => {
+    const f = fixture();
+    const candidate = [{ blockId: "b1", text: "他没有离开。" }];
+    const prior = [{ issueKey: "old-negation", code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b1", repairable: true,
+      message: "核对否定。", evidence: { sourceQuote: "He did not leave.", targetQuote: "他没有离开。", problem: "核对否定。" } }];
+    const reply = (context: import("@earendil-works/pi-ai").Context) => {
+      const message = context.messages.findLast(m => m.role === "user")!;
+      const data = JSON.parse(typeof message.content === "string" ? message.content : message.content.filter(c => c.type === "text").map(c => c.text).join("\n"));
+      assert.equal(data.priorIssues.length, 1);
+      assert.equal(data.proposedVerdict, undefined, "independent verification must not be primed with the draft verdict");
+      return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", { action: "accept", windowIds: ["w1"],
+        reviewBlockIds: [], guidance: [], issues: [], reason: "核对原文否定。", dispositions: [{ issueId: "old-negation",
+          status: data.qualityReviewStage === "verification" && !confirms ? "unresolved" : "dismissed",
+          sourceRef: data.source[0].evidence[0].id, targetRef: data.candidate[0].evidence[0].id, note: "现译文保留否定。" }] }), { stopReason: "toolUse" });
+    };
+    f.faux.setResponses([reply, reply]);
+    const qualityId = "a".repeat(64);
+    assert.equal((await f.controller.reviewFinal(qualityId, "w1", candidate, [], prior)).length, confirms ? 0 : 1);
+    assert.equal(f.faux.state.callCount, 2);
+    const closure = f.controller.finalClosure(qualityId, candidate)!;
+    assert.equal(closure.dispositions[0]?.status, confirms ? "dismissed" : "unresolved");
+    assert.ok(closure.verificationDecisionId);
+    await f.controller.reviewFinal(qualityId, "w1", candidate, [], prior);
+    assert.equal(f.faux.state.callCount, 2, "cached verification must not replenish or spend another call");
+    assert.ok(f.ledger.reconcile().consistent);
+  });
+}
+
 test("independent reviews overlap while duplicate review shares the completed receipt", { timeout: 3000 }, async () => {
   const f = fixture({ maxConcurrency: 2 });
   const release = Promise.withResolvers<void>();
@@ -240,6 +269,48 @@ test("planning shrinks an oversized batch before dispatch instead of stopping a 
   }]);
   assert.deepEqual((await f.controller.planFor("w1", [])).windowIds, ["w1"]);
   assert.equal(f.faux.state.callCount, 1);
+});
+
+test("a repaired candidate uses durable paragraph deltas and identical deltas do not spend another call", async () => {
+  const sourceText = Array.from({ length: 8 }, (_, i) => `Paragraph ${i}. ${"The traveler waited. ".repeat(16)}`).join("\n\n");
+  const f = fixture({ sourceText });
+  const text = Array.from({ length: 8 }, (_, i) => `第${i}段。${"旅人等着。".repeat(45)}`).join("\n\n");
+  const accept = { ...plan, action: "accept", windowIds: ["w1"], reviewBlockIds: [] };
+  let fullBytes = 0;
+  const reply = (delta: boolean) => (context: import("@earendil-works/pi-ai").Context) => {
+    const user = context.messages.findLast(m => m.role === "user")!;
+    const prompt = typeof user.content === "string" ? user.content : user.content.filter(c => c.type === "text").map(c => c.text).join("\n");
+    const data = JSON.parse(prompt);
+    assert.equal(!!data.reviewFocus, delta);
+    if (!delta) fullBytes = prompt.length;
+    else assert.ok(prompt.length < fullBytes, "delta payload must actually be smaller");
+    return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", accept), { stopReason: "toolUse" });
+  };
+  f.faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" }), reply(false), reply(true)]);
+  await f.controller.planFor("w1", []);
+  await f.controller.review("w1", [{ blockId: "b1", text }], []);
+  const repaired = [{ blockId: "b1", text: text.replace("第4段", "第四段") }];
+  await f.controller.review("w1", repaired, []);
+  await f.controller.review("w1", repaired, []);
+  assert.equal(f.faux.state.callCount, 3);
+});
+
+test("dependency epochs reserve repair review without resetting the lifetime ceiling", async () => {
+  const f = fixture();
+  const accept = { ...plan, action: "accept", windowIds: ["w1"], reviewBlockIds: [] };
+  f.faux.setResponses([plan, ...Array.from({ length: 12 }, () => accept)].map(value => fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", value), { stopReason: "toolUse" })));
+  await f.controller.planFor("w1", []);
+  for (let epoch = 0; epoch < 4; epoch++) {
+    const terms = [{ sourceForm: "He", target: `人物${epoch}` }];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      assert.equal(f.controller.canReview("w1", undefined, terms), true);
+      await f.controller.review("w1", [{ blockId: "b1", text: `人物${epoch}没有离开${attempt}。` }], terms);
+    }
+    assert.equal(f.controller.canReview("w1", undefined, terms), false);
+  }
+  assert.equal(f.controller.canReview("w1", undefined, [{ sourceForm: "He", target: "新人物" }]), false);
+  assert.equal(f.faux.state.callCount, 13);
+  assert.ok(f.ledger.reconcile().consistent);
 });
 
 test("revalidation refreshes only the affected window's terminology dependency", async () => {

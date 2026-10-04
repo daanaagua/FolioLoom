@@ -44,6 +44,15 @@ const typhonTerm: StableTerm = {
   locked: true,
 };
 
+test("EPUB slot identifiers never enter name concordance or consume candidate slots", () => {
+  const sources = [block("⟦E1.0.0⟧Copper called Nara.⟦/E1.0.0⟧ Copper greeted Nara.", 0)];
+  const candidates = collectWindowAnchorCandidates(sources, sources, []);
+  assert.ok(candidates.some(c => c.sourceForm === "Copper"));
+  assert.ok(candidates.every(c => !/^E\d+\./u.test(c.sourceForm)));
+  assert.ok(candidates.every(c => c.contexts.every(q => !q.includes("⟦"))));
+  assert.ok(collectRepeatedAnchorCandidates(sources, []).every(c => !/^E\d+\./u.test(c.sourceForm)));
+});
+
 test("legacy cached model anchors are downgraded to preferred constraints", () => {
   const softened = softenModelAnchorTerm({
     conceptId: "run-anchor-legacy",

@@ -16,6 +16,25 @@ function fixture() {
 }
 const plan = { action: "translate", windowIds: ["w1", "w2"], reviewBlockIds: ["b1"], guidance: [], issues: [], reason: "先译两个窗口，再检查否定含义。" };
 
+test("final review must account for each prior issue with short grounded dispositions", () => {
+  const { input } = fixture();
+  const review: SupervisorInput = { ...input, event: "review", windows: [input.windows[0]!],
+    candidate: [{ blockId: "b1", text: "罗斯离开了。她在等待。" }],
+    priorIssues: [{ issueId: "q1", blockId: "b1", sourceQuote: "did not leave", targetQuote: "罗斯离开了", problem: "否定丢失" }] } as SupervisorInput;
+  const raw = { action: "accept", windowIds: ["w1"], reviewBlockIds: [], guidance: [], issues: [], reason: "核对完成" };
+  assert.throws(() => validateSupervisorDecision(raw, review), /dispositions/u);
+  const prompt = JSON.parse(supervisorPrompt(review));
+  const disposition = { issueId: "q1", status: "fixed", sourceRef: prompt.source[0].evidence[0].id,
+    targetRef: prompt.candidate[0].evidence[0].id, note: "恢复否定" };
+  assert.throws(() => validateSupervisorDecision({ ...raw, dispositions: [disposition] }, review), /unchanged|fixed/u);
+  assert.throws(() => validateSupervisorDecision({ ...raw, dispositions: [{ ...disposition, status: "dismissed", note: "长".repeat(161) }] }, review), /note/u);
+  assert.throws(() => validateSupervisorDecision({ ...raw, dispositions: [{ ...disposition, issueId: "other" }] }, review), /issue/u);
+  const corrected = { ...review, candidate: [{ blockId: "b1", text: "罗斯没有离开。她在等待。" }] };
+  const correctedPrompt = JSON.parse(supervisorPrompt(corrected));
+  const checked = validateSupervisorDecision({ ...raw, dispositions: [{ ...disposition, targetRef: correctedPrompt.candidate[0].evidence[0].id }] }, corrected);
+  assert.equal((checked as any).dispositions[0].status, "fixed");
+});
+
 test("supervisor can search evidence then authorize a bounded batch using native Pi", async () => {
   const { faux, input } = fixture();
   const seen: string[] = [];
