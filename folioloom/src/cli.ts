@@ -69,7 +69,7 @@ import {
 } from "./report.js";
 import { verifyExport } from "./export/export-verifier.js";
 import { AutomaticRecovery } from "./fullbook/automatic-recovery.js";
-import { QualityQueue } from "./fullbook/delivery-policy.js";
+import { QualityQueue, type QualityReworkRequest } from "./fullbook/delivery-policy.js";
 import { importLegacyV1 } from "./migration/v1-importer.js";
 import { auditSourceCoverage } from "./source/auditor.js";
 import {
@@ -92,6 +92,8 @@ import {
 export type CliCommand =
   | "book-supervisor-status"
   | "book-supervisor-release"
+  | "book-quality-status"
+  | "book-quality-rework"
   | "preview"
   | "book-import"
   | "book-preflight"
@@ -917,6 +919,14 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       store: pathValue(values, "--store"), runId: identifierValue(values, "--run"),
       requestId: identifierValue(values, "--request"), supervisorReason: identifierValue(values, "--reason") };
   }
+  if (action === "quality") {
+    const sub = argv[2];
+    if (sub !== "status" && sub !== "rework") throw new Error("book quality requires status or rework");
+    const { values } = parseFlags(argv.slice(3), `book quality ${sub}`, sub === "status" ? ["--store", "--run"] : ["--store", "--run", "--input"]);
+    return { command: sub === "status" ? "book-quality-status" : "book-quality-rework",
+      store: pathValue(values, "--store"), runId: identifierValue(values, "--run"),
+      ...(sub === "rework" ? { input: pathValue(values, "--input") } : {}) };
+  }
   if (action === "run") {
     const { values } = parseFlags(
       argv.slice(2),
@@ -1174,6 +1184,19 @@ export async function main(
   dependencyOverrides: Partial<CliRuntimeDependencies> = {},
 ): Promise<void> {
   const options = parseArgs(argv);
+  if (options.command === "book-quality-status" || options.command === "book-quality-rework") {
+    const store = options.command === "book-quality-status"
+      ? LosslessBookStore.openReadOnly(requireOption(options, "store")) : new LosslessBookStore(requireOption(options, "store"));
+    try {
+      const runId = requireOption(options, "runId");
+      if (options.command === "book-quality-rework") {
+        const request = JSON.parse(readFileSync(requireOption(options, "input"), "utf8")) as QualityReworkRequest;
+        store.requestQualityRework(runId, request);
+      }
+      console.log(JSON.stringify({ schema: "folioloom-quality-status-1", runId, items: new QualityQueue(runId, store).items() }, null, 2));
+    } finally { store.close(); }
+    return;
+  }
   if (options.command === "book-supervisor-status" || options.command === "book-supervisor-release") {
     const store = new LosslessBookStore(requireOption(options, "store"));
     try {

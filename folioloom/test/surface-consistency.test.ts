@@ -11,6 +11,17 @@ const source = [{ blockId: "b1", sourceText: "They called her Copper. Copper wai
 const anchors = [{ sourceForm: "Copper", target: "铜铃", mode: "stable" as const, semanticClass: "unclassified" as const,
   proposedSemanticClass: "proper_name" as const, confidence: 0.55 }];
 const candidates = [{ sourceForm: "Copper", likelyProperName: true, corpusFrequency: 4, contexts: [source[0]!.sourceText] }];
+
+test("fragment receipts ground only owned source occurrences in local target paragraphs", () => {
+  const sources = [{ blockId: "b1", sourceText: "Copper waited.\n\nThe bell rang.\n\nCopper returned." }];
+  const mentions = surfaceMentions(sources, anchors, [], profile);
+  const start = sources[0]!.sourceText.lastIndexOf("Copper");
+  const scope = { blockId: "b1", paragraphs: [{ ordinal: 2, utf16Start: start, utf16End: sources[0]!.sourceText.length }] };
+  const usages = groundSurfaceUsages(mentions, mentions.map(m => ({ occurrenceId: m.occurrenceId, targetSurface: "铜铃" })),
+    [{ blockId: "b1", text: "铜铃回来了。" }], scope);
+  assert.deepEqual(usages.map(u => u.occurrenceId), [mentions[1]!.occurrenceId]);
+  assert.equal(usages[0]?.paragraphIndex, 2, "persist global coordinates, not the fragment-local index");
+});
 test("actual per-occurrence receipts retain novel and conflicting renderings without locks", () => {
   const mentions = surfaceMentions(source, anchors, [], profile);
   assert.equal(mentions.length, 2);

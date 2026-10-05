@@ -20,10 +20,11 @@ import { gzipSync } from "node:zlib";
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import { validateCandidateCheckpoint, type CandidateCheckpointRecord } from "../fullbook/candidate-checkpoint.js";
 import { validateRecoveryRecord, type RecoveryRecord } from "../fullbook/automatic-recovery.js";
-import { QualityQueue, validateQualityRecord, type QualityRecord, type DeliveryMode } from "../fullbook/delivery-policy.js";
-import { assertQualityClosure, priorQualityIssues, needsDispositionVerification, type QualityClosure } from "../domain/quality-closure.js";
+import { QualityQueue, qualityReviewId, validateQualityRecord, type QualityRecord, type QualityReworkRequest, type DeliveryMode } from "../fullbook/delivery-policy.js";
+import { assertQualityClosure, hasChangedIssueEvidence, priorQualityIssues, needsDispositionVerification, type QualityClosure } from "../domain/quality-closure.js";
 import { validateSurfaceObservation, surfaceObservationNoiseReason } from "../knowledge/surface-consistency.js";
-import { supervisionCandidateHash } from "../domain/supervision.js";
+import { MAX_LIFETIME_REVIEWS_PER_WINDOW, SUPERVISION_POLICY, supervisionCandidateHash } from "../domain/supervision.js";
+import { RunLease } from "../kernel/run-lease.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
 import {
@@ -6299,16 +6300,17 @@ export class LosslessBookStore {
         assertQualityClosure(prior, closure, newHash);
         const records = this.supervisionRecords(input.runId);
         const main = records.find(r => r.id === closure.decisionId && r.state === "completed"
-          && r.qualityItemId === item.itemId && r.candidateHash === newHash && r.qualityReviewStage === "disposition");
+          && r.qualityItemId === qualityReviewId(item) && r.candidateHash === newHash && r.qualityReviewStage === "disposition");
         const verification = records.find(r => r.id === closure.verificationDecisionId && r.state === "completed"
-          && r.qualityItemId === item.itemId && r.candidateHash === newHash && r.qualityReviewStage === "verification");
+          && r.qualityItemId === qualityReviewId(item) && r.candidateHash === newHash && r.qualityReviewStage === "verification");
         for (const d of closure.dispositions.filter(d => d.status !== "unresolved")) {
           const original = prior.find(p => p.issueId === d.issueId)!;
           if (!main?.decision?.dispositions?.some(p => canonicalJson(p) === canonicalJson(d))) throw new Error("quality closure has no recorded decision");
           if (needsDispositionVerification(d) && (!verification?.decision?.dispositions?.some(p => p.issueId === d.issueId && p.status === d.status)
             || verification.decision.issues.length)) throw new Error("quality closure has no independent verification");
           const target = input.translations.find(t => t.blockId === original.blockId)?.text;
-          if (!target?.includes(d.targetQuote) || (d.status === "fixed" && (!original.targetQuote || target.includes(original.targetQuote))))
+          if (!target?.includes(d.targetQuote) || (d.status === "fixed" && !hasChangedIssueEvidence(original.targetQuote, target,
+            current.find(t => t.blockId === original.blockId)?.text)))
             throw new Error("quality closure does not match changed issue evidence");
         }
       }
@@ -6652,6 +6654,31 @@ export class LosslessBookStore {
     return all<{ payload_json: string }>(this.#database.prepare(`
       SELECT payload_json FROM events WHERE run_id=? AND kind='quality_record' ORDER BY sequence
     `), runId).map(row => JSON.parse(row.payload_json) as QualityRecord);
+  }
+
+  requestQualityRework(runId: string, request: QualityReworkRequest): QualityRecord {
+    this.#run(runId);
+    const lease = RunLease.acquire(`${this.#databasePath}.run.lock`, `lossless:${runId}`);
+    try {
+      return this.#transaction(() => {
+        const queue = new QualityQueue(runId, { qualityRecords: id => this.qualityRecords(id),
+          appendQualityRecord: (id, record) => this.#appendQualityRecord(id, record) });
+        // An exact request replay never spends another credit, even after completion.
+        if (this.qualityRecords(runId).some(r => r.state === "pending" && r.rework?.requestId === request?.requestId))
+          return queue.requestRework(request);
+        const items = queue.items();
+        if (this.allWindows(runId).some(w => w.status === "running" || w.status === "staged")
+          || items.some(q => q.state === "reviewing")) throw new Error("quality rework requires an idle run");
+        const item = items.find(q => q.itemId === request?.itemId);
+        if (!item) throw new Error("unknown quality item");
+        const current = this.activeTranslations(runId).filter(t => t.windowId === item.windowId);
+        if (supervisionCandidateHash(current) !== request.expectedCandidateHash) throw new Error("stale quality rework candidate");
+        const reviews = this.supervisionRecords(runId).filter(r => r.event === "review" && r.state === "started" && r.windowIds.includes(item.windowId));
+        if (reviews.length + SUPERVISION_POLICY.maxReviewsPerWindow > MAX_LIFETIME_REVIEWS_PER_WINDOW)
+          throw new Error("quality rework has insufficient lifetime review credit");
+        return queue.requestRework(request);
+      });
+    } finally { lease.release(); }
   }
 
   appendQualityRecord(runId: string, record: QualityRecord): void {

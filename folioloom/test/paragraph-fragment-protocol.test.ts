@@ -74,6 +74,19 @@ const executionScope = {
   rightSourceContext: unit.rightSourceContext,
 };
 
+test("fragment translation wire includes receipts only for its owned paragraph occurrences", () => {
+  const make = (id: string, paragraphIndex: number, sourceStart: number) => ({ occurrenceId: id, sourceForm: "paragraph",
+    blockId: sourceBlock.id, paragraphIndex, sourceStart, sourceQuote: "paragraph" });
+  const inside = make("surface-inside", unit.paragraphs[0]!.ordinal, unit.paragraphs[0]!.utf16Start + unit.paragraphs[0]!.sourceText.indexOf("paragraph"));
+  const outside = make("surface-context-only", 0, sourceText.indexOf("paragraph"));
+  const prepared = prepareTranslationRequest({ request, blocks: [sourceBlock], stableTerms: [],
+    snapshot: { id: "snapshot-1", revisions: [] }, paragraphFragment: executionScope, surfaceMentions: [outside, inside] });
+  assert.match(prepared.prompt, /SURFACE MENTIONS/u);
+  assert.match(prepared.serializedToolSchemas, /surfaceUsages/u);
+  assert.match(prepared.serializedToolSchemas, /surface-inside/u);
+  assert.doesNotMatch(prepared.serializedToolSchemas, /surface-context-only/u);
+});
+
 test("fragment typed prompt distinguishes target paragraphs from context-only source", () => {
   const prepared = prepareTranslationRequest({
     request,
@@ -142,6 +155,27 @@ test("fragment typed prompt distinguishes target paragraphs from context-only so
   assert.equal(translationSchema.properties.blockId.const, sourceBlock.id);
   assert.equal(paragraphsSchema.minItems, unit.paragraphs.length);
   assert.equal(paragraphsSchema.maxItems, unit.paragraphs.length);
+});
+
+test("single and multi-paragraph finalizers retain grounded global occurrence receipts", async () => {
+  for (const count of [1, 2]) {
+    const paragraphs = unit.paragraphs.slice(0, count);
+    const scope = { ...executionScope, paragraphs };
+    const mentions = paragraphs.map(p => ({ occurrenceId: `surface-${p.ordinal}`, sourceForm: "paragraph", blockId: sourceBlock.id,
+      paragraphIndex: p.ordinal, sourceStart: p.utf16Start + p.sourceText.indexOf("paragraph"), sourceQuote: "paragraph" }));
+    const text = "完整译文保留了源文的全部普通信息，继续场景并保持清晰连贯。";
+    const surfaceUsages = mentions.map(m => ({ occurrenceId: m.occurrenceId, targetSurface: "译文" }));
+    const faux = fauxProvider();
+    faux.setResponses([fauxAssistantMessage(fauxToolCall(count === 1 ? "finalize_paragraph_fragment" : "finalize_translation_batch",
+      count === 1 ? { text, surfaceUsages } : { windows: [{ windowId: request.windows[0]!.windowId, surfaceUsages,
+        translations: [{ blockId: sourceBlock.id, paragraphs: paragraphs.map(() => ({ text })) }] }] }), { stopReason: "toolUse" })]);
+    const result = await runTranslationBatch({ request, blocks: [sourceBlock], stableTerms: [], snapshot: { id: "snapshot-1", revisions: [] },
+      paragraphFragment: scope, surfaceMentions: mentions, repairEnabled: false, model: faux.getModel(),
+      streamFn: faux.provider.streamSimple.bind(faux.provider), budget: new BudgetLedger() });
+    assert.equal(result.windows[0]?.status, "completed", result.windows[0]?.error);
+    assert.deepEqual(result.windows[0]?.surfaceUsages?.map(m => m.paragraphIndex), paragraphs.map(p => p.ordinal));
+    assert.equal(result.windows[0]?.surfaceUsages?.length, count);
+  }
 });
 
 test("single-paragraph refinement uses a text-only invocation-owned leaf tool", async () => {

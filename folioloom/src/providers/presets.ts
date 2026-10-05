@@ -44,7 +44,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       thinkingFormat: "deepseek",
       requiresReasoningContentOnAssistantMessages: true,
       supportsTools: true,
-      outputTokenField: "max_completion_tokens",
+      outputTokenField: "max_tokens",
     },
   },
   {

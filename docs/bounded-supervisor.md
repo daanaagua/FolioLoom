@@ -12,6 +12,10 @@ which blocks need semantic review. Reviews can accept a candidate, request a min
 repair with host-issued source/target reference IDs, or pause a checkpoint. The host
 resolves IDs to exact text and validates block, version and visibility before a decision
 can take effect. Historical quote-based decisions remain strictly validated on read.
+Readable focus quotes may omit EPUB slot markers. The host maps a unique exact visible
+match inside the selected reference back to the original marked span. It does not normalize
+words, punctuation or case, search outside the reference, or accept ambiguous projections.
+Canonical journal focus spans retain the original markers for repair and closure checks.
 
 The kernel owns window boundaries, scheduling, account/model configuration, budgets,
 validation, database writes, ordered promotion and export. Source text and tool results
@@ -21,14 +25,40 @@ exposed to the supervisor.
 Approvals cover up to four logical windows; the host reduces the batch before dispatch
 when its context estimate exceeds model capacity. The controller gives each fresh decision
 two model turns: one optional batch of evidence queries followed by a decision. The protocol
-supports at most four turns and eight tool calls; completions are capped at 8192 tokens or
-the model's smaller cap. Each checkpoint has two attempts per explicit release generation.
+supports at most four turns and eight tool calls. DeepSeek uses a 32768-token output ceiling,
+including reasoning, through its `max_tokens` field; other native providers retain the
+8192-token ceiling. Both are limited by the model's smaller cap and reserved before dispatch.
+Each checkpoint has two attempts per explicit release generation.
 Ordinary reviews have three attempts per scoped terminology dependency; final quality items
 keep their own three-attempt budget. All reviews share a twelve-attempt lifetime window cap.
 Repair requires a remaining follow-up review credit before dispatch. Ordinary resume cannot bypass a paused checkpoint.
 An explicit release is an operator action, not automatic model recovery.
+It renews the ordinary checkpoint and its automatic-recovery scope under the same
+durable generation; historical faults and run/lifetime ceilings remain in force.
+An ordinary release cannot renew a final-quality-review epoch.
 Repeated identical tool errors stop after two occurrences. A retry spends the original
 checkpoint baseline instead of adding a new baseline allowance.
+
+DeepSeek decisions use the `folioloom-supervisor-values-tool-1` transport while retaining bounded
+source-query tools. A request-bound host frame supplies short integer handles for blocks and
+issued evidence. The native `submit_supervisor_values` finalizer accepts one `values`
+argument, with no other keys. The host does not parse decisions from ordinary prose.
+Inside this argument the model returns exactly four positional values: planning uses
+`[prefixCount, reviewBlocks, guidance, reason]`, and review uses
+`[action, issues, dispositions, reason]`. Guidance rows contain `[source, instruction]`;
+issue rows contain `[source, targetOrNull, problem]`. Prior-issue dispositions preserve the
+host's order and contain `[status, source, target, note]`. Identity, versions, exact quotes
+and evidence ranges are reconstructed by the host, not copied by the model. These bound
+ranges also locate repair targets when identical paragraphs occur more than once.
+
+The host rejects wrong lengths/types, unissued or wrong-side handles, cross-block evidence,
+stale frames and extra prose before applying the existing canonical decision validation.
+It still checks scope and every prior-issue disposition. Bounded retries receive a concise
+validation error without changing the checkpoint baseline. The wire version is journaled
+separately from the canonical protocol; historical decisions and dependency hashes remain
+readable. Other providers retain the native canonical decision tool. Explicitly selected
+JSON-object transports remain available and strictly parsed; provider JSON mode does not
+waive host syntax validation. There is no format-guessing fallback or JSON auto-repair.
 
 The supervisor reads current source and relevant terminology at event boundaries;
 its durable state is an append-only journal, not an indefinitely growing conversation.
@@ -100,6 +130,16 @@ missing or invalid receipts unknown. These observations never create hard locks.
 candidates cannot move a stale receipt into an unrelated paragraph. Unknown mappings may
 be reconsidered with new source evidence; identical semantic evidence is reused.
 
+Paragraph fragments request receipts only for owned source occurrences, never context-only
+neighbors. Target paragraph coordinates are local to the fragment; retained occurrence IDs
+and paragraph indices stay global through refinement and assembly. Fragmentation, receipt
+grounding and delta review share semantic paragraph spans, including CRLF and certified scene
+separators. Trailing whitespace does not create a paragraph; real merges still require full review.
+
+Usage completeness requires a metered response for every actual model call and matching
+aggregate counters. Local turn-limit messages are not provider responses. A positive total
+cannot conceal an unmetered failure; unknown usage still blocks strict export and retry.
+
 After a durable full review, repairs and dependency changes use changed paragraphs, relevant
 terms, still-open issues and adjacent paragraphs. Structural mismatch falls back to full
 review. Cache reuse requires exact candidate text, scoped dependencies and surface evidence.
@@ -113,6 +153,31 @@ scheduling; only explicit fast mode enumerates lower-effort alternatives. Histor
 protocol-only surface records and untyped function-word noise are excluded from replay.
 The store's generation-checked derived-surface quarantine appends superseding revisions
 and a fresh snapshot without deleting original observations, translations or usage history.
+
+### EPUB text patches and explicit quality rework
+
+Semantic repairs of structurally valid EPUB candidates use `submit_epub_text_patch`.
+The host issues editable text slots for the evidenced paragraphs and provides neighboring
+paragraphs as read-only context. Each patch binds the candidate hash, block, slot and
+expected text. The host applies the complete patch atomically while preserving the original
+markers and separators. Duplicate slots, stale candidates, out-of-scope edits and marker
+injection are rejected. Structural recovery and non-EPUB repair retain their existing paths.
+
+Inspect final quality items with `book quality status --store <store> --run <id>`.
+An unresolved or interrupted item can be explicitly reprocessed with
+`book quality rework --store <store> --run <id> --input <request.json>`, followed by
+the original `book run` resume command. The request contains exactly `itemId`, `requestId`,
+`expectedRecordId`, `expectedCandidateHash` and a nonempty `reason`; the status command
+provides the item and record identities. Rework schedules repair/review but does not call
+a model or approve export itself.
+
+Rework requires an idle run lease and a matching active candidate. Request IDs are
+idempotent; conflicting reuse is rejected. Original issues, closure decisions and usage
+remain in the append-only journal. At most two explicit rework rounds are accepted for an
+item, with room required for the bounded review cycle inside the unchanged twelve-review
+lifetime window limit. Ordinary resume never replenishes a finalized quality credit.
+
+### Task context and resume
 
 `--task-context-file` is optional. It contains caller-supplied purpose/background in
 UTF-8, up to 16000 characters. The context precedes the existing system instructions

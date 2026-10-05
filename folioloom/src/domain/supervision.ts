@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { SupervisorDecision } from "../agents/supervisor.js";
 
 export type SupervisionMode = "off" | "bounded";
+export const MAX_LIFETIME_REVIEWS_PER_WINDOW = 12;
 export const SUPERVISION_POLICY = Object.freeze({
   schema: "folioloom-supervision-1", batchWindows: 4, maxTurns: 4,
   maxAttemptsPerCheckpoint: 2, maxReviewsPerWindow: 3,
@@ -11,6 +12,8 @@ export interface SupervisionRecord {
   readonly key: string;
   readonly event: "plan" | "review";
   readonly state: "started" | "completed" | "paused" | "failed" | "released";
+  /** Host-owned wire transport version; older canonical records omit it. */
+  readonly wireProtocol?: string;
   readonly windowIds: readonly string[];
   readonly inputHash: string;
   readonly candidateHash?: string;

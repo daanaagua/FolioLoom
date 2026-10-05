@@ -77,6 +77,20 @@ test("paragraph planner creates deterministic exact-cover units for tx8-shaped b
   assert.equal(new Set(first.units.map((unit) => unit.executionUnitId)).size, 3);
 });
 
+test("assembly preserves only receipts owned by each fragment with global paragraph coordinates", () => {
+  const plan = planParagraphFragments({ windowId: "w1", block: block("Copper waits.\n\nCopper leaves."), snapshotId: "s1", maxTargetParagraphs: 1 });
+  const candidates = acceptedCandidates(plan);
+  const receipts = plan.paragraphs.map(p => ({ occurrenceId: `surface-${p.ordinal}`, sourceForm: "Copper", blockId: plan.blockId,
+    paragraphIndex: p.ordinal, sourceStart: p.utf16Start, sourceQuote: p.sourceText, targetSurface: "科珀", targetQuote: "科珀" }));
+  for (const candidate of candidates) {
+    candidate.paragraphs[0]!.text = "科珀在等待。";
+    candidate.surfaceUsages = receipts;
+  }
+  const result = assembleParagraphFragmentCandidates(plan, candidates);
+  assert.deepEqual(result.surfaceUsages.map(r => r.occurrenceId), ["surface-0", "surface-1"]);
+  assert.deepEqual(result.surfaceUsages.map(r => r.paragraphIndex), [0, 1]);
+});
+
 test("paragraph planner treats certified scene separators as paragraph boundaries", () => {
   const plan = planParagraphFragments({
     windowId: "window-scene",

@@ -64,3 +64,26 @@ test("interrupted final pass remains spent and tampered evidence fails closed", 
   (f.records[0]!.issues[0] as { message: string }).message = "tampered";
   assert.throws(() => f.queue().items(), /invalid quality record/u);
 });
+
+test("explicit quality rework appends a candidate-bound idempotent bounded request", () => {
+  const f = fixture();
+  const item = f.queue().defer(f.input);
+  f.queue().claimFinal(item.itemId);
+  const failed = f.queue().finish(item.itemId, "unresolved", f.input.candidateHash, f.input.issues);
+  const request = { itemId: item.itemId, requestId: "repair-1", expectedRecordId: failed.id,
+    expectedCandidateHash: failed.candidateHash, reason: "Text-only EPUB repair protocol is available." };
+  const reopened = f.queue().requestRework(request);
+  assert.equal(reopened.state, "pending");
+  assert.equal(reopened.rework?.previousRecordId, failed.id);
+  assert.deepEqual(f.records.slice(0, 3).at(-1), failed);
+  assert.equal(f.queue().requestRework(request).id, reopened.id);
+  assert.equal(f.records.length, 4);
+  assert.throws(() => f.queue().requestRework({ ...request, reason: "changed" }), /conflict/u);
+  assert.throws(() => f.queue().requestRework({ ...request, requestId: "repair-stale" }), /stale|terminal/u);
+  f.queue().claimFinal(item.itemId);
+  const failedAgain = f.queue().finish(item.itemId, "unresolved", f.input.candidateHash, f.input.issues);
+  f.queue().requestRework({ ...request, requestId: "repair-2", expectedRecordId: failedAgain.id });
+  f.queue().claimFinal(item.itemId);
+  const final = f.queue().finish(item.itemId, "unresolved", f.input.candidateHash, f.input.issues);
+  assert.throws(() => f.queue().requestRework({ ...request, requestId: "repair-3", expectedRecordId: final.id }), /rework limit/u);
+});

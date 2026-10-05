@@ -17,3 +17,11 @@ test("supervisor status and explicit pause release have bounded typed CLI comman
   assert.equal(result.command, "book-supervisor-release");
   assert.equal(result.requestId, "decision-1");
 });
+
+test("quality rework is an explicit input-bound command separate from ordinary resume", () => {
+  assert.equal(parseArgs(["book", "quality", "status", "--store", "book.db", "--run", "r"]).command, "book-quality-status");
+  const result = parseArgs(["book", "quality", "rework", "--store", "book.db", "--run", "r", "--input", "request.json"]);
+  assert.equal(result.command, "book-quality-rework");
+  assert.ok(result.input?.endsWith("request.json"));
+  assert.throws(() => parseArgs(["book", "quality", "rework", "--force"]), /unknown|unsupported|flag/iu);
+});

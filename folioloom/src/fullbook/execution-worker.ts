@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 
 import {
   ModelProviderError,
+  piRunUsageComplete,
   type PiRunResult,
 } from "../agents/pi-runtime.js";
 import {
@@ -946,8 +947,7 @@ function accountingUsageForRuns(
   if (knownNoCalls && runs.length === 0) return normalizeRuntimeUsage({ input: 0, output: 0, totalTokens: 0 });
   const usage = runtimeUsageForRuns(runs);
   return runs.length > 0
-    && runs.every((run) =>
-      run.modelCalls === 0 || run.usage.totalTokens > 0)
+    && runs.every(piRunUsageComplete)
     ? usage
     : { ...usage, complete: false };
 }
@@ -962,7 +962,7 @@ function providerErrorUsage(error: unknown): NormalizedRuntimeUsage {
     return { ...runtimeUsageForRuns([]), complete: false };
   }
   const usage = runtimeUsageForRuns([run]);
-  return run.usage.totalTokens > 0
+  return piRunUsageComplete(run)
     ? usage
     : { ...usage, complete: false };
 }
@@ -1085,6 +1085,7 @@ export function mergeFragmentTranslationResults(
           snapshotId: plan.snapshotId,
           paragraphs: result.paragraphs.map((paragraph) => ({ ...paragraph })),
           termUsages: result.termUsages.map((usage) => ({ ...usage })),
+          surfaceUsages: result.surfaceUsages,
           notes: [...result.notes],
           memoryCandidates: [...result.memoryCandidates],
         });
@@ -1112,6 +1113,7 @@ export function mergeFragmentTranslationResults(
             : "completed",
           translations: [assembly.translation],
           termUsages: assembly.termUsages,
+          surfaceUsages: assembly.surfaceUsages,
           notes: assembly.notes,
           memoryCandidates: assembly.memoryCandidates,
           ...(styleObservation === undefined ? {} : { styleObservation }),
@@ -1263,6 +1265,7 @@ function mergeParagraphRefinementExecutions(
         paragraphs,
         termUsages: accepted.flatMap((part) =>
           part.termUsages.map((usage) => ({ ...usage }))),
+        surfaceUsages: accepted.flatMap(part => part.surfaceUsages ?? []),
         notes: accepted.flatMap((part) => [...part.notes]),
         memoryCandidates: accepted.flatMap((part) => [...part.memoryCandidates]),
         ...(styleObservation === undefined ? {} : { styleObservation }),

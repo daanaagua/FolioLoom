@@ -64,6 +64,42 @@ test("context planning covers every required risk within the exact budget", () =
   ]);
 });
 
+test("wire byte budgets retain smaller alternatives on the planning frontier", () => {
+  const profiles = planContextProfiles(planningInput([
+    bundle("large", 10, 10, [], [], { byteCost: 91 }),
+    bundle("small", 10, 9, [], [], { byteCost: 40 }),
+    bundle("needed", 20, 12, ["control"], [], { byteCost: 60 }),
+  ], {
+    budgets: { lean: 30, balanced: 30, rich: 30 },
+    maxBytes: 100,
+    requiredCoverage: ["control"],
+  }));
+  for (const profile of Object.values(profiles)) {
+    assert.deepEqual(profile?.bundleIds, ["needed", "small"]);
+    assert.equal(profile?.byteCost, 100);
+  }
+});
+
+test("byte limits preserve mandatory dependency closure and reject infeasible profiles", () => {
+  const bundles = [
+    bundle("anchor", 10, 1, [], [], { byteCost: 60 }),
+    bundle("required", 10, 1, ["control"], ["anchor"], {
+      mandatory: true, byteCost: 41,
+    }),
+  ];
+  const input = planningInput(bundles, { maxBytes: 100 });
+  assert.deepEqual(planContextProfiles(input), {
+    lean: undefined, balanced: undefined, rich: undefined,
+  });
+  const feasible = planContextProfiles({ ...input, maxBytes: 101 });
+  assert.deepEqual(feasible.rich?.bundleIds, ["anchor", "required"]);
+  assert.equal(feasible.rich?.byteCost, 101);
+  assert.throws(() => planContextProfiles({ ...input, maxBytes: -1 }), /byte/iu);
+  assert.throws(() => planContextProfiles(planningInput([
+    bundle("invalid", 1, 1, [], [], { byteCost: NaN }),
+  ])), /byte/iu);
+});
+
 test("selecting an atomic relation closes all of its evidence dependencies", () => {
   const profile = planContextProfiles(planningInput([
     bundle("bird", 40, 2, ["entity_identity"]),

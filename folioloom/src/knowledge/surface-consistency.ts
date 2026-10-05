@@ -5,6 +5,7 @@ import type { SourceLanguageProfile } from "../language/types.js";
 import type { StableTerm } from "../domain/types.js";
 import type { KnowledgeCandidate } from "./knowledge-store.js";
 import { stripEpubStructuralMarkers } from "../source/epub-structure.js";
+import { semanticParagraphSpans } from "../text/paragraph-spans.js";
 
 type Source = { blockId: string; sourceText: string };
 type Translation = { blockId: string; text: string };
@@ -15,7 +16,16 @@ export interface SurfaceMention {
 }
 export interface SurfaceUsageSubmission { occurrenceId: string; targetSurface: string }
 export interface SurfaceUsage extends SurfaceMention { targetSurface: string; targetQuote: string }
-const paragraphs = (text: string): string[] => text.split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u);
+const paragraphs = (text: string): string[] => semanticParagraphSpans(text).map(p => p.sourceText);
+export interface SurfaceParagraphScope {
+  readonly blockId: string;
+  readonly paragraphs: readonly { readonly ordinal: number; readonly utf16Start: number; readonly utf16End: number }[];
+}
+
+export function scopedSurfaceMentions(mentions: readonly SurfaceMention[], scope?: SurfaceParagraphScope): SurfaceMention[] {
+  return mentions.filter(m => !scope || (m.blockId === scope.blockId && scope.paragraphs.some(p =>
+    p.ordinal === m.paragraphIndex && m.sourceStart >= p.utf16Start && m.sourceStart + m.sourceForm.length <= p.utf16End)));
+}
 
 /** Bounded host identities; preferences are rendering conventions, never entity facts. */
 export function surfaceMentions(sources: readonly Source[], anchors: readonly LexicalAnchor[], previous: readonly SurfaceObservation[], profile: SourceLanguageProfile): SurfaceMention[] {
@@ -46,13 +56,17 @@ export function surfaceMentions(sources: readonly Source[], anchors: readonly Le
 }
 
 /** Bad discovery metadata is discarded, never used to justify a name or rewrite. */
-export function groundSurfaceUsages(mentions: readonly SurfaceMention[], submissions: readonly SurfaceUsageSubmission[], translations: readonly Translation[]): SurfaceUsage[] {
+export function groundSurfaceUsages(mentions: readonly SurfaceMention[], submissions: readonly SurfaceUsageSubmission[], translations: readonly Translation[], scope?: SurfaceParagraphScope): SurfaceUsage[] {
   const result: SurfaceUsage[] = [];
+  const owned = scopedSurfaceMentions(mentions, scope);
   for (const receipt of submissions) {
-    const mention = mentions.find(m => m.occurrenceId === receipt.occurrenceId);
+    const mention = owned.find(m => m.occurrenceId === receipt.occurrenceId);
     if (!mention || submissions.filter(s => s.occurrenceId === receipt.occurrenceId).length !== 1 || typeof receipt.targetSurface !== "string" || !receipt.targetSurface.trim()) continue;
     const target = translations.find(t => t.blockId === mention.blockId)?.text;
-    const paragraph = target === undefined ? undefined : paragraphs(target)[mention.paragraphIndex];
+    const targetParagraphs = target === undefined ? [] : paragraphs(target);
+    if (scope && targetParagraphs.length !== scope.paragraphs.length) continue;
+    const index = scope ? scope.paragraphs.findIndex(p => p.ordinal === mention.paragraphIndex) : mention.paragraphIndex;
+    const paragraph = targetParagraphs[index];
     if (!paragraph?.includes(receipt.targetSurface)) continue;
     result.push({ ...mention, targetSurface: receipt.targetSurface, targetQuote: excerpt(paragraph, receipt.targetSurface) });
   }

@@ -1,5 +1,6 @@
 import type { StableTerm } from "../domain/types.js";
 import type { SurfaceMention, SurfaceUsage, SurfaceUsageSubmission } from "../knowledge/surface-consistency.js";
+import { scopedSurfaceMentions } from "../knowledge/surface-consistency.js";
 import type { ParagraphFragmentExecutionScope } from "../fullbook/paragraph-fragment.js";
 import type { PhysicalRequestPlan } from "../fullbook/types.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
@@ -79,6 +80,7 @@ interface FinalizeTranslationBatchWireArgs {
 
 interface FinalizeParagraphFragmentWireArgs {
   text: string;
+  surfaceUsages?: SurfaceUsageSubmission[];
 }
 
 const FINALIZER_METADATA_KEYS = [
@@ -95,7 +97,7 @@ function canonicalizeFinalizerEnvelope(
 ): FinalizeTranslationBatchArgs {
   const allowedEnvelopeKeys = paragraphFragment === undefined
     ? FINALIZER_METADATA_KEYS
-    : (["termUsages"] as const);
+    : (["termUsages", "surfaceUsages"] as const);
   if (paragraphFragment !== undefined) {
     const disallowedFragmentMetadata = [
       "notes",
@@ -329,7 +331,7 @@ function finalizerTool(
     targetSurface: Type.String(),
   }, { additionalProperties: false }), { maxItems: strictScope === undefined ? 512 : strictScope.occurrences.length });
   const notesSchema = Type.Array(Type.String());
-  const surfaceProperties: Parameters<typeof Type.Object>[0] = surfaceMentions.length && paragraphFragment === undefined ? {
+  const surfaceProperties: Parameters<typeof Type.Object>[0] = surfaceMentions.length ? {
     surfaceUsages: Type.Optional(Type.Array(Type.Object({
       occurrenceId: Type.String({ enum: surfaceMentions.map(m => m.occurrenceId) }), targetSurface: Type.String({ maxLength: 120 }),
     }, { additionalProperties: false }), { maxItems: surfaceMentions.length })),
@@ -374,6 +376,7 @@ function finalizerTool(
         "Submit only the complete target text for this invocation-owned source paragraph.",
       phase: "translation",
       parameters: Type.Object({
+        ...surfaceProperties,
         text: Type.String({
           minLength: fragmentParagraphMinimumLength,
         }),
@@ -391,6 +394,7 @@ function finalizerTool(
               text: rawArgs.text,
             }],
             notes: [],
+            ...(rawArgs.surfaceUsages === undefined ? {} : { surfaceUsages: rawArgs.surfaceUsages }),
           }],
         }, signal);
       },
@@ -416,6 +420,7 @@ function finalizerTool(
     styleObservation: Type.Optional(styleObservationSchema),
   };
   const fragmentWindowProperties = {
+    ...surfaceProperties,
     windowId: Type.Literal(expectedWindowId!),
     translations: Type.Array(translationSchema, {
       minItems: 1,
@@ -453,7 +458,8 @@ function finalizerTool(
           minItems: 1,
           maxItems: 1,
         }),
-        // Term receipts are the only fragment-owned metadata. Discovery
+        ...surfaceProperties,
+        // Grounded receipts are the only fragment-owned metadata. Discovery
         // notes, memory, and style are consolidated outside recovery calls.
         termUsages: Type.Optional(termUsagesSchema),
       }, { additionalProperties: false }),
@@ -704,8 +710,8 @@ export function prepareTranslationRequest(
   const requestedBlockIds = new Set(windows.flatMap((window) =>
     window.blocks.map((block) => block.blockId)));
   const termOccurrences = expectedTermOccurrencesForTranslationInput(input);
-  const surfaceMentions = input.paragraphFragment === undefined && responseProtocol === "typed_tool"
-    ? (input.surfaceMentions ?? []).filter(m => requestedBlockIds.has(m.blockId)) : [];
+  const surfaceMentions = responseProtocol === "typed_tool"
+    ? scopedSurfaceMentions(input.surfaceMentions ?? [], input.paragraphFragment).filter(m => requestedBlockIds.has(m.blockId)) : [];
   const wireTermOccurrences = termOccurrences.map(withoutLocalTermRevision);
   const knowledgeContext = translationKnowledgeWireContext(input, windows);
   const framedProtocol = responseProtocol === "framed_text"
@@ -832,8 +838,8 @@ export function prepareTranslationRequest(
         ? input.paragraphFragment === undefined
           ? "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. For every listed TERM OCCURRENCE, include one exact termUsages receipt in its owning window; omit termUsages only when that window has no listed occurrence. Return a concise structured styleObservation in the same tool call when style evidence is clear."
           : input.paragraphFragment.paragraphs.length === 1
-            ? "Translate only the one TARGET SOURCE FRAGMENT paragraph. Call finalize_paragraph_fragment with only its complete Chinese text. The host owns the window, block, paragraph identity, and metadata. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output."
-            : "Translate only TARGET SOURCE FRAGMENT. Return the original canonical blockId and encode each target paragraph as one separate translations[].paragraphs[] {text} item, in exact source order. Never join multiple source paragraphs inside one item. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output. Include exact termUsages receipts for listed TERM OCCURRENCES. Do not emit notes, memoryCandidates, styleObservation, or other discovery metadata; the host consolidates those outside fragment recovery."
+            ? "Translate only the one TARGET SOURCE FRAGMENT paragraph. Call finalize_paragraph_fragment with its complete Chinese text and surfaceUsages receipts for listed SURFACE MENTIONS. The host owns the window, block, paragraph identity, and other metadata. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output."
+            : "Translate only TARGET SOURCE FRAGMENT. Return the original canonical blockId and encode each target paragraph as one separate translations[].paragraphs[] {text} item, in exact source order. Never join multiple source paragraphs inside one item. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output. Include exact termUsages receipts for listed TERM OCCURRENCES and surfaceUsages receipts for listed SURFACE MENTIONS. Do not emit notes, memoryCandidates, styleObservation, or other discovery metadata; the host consolidates those outside fragment recovery."
         : framedTranslationInstructions(framedProtocol),
     },
   ];
@@ -862,6 +868,7 @@ export function prepareTranslationRequest(
   if (surfaceMentions.length) sections.splice(sections.length - 1, 0, {
     kind: "terms", jsonPayload: surfaceMentions,
     text: ["SURFACE MENTIONS", JSON.stringify(surfaceMentions.map(({ sourceQuote: _quote, sourceStart: _start, ...m }) => ({ ...m,
+      paragraphIndex: input.paragraphFragment ? input.paragraphFragment.paragraphs.findIndex(p => p.ordinal === m.paragraphIndex) : m.paragraphIndex,
       occurrenceInParagraph: surfaceMentions.filter(n => n.blockId === m.blockId && n.paragraphIndex === m.paragraphIndex && n.sourceForm === m.sourceForm)
         .findIndex(n => n.occurrenceId === m.occurrenceId) + 1 }))),
       "Return surfaceUsages [{occurrenceId,targetSurface}] in the owning window, using the exact actual rendering for each listed occurrence in its corresponding target paragraph. Use an empty surface only when no explicit rendering exists. These are provisional observations, not locked terms or identity aliases. preferredTarget is a scoped continuity preference; preserve distinct names, nicknames, ambiguity and contextual meanings."].join("\n\n"),

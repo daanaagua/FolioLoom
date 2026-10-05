@@ -109,6 +109,7 @@ test("Pi gracefully stops a nonterminal session at its local turn cap", async ()
 
   assert.equal(result.modelCalls, 1);
   assert.equal(result.turnLimitReached, true);
+  assert.equal(result.providerResponses?.length, 1);
   assert.equal(faux.state.callCount, 1);
 });
 

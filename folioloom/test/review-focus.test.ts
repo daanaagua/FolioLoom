@@ -3,6 +3,15 @@ import test from "node:test";
 import { reviewFocus } from "../src/fullbook/review-focus.js";
 import { evidenceReferences } from "../src/domain/evidence-reference.js";
 
+test("delta review shares semantic paragraph coordinates with fragment execution", () => {
+  const sourceText = "First paragraph.\r\n\r\nSecond paragraph.\r\n\r\n";
+  const candidate = [{ blockId: "b", text: "第一段。\n\n修正第二段。" }];
+  const before = [{ blockId: "b", text: "第一段。\n\n第二段。\n\n" }];
+  assert.ok(reviewFocus([{ blockId: "b", globalIndex: 0, sourceText }], candidate, before, [], [], []));
+  assert.equal(reviewFocus([{ blockId: "b", globalIndex: 0, sourceText }],
+    [{ blockId: "b", text: "两个段落被合并了。" }], before, [], [], []), undefined);
+});
+
 test("delta review selects changed paragraph and neighbors, not unrelated prose", () => {
   const sourceText = Array.from({ length: 9 }, (_, i) => `Paragraph ${i}. ${"A quiet day. ".repeat(35)}`).join("\n\n");
   const before = Array.from({ length: 9 }, (_, i) => `第${i}段。${"平静的一天。".repeat(60)}`).join("\n\n");

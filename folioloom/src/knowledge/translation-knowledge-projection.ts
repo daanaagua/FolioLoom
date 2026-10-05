@@ -64,6 +64,7 @@ export interface TranslationKnowledgeCandidate {
   readonly evidenceDistance?: number;
   readonly tokenCost: number;
   readonly entryCost: number;
+  readonly byteCost: number;
   readonly utility: number;
   readonly coverage: readonly RiskDimension[];
   readonly requires: readonly string[];
@@ -441,6 +442,30 @@ function projectionWithStableByteCount(
   throw new Error("knowledge projection byte count did not converge");
 }
 
+/** Reserve an upper bound for the JSON envelope before selecting atomic entries. */
+export function translationKnowledgeContentByteBudget(
+  total: number,
+  options: TranslationKnowledgeProjectionOptions = {},
+): number {
+  nonNegativeSafeInteger(total, "total knowledge revisions");
+  const resolved = resolvedOptions(options);
+  const empty = projectionWithStableByteCount(total, [], resolved);
+  if (empty.metadata.serializedBytes > resolved.maxSerializedBytes) {
+    throw new RangeError("maxSerializedBytes cannot fit knowledge projection metadata");
+  }
+  const envelope = {
+    ...empty,
+    metadata: {
+      ...empty.metadata,
+      projected: Math.min(total, resolved.maxEntries),
+      // The actual omitted count and byte count cannot have more digits.
+      serializedBytes: resolved.maxSerializedBytes,
+    },
+  };
+  return Math.max(0, resolved.maxSerializedBytes
+    - Buffer.byteLength(canonicalJson(envelope), "utf8"));
+}
+
 function appendIfWithinBounds(
   total: number,
   selected: ProjectedKnowledgeRevision[],
@@ -661,6 +686,8 @@ function translationKnowledgeCandidate(
       profile,
     ).tokens,
     entryCost: 1,
+    // Reserve a comma even for the first entry so sums remain conservative.
+    byteCost: Buffer.byteLength(canonicalJson(payload), "utf8") + 1,
     utility: candidateUtility(candidate),
     coverage: explicitCoverage(candidate),
     requires: [],

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { ModelProviderError } from "../agents/pi-runtime.js";
+import { ModelProviderError, piRunUsageComplete } from "../agents/pi-runtime.js";
 import { supervisionHash } from "../domain/supervision.js";
 
 export type RecoveryAction = "provider_retry" | "supervisor_retry" | "reject_checkpoint" | "export_retry";
@@ -83,10 +83,7 @@ export class AutomaticRecovery {
   }
 
   async providerRetry(scope: string, error: unknown, options: { signal?: AbortSignal; deadlineAtMs?: number; supervisor?: boolean } = {}): Promise<boolean> {
-    if (!(error instanceof ModelProviderError) || !error.run
-      || (error.run.modelCalls > 0 && !(error.run.usage.totalTokens > 0))) return false;
-    const responses = error.run.messages.filter(m => m.role === "assistant");
-    if (responses.length !== error.run.modelCalls || responses.some(m => !(m.usage.totalTokens > 0))) return false;
+    if (!(error instanceof ModelProviderError) || !error.run || !piRunUsageComplete(error.run)) return false;
     const allowed = ["throttled", "timeout", "busy"].includes(error.kind)
       || (options.supervisor && error.kind === "protocol");
     if (!allowed) return false;

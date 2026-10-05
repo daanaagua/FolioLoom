@@ -8,7 +8,7 @@ import { type SupervisionRecord, summarizeSupervision } from "../src/domain/supe
 import { evidenceReferences } from "../src/domain/evidence-reference.js";
 import { AutomaticRecovery, type RecoveryRecord } from "../src/fullbook/automatic-recovery.js";
 
-function fixture(options: { sourceText?: string; contextWindow?: number; maxConcurrency?: number } = {}) {
+function fixture(options: { sourceText?: string; contextWindow?: number; maxConcurrency?: number; valueWire?: boolean } = {}) {
   const faux = fauxProvider();
   const records: SupervisionRecord[] = [];
   const recoveries: RecoveryRecord[] = [];
@@ -17,7 +17,7 @@ function fixture(options: { sourceText?: string; contextWindow?: number; maxConc
     maxConcurrency: options.maxConcurrency,
     runId: "run", sourceVersion: "source", windows: [{ windowId: "w1", ordinal: 0, blockIds: ["b1"] }, { windowId: "w2", ordinal: 1, blockIds: ["b2"] }],
     sources: [{ blockId: "b1", globalIndex: 0, sourceText: options.sourceText ?? "He did not leave." }, { blockId: "b2", globalIndex: 1, sourceText: options.sourceText ?? "He waited." }],
-    runtime: { model: { ...faux.getModel(), ...(options.contextWindow ? { contextWindow: options.contextWindow } : {}) }, streamFn: faux.provider.streamSimple.bind(faux.provider) },
+    runtime: { model: { ...faux.getModel(), ...(options.valueWire ? { provider: "folioloom-deepseek" } : {}), ...(options.contextWindow ? { contextWindow: options.contextWindow } : {}) }, streamFn: faux.provider.streamSimple.bind(faux.provider) },
     admission: new AdmissionController({ ledger, mode: "off", persist: event => ledger.apply(event) }),
     recovery: new AutomaticRecovery({ runId: "run", store: { recoveryRecords: () => recoveries,
       appendRecoveryRecord: (_run, record) => { recoveries.push(record); } }, sleep: async () => {} }),
@@ -26,6 +26,56 @@ function fixture(options: { sourceText?: string; contextWindow?: number; maxConc
   return { faux, records, recoveries, ledger, controller };
 }
 const plan = { action: "translate", windowIds: ["w1", "w2"], reviewBlockIds: ["b1"], guidance: [], issues: [], reason: "审校否定。" };
+
+test("explicit supervision release scopes automatic recovery to the same durable generation", async () => {
+  const f = fixture();
+  f.faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" })]);
+  await f.controller.planFor("w1", []);
+  f.recoveries.push({ id: "old-block", scope: "supervision:review:w1", action: "supervisor_retry",
+    fingerprint: "a".repeat(64), state: "blocked", at: Date.now(), reason: "repeated_fault" });
+  const candidate = [{ blockId: "b1", text: "他没有离开。" }];
+  await assert.rejects(() => f.controller.review("w1", candidate, []), /AUTOMATIC_RECOVERY_PAUSED/u);
+  assert.equal(f.faux.state.callCount, 1);
+  f.controller.pauseCandidate("w1", "Addressed transport failure.");
+  const pause = f.records.findLast(r => r.state === "paused")!;
+  f.records.push({ ...pause, id: `release:${pause.id}`, key: pause.id, state: "released" });
+  f.faux.setResponses([fauxAssistantMessage("invalid terminal"), fauxAssistantMessage(fauxToolCall("submit_supervisor_decision",
+    { action: "accept", windowIds: ["w1"], reviewBlockIds: [], guidance: [], issues: [], reason: "Checked source." }), { stopReason: "toolUse" })]);
+  assert.deepEqual(await f.controller.review("w1", candidate, []), []);
+  assert.equal(f.recoveries[0]!.id, "old-block");
+  assert.ok(f.recoveries.some(r => r.state === "claimed" && r.scope === "supervision:review:w1:generation-1"));
+  assert.equal(f.records.filter(r => r.event === "review" && r.state === "started").length, 2);
+});
+
+test("value-wire retry receives bounded diagnostic feedback without renewing its checkpoint or baseline", async () => {
+  const f = fixture({ valueWire: true });
+  f.faux.setResponses([fauxAssistantMessage('{"values":[2,[],[]]}'), context => {
+    const message = context.messages.findLast(m => m.role === "user")!;
+    const prompt = JSON.parse(typeof message.content === "string" ? message.content : message.content.filter(c => c.type === "text").map(c => c.text).join(""));
+    assert.match(prompt.protocolFeedback, /valid bounded decision/u);
+    assert.ok(prompt.protocolFeedback.length <= 400);
+    return fauxAssistantMessage(fauxToolCall("submit_supervisor_values", { values: [2, [], [], "Checked both windows."] }), { stopReason: "toolUse" });
+  }]);
+  assert.equal((await f.controller.planFor("w1", [])).action, "translate");
+  const attempts = f.records.filter(r => r.state === "started");
+  assert.equal(attempts.length, 2);
+  assert.equal(new Set(attempts.map(r => r.inputHash)).size, 1);
+  assert.equal(f.ledger.state().baselinedTaskIds.size, 1);
+  assert.ok(f.records.filter(r => r.state === "completed" || r.state === "failed").every(r => r.wireProtocol === "folioloom-supervisor-values-tool-1"));
+  assert.ok(f.ledger.reconcile().consistent);
+  assert.equal(f.ledger.state().spentTokens, f.records.reduce((n, r) => n + (r.totalTokens ?? 0), 0));
+});
+
+test("mixed metered and unmetered supervisor responses block retry and retain incomplete ledger", async () => {
+  const f = fixture();
+  f.faux.setResponses([fauxAssistantMessage(fauxToolCall("search_source", { query: "He", limit: 1 }), { stopReason: "toolUse" }),
+    () => { throw new Error("503 service unavailable"); }]);
+  await assert.rejects(() => f.controller.planFor("w1", []));
+  assert.equal(f.faux.state.callCount, 2);
+  assert.ok(f.ledger.state().spentTokens > 0);
+  assert.equal(f.ledger.state().tokenUsageComplete, false);
+  assert.equal(f.records.find(r => r.state === "failed")?.usageComplete, false);
+});
 
 for (const confirms of [true, false]) {
   test(`unchanged candidate dismissal needs one independent bounded receipt (confirmed: ${confirms})`, async () => {
@@ -192,7 +242,10 @@ test("grounded review issues request repair; only accepted exact candidate satis
   ]);
   await f.controller.planFor("w1", []);
   const bad = [{ blockId: "b1", text: "他离开了。" }];
-  assert.equal((await f.controller.review("w1", bad, []))[0]?.code, "SUPERVISOR_SEMANTIC_REVIEW");
+  const failures = await f.controller.review("w1", bad, []);
+  assert.equal(failures[0]?.code, "SUPERVISOR_SEMANTIC_REVIEW");
+  assert.equal(failures[0]?.evidence?.sourceScopeQuote, "He did not leave.");
+  assert.equal(failures[0]?.evidence?.targetScopeQuote, "他离开了。");
   const good = [{ blockId: "b1", text: "他并没有离开。" }];
   assert.deepEqual(await f.controller.review("w1", good, []), []);
   assert.deepEqual(await f.controller.review("w1", good, []), []);

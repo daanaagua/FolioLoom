@@ -50,6 +50,7 @@ const SEQUENTIAL_TOOLS = new Set([
   "finalize_translation",
   "finalize_translation_batch",
   "submit_repaired_translation",
+  "submit_epub_text_patch",
   "submit_lexical_anchors",
   "choose_recovery_strategy",
   "submit_recovery_result",
@@ -171,12 +172,25 @@ export interface PiRunResult {
   durationMs: number;
   stopReason: StopReason;
   messages: AgentMessage[];
+  /** Actual responses only; excludes host-generated turn-limit sentinels. */
+  providerResponses?: AssistantMessage[];
   deadlineExceeded: boolean;
   turnLimitReached: boolean;
 }
 
 function assistant(message: AgentMessage): message is AssistantMessage {
   return "role" in message && message.role === "assistant";
+}
+
+export function piRunUsageComplete(run: PiRunResult): boolean {
+  const responses = run.providerResponses ?? run.messages.filter(assistant);
+  if (!Number.isSafeInteger(run.modelCalls) || run.modelCalls < 0 || responses.length !== run.modelCalls) return false;
+  const fields = ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const;
+  if (responses.some(m => fields.some(k => !Number.isFinite(m.usage[k]) || m.usage[k] < 0)
+    || !(m.usage.totalTokens > 0) || (m.usage.reasoning !== undefined
+      && (!Number.isFinite(m.usage.reasoning) || m.usage.reasoning < 0 || m.usage.reasoning > m.usage.output)))) return false;
+  return fields.every(k => Number.isFinite(run.usage[k]) && run.usage[k] >= 0
+    && run.usage[k] === responses.reduce((sum, m) => sum + m.usage[k], 0));
 }
 
 function addUsage(total: Usage, value: Usage): void {
@@ -255,6 +269,7 @@ export class PiRuntime {
       "finish_research",
       "finalize_translation",
       "submit_repaired_translation",
+      "submit_epub_text_patch",
     ]);
     const eventLog = spec.eventLog ?? new MemoryEventLog();
     const startedAt = performance.now();
@@ -266,6 +281,7 @@ export class PiRuntime {
     let turnStarts = 0;
     let deadlineExceeded = false;
     let turnLimitReached = false;
+    const localStops = new WeakSet<AssistantMessage>();
     const assistantResponses: Array<{
       readonly modelCallOrdinal: number;
       readonly message: AssistantMessage;
@@ -298,6 +314,7 @@ export class PiRuntime {
         timestamp: Date.now(),
       };
       queueMicrotask(() => {
+        localStops.add(message);
         stream.push({ type: "done", reason: "stop", message });
         stream.end(message);
       });
@@ -370,7 +387,7 @@ export class PiRuntime {
           eventLog.append("model", { phase: spec.phase, modelCalls });
           break;
         case "turn_end":
-          if (assistant(event.message)) {
+          if (assistant(event.message) && !localStops.has(event.message)) {
             addUsage(usage, event.message.usage);
             assistantResponses.push({
               // Agent event delivery can start the next turn before publishing
@@ -438,6 +455,7 @@ export class PiRuntime {
         ? "aborted"
         : (lastAssistant?.stopReason ?? "stop"),
       messages,
+      providerResponses: assistantResponses.map(response => response.message),
       deadlineExceeded,
       turnLimitReached,
     };

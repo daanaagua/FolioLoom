@@ -10,7 +10,7 @@ import { supervisionCandidateHash, supervisionMetadata, validateSupervisionIdent
 import { SupervisionController, isSupervisionBoundaryError } from "./supervision-controller.js";
 import { CandidateCheckpointService, CandidateRecoveryPausedError } from "./candidate-checkpoint.js";
 import { AutomaticRecovery, RecoveryPausedError } from "./automatic-recovery.js";
-import { QualityQueue, resolveDeliveryMode, type DeliveryMode } from "./delivery-policy.js";
+import { QualityQueue, qualityReviewId, resolveDeliveryMode, type DeliveryMode } from "./delivery-policy.js";
 import { readSurfaceObservations, surfaceObservations, surfaceConsistencyEvidence, reconsiderSurfaceCandidates, surfaceMentions } from "../knowledge/surface-consistency.js";
 import {
   collectWindowAnchorCandidates,
@@ -22,6 +22,7 @@ import {
 } from "../agents/lexical-anchorer.js";
 import {
   ModelProviderError,
+  piRunUsageComplete,
   PiRuntime,
 } from "../agents/pi-runtime.js";
 import {
@@ -48,6 +49,7 @@ import {
 } from "../knowledge/knowledge-store.js";
 import {
   collectTranslationKnowledgeCandidates,
+  translationKnowledgeContentByteBudget,
   type TranslationKnowledgeCandidate,
 } from "../knowledge/translation-knowledge-projection.js";
 import {
@@ -1521,6 +1523,9 @@ function translationContextPlan(
       requiredCoverage: risk.requiredCoverage,
       budgets: contextBudgets(candidates),
       maxEntries: DEFAULT_TRANSLATION_KNOWLEDGE_MAX_ENTRIES,
+      maxBytes: translationKnowledgeContentByteBudget(
+        baseInput.snapshot.revisions.length,
+      ),
     }),
     risk,
   };
@@ -3184,18 +3189,19 @@ async function runLosslessBook(
         ], context), [window], context, options.glossary);
         const request: PhysicalRequestPlan = { requestId: `quality-${item.itemId}`, windows: [{ ...window, status: "completed_with_warnings" }], sourceTokens: window.sourceTokens };
         const runtime = runtimeSet.escalation;
+        const reviewId = qualityReviewId(item);
         const buildInput = (selected: PhysicalRequestPlan): TranslationRequestInput => ({ request: selected, deliveryMode: "standard",
           blocks: context.losslessBlocks, stableTerms: terms, snapshot, strictIdentifiers: true,
           styleState: mergeStyleState(options.styleState, persistedStyleFromKnowledge(snapshot.revisions)),
           sourceLanguageProfile: context.languageProfile,
-          reviewCandidate: candidate => supervisor.reviewFinal(item.itemId, candidate.windowId, candidate.translations, terms, item.issues),
-          canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, item.itemId),
+          reviewCandidate: candidate => supervisor.reviewFinal(reviewId, candidate.windowId, candidate.translations, terms, item.issues, current),
+          canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, reviewId),
         });
         const admitted = admitTranslationRequests([request], runtime, estimator, blockById, buildInput)[0]!;
         const baseline = baselineVariantForTask(admitted, { runtime, maxConcurrency: 1, costModel: runtimeCostModel,
           risk: assessTaskRisk({ sourceTokens: request.sourceTokens, entityMentions: 0, pronounMentions: 0, relationKinds: [],
             remoteEvidenceDistance: 0, lockedTermOccurrences: 0, needsRevalidate: true, priorRepairs: 1, sourceAnomalies: 0 }) });
-        const baselineId = `quality-task:${item.itemId}`;
+        const baselineId = `quality-task:${reviewId}`;
         admission.addBaseline({ taskIds: [baselineId], baselineTokens: baseline.variant.predicted.totalTokens
           + admitted.targetedRepairReserveTokens + admitted.paragraphRecoveryReserveTokens + admitted.paragraphRefinementReserveTokens,
           source: "revalidate", reason: "final_quality_review" });
@@ -3231,7 +3237,7 @@ async function runLosslessBook(
         store.replaceQualityWindow({ runId, itemId: item.itemId, expectedHash: supervisionCandidateHash(current), snapshotId: snapshot.id,
           translations: candidate.translations.map(t => ({ ...t, sourceHash: blockById.get(t.blockId)!.sourceHash })),
           bindings: { usages: candidate.termUsages, concepts: conceptsFromStableTerms(terms) }, issues: candidate.qualityIssues ?? [],
-          closure: supervisor.finalClosure(item.itemId, candidate.translations) });
+          closure: supervisor.finalClosure(reviewId, candidate.translations) });
         flushSchedulerProjection?.();
       }
     };
@@ -3486,8 +3492,7 @@ async function runLosslessBook(
               const resolved = await operation(attemptId);
               transaction.settle({
                 actualTokens: resolved.run.usage.totalTokens,
-                usageComplete: resolved.run.modelCalls === 0
-                  || resolved.run.usage.totalTokens > 0,
+                usageComplete: piRunUsageComplete(resolved.run),
                 outcome: "success",
               });
               return resolved;
@@ -3498,8 +3503,7 @@ async function runLosslessBook(
               transaction.settle({
                 actualTokens: failedRun?.usage.totalTokens ?? 0,
                 usageComplete: failedRun !== undefined
-                  && (failedRun.modelCalls === 0
-                    || failedRun.usage.totalTokens > 0),
+                  && piRunUsageComplete(failedRun),
                 outcome: error instanceof ModelProviderError
                   && error.kind === "protocol"
                   ? "protocol"

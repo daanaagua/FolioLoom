@@ -369,6 +369,26 @@ export function stripEpubStructuralMarkers(text: string): string {
   return text.replace(/⟦\/?E\d+\.\d+\.\d+⟧/gu, "");
 }
 
+/** Map an exact visible quote back to unchanged bytes; only host slot markers are invisible. */
+export function resolveEpubVisibleQuote(text: string, quote: string): string | undefined {
+  if (text.includes(quote)) return quote;
+  const characters: string[] = [];
+  const offsets: number[] = [];
+  let cursor = 0;
+  const append = (end: number) => {
+    for (let i = cursor; i < end; i++) { characters.push(text[i]!); offsets.push(i); }
+  };
+  for (const marker of text.matchAll(/⟦\/?E\d+\.\d+\.\d+⟧/gu)) {
+    append(marker.index);
+    cursor = marker.index + marker[0].length;
+  }
+  append(text.length);
+  const visible = characters.join("");
+  const start = visible.indexOf(quote);
+  if (start < 0 || visible.indexOf(quote, start + 1) >= 0) return undefined;
+  return text.slice(offsets[start], offsets[start + quote.length - 1]! + 1);
+}
+
 function structuralMarkers(text: string): string[] {
   return [...text.matchAll(/⟦\/?E\d+\.\d+\.\d+⟧/gu)].map((match) => match[0]);
 }

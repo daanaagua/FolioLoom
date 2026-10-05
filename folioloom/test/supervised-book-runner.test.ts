@@ -16,6 +16,8 @@ import { runtimeObservationProfileKey } from "../src/fullbook/runtime-telemetry.
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { canonicalJson } from "../src/knowledge/knowledge-store.js";
 import { supervisionHash } from "../src/domain/supervision.js";
+import { RunLease } from "../src/kernel/run-lease.js";
+import { QualityQueue } from "../src/fullbook/delivery-policy.js";
 
 function userText(context: Context): string {
   const msg = context.messages.findLast(m => m.role === "user");
@@ -36,6 +38,7 @@ for (const finalRepairSucceeds of [true, false]) {
     const bad = "那位安静的旅人已经离开了屋子。他守在门边，一直等到外面的雨停了下来。";
     let repairCalls = 0;
     let translationCalls = 0;
+    let reworkGood = false;
     const reply = (context: Context) => {
       const prompt = userText(context);
       const answer = (tool: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(tool, args), { stopReason: "toolUse" });
@@ -53,7 +56,7 @@ for (const finalRepairSucceeds of [true, false]) {
         repairCalls++;
         const candidate = JSON.parse(/FAILED CANDIDATE\n\n([^\n]+)/u.exec(prompt)![1]!);
         return answer("submit_repaired_translation", { translations: candidate.map((t: any) => ({ blockId: t.blockId,
-          text: finalRepairSucceeds && repairCalls > (switchFromStrict ? 2 : 1) ? good : bad })), notes: [] });
+          text: reworkGood || finalRepairSucceeds && repairCalls > (switchFromStrict ? 2 : 1) ? good : bad })), notes: [] });
       }
       translationCalls++;
       const windows = JSON.parse(/WINDOWS\n\n([^\n]+)\n\nSTABLE TERMS/u.exec(prompt)![1]!);
@@ -97,6 +100,37 @@ for (const finalRepairSucceeds of [true, false]) {
     const calls = faux.state.callCount;
     assert.equal((await runBook(options)).outcome, "completed_with_warnings");
     assert.equal(faux.state.callCount, calls);
+    if (!finalRepairSucceeds && !switchFromStrict) {
+      const control = new LosslessBookStore(options.storePath);
+      const failed = new QualityQueue("standard", control).items()[0]!;
+      const request = { itemId: failed.itemId, requestId: "protocol-rework-1", expectedRecordId: failed.id,
+        expectedCandidateHash: failed.candidateHash, reason: "Repair transport changed; retry the retained candidate." };
+      const recordsBefore = control.qualityRecords("standard");
+      const ledgerBefore = control.loadTokenLedgerEvents("standard");
+      const lease = RunLease.acquire(`${options.storePath}.run.lock`, "lossless:standard");
+      assert.throws(() => control.requestQualityRework("standard", request), /active run lease/u);
+      lease.release();
+      assert.throws(() => control.requestQualityRework("standard", { ...request, expectedCandidateHash: "f".repeat(64) }), /stale/u);
+      control.requestQualityRework("standard", request);
+      control.requestQualityRework("standard", request);
+      assert.deepEqual(control.qualityRecords("standard").slice(0, recordsBefore.length), recordsBefore);
+      assert.equal(control.qualityRecords("standard").length, recordsBefore.length + 1);
+      assert.deepEqual(control.loadTokenLedgerEvents("standard"), ledgerBefore);
+      control.close();
+      reworkGood = true;
+      await runBook(options);
+      const verified = LosslessBookStore.openReadOnly(options.storePath);
+      try {
+        assert.equal(new QualityQueue("standard", verified).items()[0]?.state, "resolved");
+        assert.equal(verified.activeTranslations("standard")[0]?.text, good);
+        assert.equal(auditLosslessBookExport(verified, "standard").audit.strictExportable, true);
+        assert.equal(translationCalls, 1);
+        assert.ok(verified.supervisionRecords("standard").filter(r => r.state === "started" && r.event === "review").length < 12);
+      } finally { verified.close(); }
+      const afterRework = faux.state.callCount;
+      await runBook(options);
+      assert.equal(faux.state.callCount, afterRework);
+    }
   });
  }
 }

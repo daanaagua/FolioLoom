@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { evidenceReferences, resolveEvidenceReference } from "../src/domain/evidence-reference.js";
+import { resolveEpubVisibleQuote } from "../src/source/epub-structure.js";
+
+test("visible focus projection ignores only host EPUB markers and rejects ambiguity", () => {
+  const text = "🦉 ⟦E1.2.0⟧Do ⟦/E1.2.0⟧⟦E1.2.1⟧not leave.⟦/E1.2.1⟧";
+  const raw = resolveEpubVisibleQuote(text, "Do not leave.");
+  assert.equal(raw, "Do ⟦/E1.2.0⟧⟦E1.2.1⟧not leave.");
+  assert.ok(text.includes(raw!));
+  for (const focus of ["Do leave.", "do not leave.", "Do not leave!", "Do  not leave.", "E1.2.0Do"])
+    assert.equal(resolveEpubVisibleQuote(text, focus), undefined);
+  assert.equal(resolveEpubVisibleQuote(text + text, "Do not leave."), undefined);
+  assert.equal(resolveEpubVisibleQuote("Do <b>not</b> leave.", "Do not leave."), undefined);
+  assert.equal(resolveEpubVisibleQuote("Do ⟦UNKNOWN⟧not leave.", "Do not leave."), undefined);
+  assert.equal(resolveEpubVisibleQuote(text, "🦉 Do"), "🦉 ⟦E1.2.0⟧Do");
+  assert.equal(resolveEpubVisibleQuote("", ""), "");
+});
 
 test("evidence references preserve scalar coordinates across Unicode and repeated text", () => {
   for (const text of ["Rose rose. rose Rose.", "🦉 e\u0301 é ‘quoted’ 中文。\r\n".repeat(140), "x".repeat(2401), "\n".repeat(700) + "ending"]) {

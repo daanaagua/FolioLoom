@@ -8,7 +8,7 @@
   Cross-window checks cover resumed and parallel sibling windows without turning
   nicknames into locked identity aliases. Scoped rendering rules remain authoritative.
 - EPUB slot IDs are excluded from name concordance and provisional-memory replay.
-- Verification: 1132 core tests passed with one Windows environment skip; core and
+- Verification: 1177 core tests passed with one Windows environment skip; core and
   desktop type checks and the production desktop build passed.
 - Storage remains schema v5. Existing finalized quality records remain readable;
   current writes require candidate-bound closure receipts.
@@ -20,6 +20,31 @@
 - Durable delta reviews retain changed paragraphs, neighbors and open issues.
   Review credits are dependency-scoped with a lifetime cap and pre-repair admission.
 - Derived-noise quarantine preserves historical revisions and all translation/usage data.
+- DeepSeek supervision uses request-bound fixed-length decision arrays in a native
+  finalizer's sole values argument, with short
+  evidence handles. The host retains identities, quotes, versions and repair ranges;
+  canonical validation and bounded retry budgets remain unchanged.
+- Fragment receipts preserve global occurrence identities through local paragraph scopes,
+  refinement and assembly. Delta review shares the same semantic paragraph coordinates.
+- Usage completeness checks every actual provider response; local turn-limit sentinels
+  are excluded, while unmetered failures remain incomplete.
+- Readable EPUB focus quotes map back to exact source spans across host slot markers;
+  invented text, ambiguous projections and unissued references remain rejected.
+- Context planning reserves JSON metadata and UTF-8 entry bytes within the existing
+  wire limit while retaining mandatory evidence, dependencies and risk coverage.
+- EPUB semantic repairs submit candidate-bound text-slot patches; host-owned markers,
+  paragraph boundaries, fixed breaks and unrelated paragraphs remain unchanged.
+- EPUB repair wire responses use one fixed-length string/null array. Slot identity,
+  expected text and candidate hashes are host-owned; malformed arrays fail atomically
+  and rejected responses retain their actual provider usage.
+- Repair focus retains its validated source/target context. Repeated terms are
+  scoped to matching paragraphs inside that context; unscoped ambiguity is rejected.
+- Multi-paragraph plain-text semantic repairs use the same ordered values protocol.
+  Single-paragraph block repair and non-semantic repair retain their existing route.
+- Explicit quality rework is append-only, idempotent and candidate/version checked;
+  run leases and cumulative review limits remain enforced across rework rounds.
+- Fixed-issue evidence uses bounded local edit alignment when a corrected phrase
+  still contains its old substring; unrelated edits do not prove a fix.
 
 ## History
 

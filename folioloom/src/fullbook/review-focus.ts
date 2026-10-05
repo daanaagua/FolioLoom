@@ -2,16 +2,12 @@ import type { SupervisorInput, SupervisorSource } from "../agents/supervisor.js"
 import { evidenceReferences } from "../domain/evidence-reference.js";
 import type { SurfaceConsistencyEvidence } from "../knowledge/surface-consistency.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
+import { semanticParagraphSpans } from "../text/paragraph-spans.js";
 
 export interface ReviewFocus { policy: "paragraph-delta-1"; sourceIds: string[]; targetIds: string[] }
 type Candidate = readonly { blockId: string; text: string }[];
 function paragraphs(text: string) {
-  let cursor = 0;
-  return text.split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u).map(value => {
-    const at = text.indexOf(value, cursor);
-    cursor = at + value.length;
-    return { text: value, start: Array.from(text.slice(0, at)).length, end: Array.from(text.slice(0, cursor)).length };
-  });
+  return semanticParagraphSpans(text).map(p => ({ text: p.sourceText, start: p.scalarStart, end: p.scalarEnd }));
 }
 /** Only a durable earlier review permits a delta; structural uncertainty falls back to full review. */
 export function reviewFocus(sources: readonly SupervisorSource[], candidate: Candidate, previous: Candidate,

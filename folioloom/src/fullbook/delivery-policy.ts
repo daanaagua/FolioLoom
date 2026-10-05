@@ -2,6 +2,16 @@ import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { supervisionHash } from "../domain/supervision.js";
 import type { ValidationFailure } from "../tools/repair-tools.js";
 import { assertQualityClosure, priorQualityIssues, type QualityClosure } from "../domain/quality-closure.js";
+import { EPUB_TEXT_PATCH_PROTOCOL } from "../tools/epub-repair-patch.js";
+
+export const MAX_QUALITY_REWORKS = 2;
+export interface QualityReworkRequest {
+  readonly itemId: string;
+  readonly requestId: string;
+  readonly expectedRecordId: string;
+  readonly expectedCandidateHash: string;
+  readonly reason: string;
+}
 
 export type DeliveryMode = "standard" | "strict";
 export function resolveDeliveryMode(requested: DeliveryMode | undefined, stored: DeliveryMode | undefined, existing: boolean): DeliveryMode {
@@ -25,12 +35,17 @@ export interface QualityRecord {
   readonly reason?: string;
   readonly closureRequired?: boolean;
   readonly closure?: QualityClosure;
+  readonly rework?: { readonly requestId: string; readonly previousRecordId: string;
+    readonly protocol: typeof EPUB_TEXT_PATCH_PROTOCOL; readonly reason: string };
 }
 export interface QualityJournal {
   qualityRecords(runId: string): QualityRecord[];
   appendQualityRecord(runId: string, record: QualityRecord): void;
 }
 const hash = (value: unknown): string => supervisionHash(canonicalJson(value));
+export function qualityReviewId(item: QualityRecord): string {
+  return item.rework ? hash([item.itemId, item.rework.requestId, item.rework.protocol]) : item.itemId;
+}
 export function validateQualityRecord(record: QualityRecord): void {
   const { id, ...payload } = record;
   if (record.protocol !== "folioloom-quality-queue-1" || id !== hash(payload)
@@ -38,7 +53,11 @@ export function validateQualityRecord(record: QualityRecord): void {
     || typeof record.windowId !== "string" || !record.windowId
     || !["pending", "reviewing", "resolved", "unresolved", "blocked"].includes(record.state)
     || !Array.isArray(record.issues)
-    || (record.state === "resolved" ? record.issues.length !== 0 : !onlySemanticIssues(record.issues))) {
+    || (record.state === "resolved" ? record.issues.length !== 0 : !onlySemanticIssues(record.issues))
+    || (record.rework !== undefined && (record.rework.protocol !== EPUB_TEXT_PATCH_PROTOCOL
+      || !/^[a-f0-9]{64}$/u.test(record.rework.previousRecordId)
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(record.rework.requestId)
+      || typeof record.rework.reason !== "string" || !record.rework.reason.trim() || record.rework.reason.length > 1200))) {
     throw new Error("invalid quality record");
   }
 }
@@ -49,13 +68,26 @@ export class QualityQueue {
 
   items(): QualityRecord[] {
     const latest = new Map<string, QualityRecord>();
+    const reworks = new Map<string, number>();
+    const requests = new Set<string>();
     for (const record of this.store.qualityRecords(this.runId)) {
       validateQualityRecord(record);
       const previous = latest.get(record.itemId);
-      if ((!previous && record.state !== "pending")
+      const reopening = previous && record.state === "pending" && record.rework
+        && ["unresolved", "blocked"].includes(previous.state)
+        && record.rework.previousRecordId === previous.id;
+      if (reopening) {
+        const count = (reworks.get(record.itemId) ?? 0) + 1;
+        if (count > MAX_QUALITY_REWORKS || requests.has(record.rework!.requestId)
+          || record.candidateHash !== previous.candidateHash || canonicalJson(record.issues) !== canonicalJson(previous.issues)
+          || record.closure !== undefined || record.closureRequired !== true) throw new Error("invalid quality rework history");
+        reworks.set(record.itemId, count); requests.add(record.rework!.requestId);
+      }
+      if ((!previous && (record.state !== "pending" || record.rework !== undefined))
         || (previous && (previous.windowId !== record.windowId
-          || !(previous.state === "pending" && record.state === "reviewing"
-            || previous.state === "reviewing" && ["resolved", "unresolved", "blocked"].includes(record.state))))) {
+          || (!reopening && (canonicalJson(previous.rework ?? null) !== canonicalJson(record.rework ?? null)
+            || !(previous.state === "pending" && record.state === "reviewing"
+              || previous.state === "reviewing" && ["resolved", "unresolved", "blocked"].includes(record.state))))))) {
         throw new Error("invalid quality record transition");
       }
       latest.set(record.itemId, record);
@@ -80,6 +112,30 @@ export class QualityQueue {
     const item = this.#item(itemId);
     if (item.state !== "pending") throw new Error("quality final-review credit already consumed");
     return this.#append({ ...item, state: "reviewing" });
+  }
+
+  requestRework(input: QualityReworkRequest): QualityRecord {
+    if (!input || Object.keys(input).sort().join(",") !== "expectedCandidateHash,expectedRecordId,itemId,reason,requestId"
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(input.requestId)
+      || !/^[a-f0-9]{64}$/u.test(input.expectedCandidateHash) || !/^[a-f0-9]{64}$/u.test(input.expectedRecordId)
+      || typeof input.reason !== "string" || !input.reason.trim() || input.reason.length > 1200) throw new Error("invalid quality rework request");
+    this.items();
+    const records = this.store.qualityRecords(this.runId);
+    const existing = records.find(r => r.state === "pending" && r.rework?.requestId === input.requestId);
+    if (existing) {
+      if (existing.itemId !== input.itemId || existing.candidateHash !== input.expectedCandidateHash
+        || existing.rework!.previousRecordId !== input.expectedRecordId || existing.rework!.reason !== input.reason)
+        throw new Error("quality rework request id conflict");
+      return existing;
+    }
+    const item = this.#item(input.itemId);
+    if (item.id !== input.expectedRecordId || item.candidateHash !== input.expectedCandidateHash) throw new Error("stale quality rework request");
+    if (!["unresolved", "blocked"].includes(item.state)) throw new Error("quality rework requires a terminal unresolved item");
+    if (records.filter(r => r.itemId === item.itemId && r.state === "pending" && r.rework).length >= MAX_QUALITY_REWORKS)
+      throw new Error("quality rework limit exhausted");
+    return this.#append({ itemId: item.itemId, windowId: item.windowId, candidateHash: item.candidateHash,
+      state: "pending", issues: item.issues, closureRequired: true,
+      rework: { requestId: input.requestId, previousRecordId: item.id, protocol: EPUB_TEXT_PATCH_PROTOCOL, reason: input.reason } });
   }
 
   finish(itemId: string, state: "resolved" | "unresolved" | "blocked", candidateHash: string, issues: readonly ValidationFailure[], reason?: string, closure?: QualityClosure): QualityRecord {

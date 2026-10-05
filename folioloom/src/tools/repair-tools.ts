@@ -1,6 +1,7 @@
 import type { V4Block } from "../domain/types.js";
 import { BudgetLedger } from "../kernel/budget.js";
 import { hasSemanticText } from "../text/semantic-text.js";
+import { applyEpubTextPatch, type EpubRepairPlan, type EpubTextPatch } from "./epub-repair-patch.js";
 import {
   CandidateCollector,
   type TranslationCandidate,
@@ -14,7 +15,9 @@ import {
 export interface ValidationFailure {
   /** Host-owned identity excluding mutable candidate quotations. */
   issueKey?: string;
-  evidence?: { sourceQuote: string; targetQuote: string; problem: string };
+  evidence?: { sourceQuote: string; targetQuote: string; problem: string;
+    sourceRef?: string; targetRef?: string;
+    sourceScopeQuote?: string; targetScopeQuote?: string };
   code: string;
   blockId?: string;
   message: string;
@@ -26,6 +29,7 @@ interface RepairToolsOptions {
   targetBlocks: readonly V4Block[];
   failures: readonly ValidationFailure[];
   collector: CandidateCollector;
+  epubPatch?: { plan: EpubRepairPlan; candidate: TranslationCandidate };
 }
 
 export class RepairTools {
@@ -33,12 +37,14 @@ export class RepairTools {
   readonly #targetBlockIds: ReadonlySet<string>;
   readonly #failures: readonly ValidationFailure[];
   readonly #collector: CandidateCollector;
+  readonly #epubPatch: RepairToolsOptions["epubPatch"];
 
   constructor(options: RepairToolsOptions) {
     this.#budget = options.budget;
     this.#targetBlockIds = new Set(options.targetBlocks.map((item) => item.id));
     this.#failures = options.failures.map((item) => ({ ...item }));
     this.#collector = options.collector;
+    this.#epubPatch = options.epubPatch;
   }
 
   async inspectValidationFailures(
@@ -76,6 +82,24 @@ export class RepairTools {
   }
 
   specs(): TypedToolSpec[] {
+    if (this.#epubPatch) {
+      const { plan, candidate } = this.#epubPatch;
+      return [{ name: "submit_epub_text_patch", label: "Submit EPUB text patch", phase: "repair",
+        description: "Change only issued text slots. The host preserves every EPUB marker and all other text.",
+        parameters: Type.Object({ baseCandidateHash: Type.Literal(plan.baseCandidateHash),
+          patches: Type.Array(Type.Object({ blockId: Type.String(), slotId: Type.String(), expectedText: Type.String(), text: Type.String() },
+            { additionalProperties: false }), { minItems: 1, maxItems: plan.slots.length }),
+          notes: Type.Array(Type.String()),
+        }, { additionalProperties: false }),
+        execute: async (args, signal) => {
+          assertNotAborted(signal);
+          const patched = applyEpubTextPatch(plan, candidate, args as unknown as EpubTextPatch);
+          this.#budget.consume("translationToolCalls", 1);
+          this.#collector.addTranslation(patched);
+          return { accepted: true };
+        },
+      }];
+    }
     return [
       {
         name: "inspect_validation_failures",

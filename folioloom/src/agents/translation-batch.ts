@@ -221,7 +221,7 @@ function validateSubmission(
       status: notes.length > 0 ? "completed_with_warnings" : "completed",
       translations,
       termUsages: copyTermUsages(candidate.termUsages),
-      surfaceUsages: groundSurfaceUsages(input.surfaceMentions ?? [], candidate.surfaceUsages ?? [], translations),
+      surfaceUsages: groundSurfaceUsages(input.surfaceMentions ?? [], candidate.surfaceUsages ?? [], translations, input.paragraphFragment),
       notes,
       memoryCandidates: memories.candidates,
       ...(paragraphTranslations === undefined
@@ -688,7 +688,7 @@ async function validateAndRepair(
       ),
     ];
     delete repairedWindow.styleObservation;
-    repairedWindow.surfaceUsages = groundSurfaceUsages(input.surfaceMentions ?? [], window.surfaceUsages ?? [], repairedWindow.translations);
+    repairedWindow.surfaceUsages = groundSurfaceUsages(input.surfaceMentions ?? [], window.surfaceUsages ?? [], repairedWindow.translations, input.paragraphFragment);
     return repairedWindow;
   });
   const windows = normalizeWindowTypography(
