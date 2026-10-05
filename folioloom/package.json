@@ -13,6 +13,7 @@
     "pilot": "tsx src/cli.ts",
     "book": "tsx src/cli.ts book",
     "benchmark:cjk": "tsx src/benchmark/cjk-benchmark.ts",
+    "benchmark:context": "tsx src/benchmark/context-planning-benchmark.ts",
     "benchmark:reliability": "tsx src/benchmark/reliability-gate.ts",
     "desktop:dev": "electron-vite dev",
     "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",

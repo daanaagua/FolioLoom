@@ -8,7 +8,7 @@
   Cross-window checks cover resumed and parallel sibling windows without turning
   nicknames into locked identity aliases. Scoped rendering rules remain authoritative.
 - EPUB slot IDs are excluded from name concordance and provisional-memory replay.
-- Verification: 1177 core tests passed with one Windows environment skip; core and
+- Verification: 1188 core tests passed with one Windows environment skip; core and
   desktop type checks and the production desktop build passed.
 - Storage remains schema v5. Existing finalized quality records remain readable;
   current writes require candidate-bound closure receipts.
@@ -32,6 +32,11 @@
   invented text, ambiguous projections and unissued references remain rejected.
 - Context planning reserves JSON metadata and UTF-8 entry bytes within the existing
   wire limit while retaining mandatory evidence, dependencies and risk coverage.
+- Context admission reuses exact planning decisions in a bounded local cache;
+  independent frontiers prune across token buckets within equal coverage, preserving
+  resource tradeoffs and exact choices. Exceptional numerical/identity cases retain
+  bucket-local behavior.
+  The offline context benchmark covers 137 varied-cost candidates.
 - EPUB semantic repairs submit candidate-bound text-slot patches; host-owned markers,
   paragraph boundaries, fixed breaks and unrelated paragraphs remain unchanged.
 - EPUB repair wire responses use one fixed-length string/null array. Slot identity,

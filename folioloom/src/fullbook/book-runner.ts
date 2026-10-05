@@ -123,6 +123,7 @@ import {
 import { CongestionSensor } from "./congestion-sensor.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
 import { TelemetrySink } from "./telemetry-sink.js";
+import { createContextProfilePlanner } from "./context-profile-cache.js";
 import {
   planContextProfiles,
   type ContextProfile,
@@ -1467,6 +1468,7 @@ function translationContextPlan(
   priorRepairs: number,
   sourceAnomalyReport: SourceAnomalyReport,
   blockById: ReadonlyMap<string, LosslessBlock>,
+  planProfiles: typeof planContextProfiles,
 ): TranslationContextPlan {
   const blocks = requestBlocks(request, blockById);
   const sourceTexts = blocks.map((block) => block.sourceText);
@@ -1518,7 +1520,7 @@ function translationContextPlan(
   });
   return {
     candidates,
-    profiles: planContextProfiles({
+    profiles: planProfiles({
       bundles: candidates,
       requiredCoverage: risk.requiredCoverage,
       budgets: contextBudgets(candidates),
@@ -1695,6 +1697,7 @@ function dynamicRequestPlanning(
     readonly maxInFlightTokens: number;
   },
 ): DynamicRequestPlanning {
+  const planProfiles = createContextProfilePlanner();
   const legacyByTaskId = new Map<string, PlannedTranslationExecution>();
   const executionsByVariantId = new Map<string, PlannedTranslationExecution>();
   const variants: TaskExecutionVariant[] = [];
@@ -1722,6 +1725,7 @@ function dynamicRequestPlanning(
         options.retryRound,
         options.sourceAnomalyReport,
         options.blockById,
+        planProfiles,
       );
     const risk = contextPlan === undefined
       ? assessTaskRisk({
@@ -1871,6 +1875,7 @@ function dynamicRequestPlanning(
             options.retryRound,
             options.sourceAnomalyReport,
             options.blockById,
+            planProfiles,
           );
         const profile = selectedPlan.profiles[profileName];
         if (profile === undefined) {

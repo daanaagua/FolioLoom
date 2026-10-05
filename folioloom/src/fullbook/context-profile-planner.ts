@@ -1,4 +1,5 @@
 import type { RiskDimension } from "./task-risk.js";
+import { pruneIndependentFrontier } from "./context-frontier.js";
 
 export type ContextProfileName = "lean" | "balanced" | "rich";
 
@@ -491,8 +492,21 @@ function planIndependentStates(
   const bucketsPerCoverage = Math.floor(
     maximumBudget / TOKEN_BUCKET_SIZE,
   ) + 1;
-  const initialKey = mandatoryState.coverageMask * bucketsPerCoverage
-    + mandatoryState.tokenBucket;
+  // All future choices are independent and consume non-negative resources.
+  // A cheaper state with the same coverage and no worse entries/bytes/utility
+  // therefore dominates across token buckets too. Keeping those dominated
+  // states multiplies subsequent work without improving any profile.
+  // Preserve legacy ordering for overflow-sized utilities and distinct IDs
+  // that collate equally, whose numerical/stable-tie behavior is exceptional.
+  const globalDominance = bundles.every((bundle, index) =>
+    Math.abs(bundle.effectiveUtility) <= Number.MAX_VALUE / (2 * bundles.length)
+    && (index === 0 || compareText(
+      bundles[index - 1]!.value.bundleId, bundle.value.bundleId,
+    ) !== 0));
+  const stateKey = (state: ContextState): number => globalDominance
+    ? state.coverageMask
+    : state.coverageMask * bucketsPerCoverage + state.tokenBucket;
+  const initialKey = stateKey(mandatoryState);
   let groups = new Map<number, ContextState[]>([[
     initialKey,
     [mandatoryState],
@@ -590,10 +604,28 @@ function planIndependentStates(
               },
             utility: state.utility + choice.utility,
           };
-          const key = candidate.coverageMask * bucketsPerCoverage
-            + candidate.tokenBucket;
-          insertIndependentState(next, key, candidate, bundles);
+          const key = stateKey(candidate);
+          const candidates = next.get(key);
+          if (candidates === undefined) next.set(key, [candidate]);
+          else candidates.push(candidate);
         }
+      }
+    }
+    for (const [key, candidates] of next) {
+      if (candidates.length < 64
+        || candidates.some((state) => !Number.isFinite(state.utility))) {
+        // Small frontiers avoid index setup. Non-finite accumulated utilities
+        // retain the original comparison semantics, including overflow cases.
+        const pruned = new Map<number, ContextState[]>();
+        for (const candidate of candidates) {
+          insertIndependentState(pruned, key, candidate, bundles);
+        }
+        next.set(key, pruned.get(key)!);
+      } else {
+        next.set(key, pruneIndependentFrontier(candidates, (left, right) =>
+          compareIdSequences(
+            selectedBundleIds(left, bundles), selectedBundleIds(right, bundles),
+          )));
       }
     }
     groups = next;
