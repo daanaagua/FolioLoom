@@ -66,7 +66,7 @@ export interface QualityDisposition {
   note: string;
 }
 export interface QualityClosure {
-  policy: "issue-closure-1";
+  policy: "issue-closure-1" | "issue-closure-2";
   candidateHash: string;
   dispositions: readonly QualityDisposition[];
   decisionId: string;
@@ -85,12 +85,13 @@ export function priorQualityIssues(issues: readonly ValidationFailure[]): PriorQ
   });
 }
 
-export function needsDispositionVerification(disposition: QualityDisposition): boolean {
-  return disposition.status === "dismissed" || disposition.status === "variant";
+/** Legacy receipts keep their original two-pass contract. Current receipts use one grounded judgment. */
+export function needsDispositionVerification(disposition: QualityDisposition, policy: QualityClosure["policy"] = "issue-closure-1"): boolean {
+  return policy === "issue-closure-1" && (disposition.status === "dismissed" || disposition.status === "variant");
 }
 
 export function assertQualityClosure(prior: readonly PriorQualityIssue[], closure: QualityClosure, candidateHash: string): void {
-  if (closure.policy !== "issue-closure-1" || closure.candidateHash !== candidateHash || !closure.decisionId
+  if (!["issue-closure-1", "issue-closure-2"].includes(closure.policy) || closure.candidateHash !== candidateHash || !closure.decisionId
     || closure.dispositions.length !== prior.length || new Set(closure.dispositions.map(d => d.issueId)).size !== prior.length)
     throw new Error("invalid quality closure coverage or candidate");
   for (const issue of prior) {
@@ -99,6 +100,6 @@ export function assertQualityClosure(prior: readonly PriorQualityIssue[], closur
       || !d.note?.trim() || d.note.length > 160) throw new Error("invalid quality closure disposition");
     if (d.status !== "unresolved" && (!issue.sourceQuote || !d.sourceQuote || !d.targetQuote || !d.sourceRef || !d.targetRef))
       throw new Error("quality closure requires grounded evidence");
-    if (needsDispositionVerification(d) && !closure.verificationDecisionId) throw new Error("quality reversal requires verification");
+    if (needsDispositionVerification(d, closure.policy) && !closure.verificationDecisionId) throw new Error("quality reversal requires verification");
   }
 }

@@ -23,7 +23,8 @@ import { validateRecoveryRecord, type RecoveryRecord } from "../fullbook/automat
 import { QualityQueue, qualityReviewId, validateQualityRecord, type QualityRecord, type QualityReworkRequest, type DeliveryMode } from "../fullbook/delivery-policy.js";
 import { assertQualityClosure, hasChangedIssueEvidence, priorQualityIssues, needsDispositionVerification, type QualityClosure } from "../domain/quality-closure.js";
 import { validateSurfaceObservation, surfaceObservationNoiseReason } from "../knowledge/surface-consistency.js";
-import { MAX_LIFETIME_REVIEWS_PER_WINDOW, SUPERVISION_POLICY, supervisionCandidateHash } from "../domain/supervision.js";
+import { MAX_LIFETIME_REVIEWS_PER_WINDOW, SUPERVISION_POLICY, supervisionCandidateHash, supervisorIssueFailures, isProvenUnlaunchedSupervisorFailure } from "../domain/supervision.js";
+import { chapterReviewCoverage, type ChapterReviewCheckpoint, type ChapterReviewMetadata } from "../fullbook/chapter-review.js";
 import { RunLease } from "../kernel/run-lease.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
@@ -129,6 +130,9 @@ import {
   type TermUsageSubmission,
 } from "../knowledge/term-usage.js";
 import { stableTermsFromKnowledge } from "../knowledge/stable-terms-from-knowledge.js";
+import { readLexicalPreference } from "../knowledge/lexical-preference.js";
+import { stripEpubStructuralMarkers } from "../source/epub-structure.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
 import {
   planTermRetrofit,
   type TermRetrofitPlan,
@@ -682,6 +686,7 @@ export interface LosslessAuditMissingConceptBinding {
 }
 
 export interface LosslessAuditState {
+  sourceLanguage?: string;
   runId: string;
   sourceVersion: string;
   protocolVersion: string;
@@ -1157,7 +1162,6 @@ function termRuleProjectionFromRevision(
       canonicalTarget: first.target,
       policy: rule.policy,
       allowedRealizations: Object.freeze([...rule.allowedTargets]),
-      confidence: 1,
       visibility: "translator_global",
       renderFingerprint: first.renderFingerprint,
     }),
@@ -1542,7 +1546,6 @@ function lexicalConceptFromRow(row: LexicalConceptRow): StoredLexicalConcept {
       "lexical allowed realizations",
     ),
     visibility: row.visibility as LexicalConcept["visibility"],
-    confidence: row.confidence,
     renderFingerprint: row.render_fingerprint,
   };
 }
@@ -1568,10 +1571,6 @@ function lexicalConceptFromPayload(value: unknown): LexicalConcept {
     || payload.allowedRealizations.length === 0
     || payload.allowedRealizations.some((item: unknown) =>
       typeof item !== "string" || item.trim().length === 0)
-    || typeof payload.confidence !== "number"
-    || !Number.isFinite(payload.confidence)
-    || payload.confidence < 0
-    || payload.confidence > 1
     || !["translator_global", "narrative_before_target"].includes(
       payload.visibility ?? "",
     )
@@ -1588,7 +1587,6 @@ function lexicalConceptFromPayload(value: unknown): LexicalConcept {
     canonicalTarget: payload.canonicalTarget,
     policy: payload.policy as LexicalConcept["policy"],
     allowedRealizations: [...payload.allowedRealizations] as string[],
-    confidence: payload.confidence,
     visibility: payload.visibility as LexicalConcept["visibility"],
     renderFingerprint: payload.renderFingerprint,
   };
@@ -2250,8 +2248,25 @@ export class LosslessBookStore {
           WHERE m.run_id=? AND m.window_id=?`), input.runId, input.windowId);
         for (const candidate of surfaceCandidates) validateSurfaceObservation(candidate.payload, input.windowId, sources, input.translations);
       }
+      const preferenceCandidates = input.knowledgeCandidates.filter(c => c.kind.startsWith("lexical_preference:"));
+      if (preferenceCandidates.length) {
+        const sourceRows = all<{ blockId: string; sourceText: string }>(this.#database.prepare(`
+          SELECT block_id AS blockId, source_text AS sourceText FROM logical_blocks WHERE source_version=?`), this.#run(input.runId).source_version);
+        const clean = (text: string) => stripEpubStructuralMarkers(sourceTextForTranslation(text)).replace(/\s+/gu, " ").trim();
+        // Concordance may come from raw immutable text or the layout-free model
+        // projection. A bounded raw quote may legitimately end inside a marker.
+        const sourceTexts = sourceRows.flatMap(row => [clean(row.sourceText), row.sourceText.replace(/\s+/gu, " ").trim()]);
+        for (const candidate of preferenceCandidates) {
+          const term = readLexicalPreference(candidate.payload);
+          if (!term || candidate.kind !== `lexical_preference:${term.preference!.senseId}`
+            || canonicalJson(term) !== canonicalJson(candidate.payload)
+            || !term.preference!.evidenceQuotes.every(quote => sourceTexts.some(source => source.includes(clean(quote))))) {
+            throw new Error("lexical preference requires immutable source evidence and soft policy");
+          }
+        }
+      }
       if (input.qualityIssues?.length) {
-        if (input.knowledgeCandidates.some(c => c.kind !== "lexical_surface_observation") || input.styleTail)
+        if (input.knowledgeCandidates.some(c => c.kind !== "lexical_surface_observation" && !c.kind.startsWith("lexical_preference:")) || input.styleTail)
           throw new Error("quality-deferred window cannot publish memory or style");
         new QualityQueue(input.runId, {
           qualityRecords: runId => this.qualityRecords(runId),
@@ -6306,7 +6321,7 @@ export class LosslessBookStore {
         for (const d of closure.dispositions.filter(d => d.status !== "unresolved")) {
           const original = prior.find(p => p.issueId === d.issueId)!;
           if (!main?.decision?.dispositions?.some(p => canonicalJson(p) === canonicalJson(d))) throw new Error("quality closure has no recorded decision");
-          if (needsDispositionVerification(d) && (!verification?.decision?.dispositions?.some(p => p.issueId === d.issueId && p.status === d.status)
+          if (needsDispositionVerification(d, closure.policy) && (!verification?.decision?.dispositions?.some(p => p.issueId === d.issueId && p.status === d.status)
             || verification.decision.issues.length)) throw new Error("quality closure has no independent verification");
           const target = input.translations.find(t => t.blockId === original.blockId)?.text;
           if (!target?.includes(d.targetQuote) || (d.status === "fixed" && !hasChangedIssueEvidence(original.targetQuote, target,
@@ -6654,6 +6669,52 @@ export class LosslessBookStore {
     return all<{ payload_json: string }>(this.#database.prepare(`
       SELECT payload_json FROM events WHERE run_id=? AND kind='quality_record' ORDER BY sequence
     `), runId).map(row => JSON.parse(row.payload_json) as QualityRecord);
+  }
+
+  chapterReviewCheckpoints(runId: string): ChapterReviewCheckpoint[] {
+    this.#run(runId);
+    return all<{ payload_json: string }>(this.#database.prepare(
+      "SELECT payload_json FROM events WHERE run_id=? AND kind='chapter_review_checkpoint' ORDER BY sequence"), runId)
+      .map(row => JSON.parse(row.payload_json) as ChapterReviewCheckpoint);
+  }
+
+  /** Persist coverage together with all newly found issues; a verdict alone cannot mark a chapter delivered. */
+  commitChapterReview(runId: string, decisionId: string): ChapterReviewCheckpoint {
+    return this.#transaction(() => {
+      const existing = this.chapterReviewCheckpoints(runId).find(c => c.decisionId === decisionId);
+      if (existing) return existing;
+      const run = this.listTranslationRuns().find(r => r.runId === runId);
+      const metadata = (run?.metadata as { chapterReview?: ChapterReviewMetadata } | undefined)?.chapterReview;
+      const records = this.supervisionRecords(runId);
+      const record = records.find(r => r.id === decisionId);
+      if (!metadata || !record?.chapterReview || record.event !== "review" || record.state !== "completed" || !record.decision
+        || !["accept", "revise"].includes(record.decision.action)) throw new Error("chapter review requires a recorded completed decision");
+      const scope = metadata.scopes.find(s => s.id === record.chapterReview!.scopeId);
+      const first = scope?.windowIds.indexOf(record.windowIds[0]!);
+      if (!scope || first === undefined || first < 0 || record.windowIds.some((id, i) => scope.windowIds[first + i] !== id)) {
+        throw new Error("chapter decision outside planned scope");
+      }
+      const windows = this.allWindows(runId).filter(w => record.windowIds.includes(w.windowId));
+      if (windows.length !== record.windowIds.length || windows.some(w => !["completed", "completed_with_warnings"].includes(w.status))) {
+        throw new Error("chapter review requires committed windows");
+      }
+      const current = this.activeTranslations(runId).filter(t => record.windowIds.includes(t.windowId));
+      if (record.candidateHash !== supervisionCandidateHash(current)) throw new Error("chapter review candidate changed before findings were recorded");
+      const failures = supervisorIssueFailures(record.decision.issues);
+      if (failures.some(i => !current.some(t => t.blockId === i.blockId))) throw new Error("chapter issue outside reviewed candidate");
+      const queue = new QualityQueue(runId, { qualityRecords: id => this.qualityRecords(id),
+        appendQualityRecord: (id, r) => this.#appendQualityRecord(id, r) });
+      const qualityItemIds = windows.flatMap(window => {
+        const issues = failures.filter(i => window.blockIds.includes(i.blockId!));
+        return issues.length ? [queue.mergePending({ windowId: window.windowId,
+          candidateHash: supervisionCandidateHash(current.filter(t => t.windowId === window.windowId)), issues }).itemId] : [];
+      });
+      const checkpoint: ChapterReviewCheckpoint = { schema: "chapter-review-checkpoint-1", scopeId: scope.id,
+        windowIds: record.windowIds, decisionId, candidateHash: record.candidateHash, qualityItemIds };
+      chapterReviewCoverage(metadata, [...this.chapterReviewCheckpoints(runId), checkpoint], records);
+      this.#appendEvent(runId, "chapter_review_checkpoint", checkpoint);
+      return checkpoint;
+    });
   }
 
   requestQualityRework(runId: string, request: QualityReworkRequest): QualityRecord {
@@ -7056,6 +7117,7 @@ export class LosslessBookStore {
       runStatus: run.status,
       runMetadata: JSON.parse(run.metadata_json) as unknown,
       canonicalSha256: source.canonical_sha256,
+      sourceLanguage: getSourceLanguageProfile((JSON.parse(source.source_payload_json) as { sourceLanguage?: string }).sourceLanguage).id,
       canonicalChars: source.canonical_chars,
       blocks,
       windows: this.allWindows(runId),
@@ -7116,10 +7178,30 @@ export class LosslessBookStore {
     this.#run(runId);
     validateLedgerEvent(event);
     this.#transaction(() => {
+      if (event.type === "unlaunched_corrected") {
+        const record = this.supervisionRecords(runId).find(r => r.id === event.evidenceId);
+        if (!record || event.evidenceId !== `${event.requestId}:failed` || !isProvenUnlaunchedSupervisorFailure(record)) {
+          throw new Error("unlaunched correction requires matching durable preflight evidence");
+        }
+        const ledger = TokenLedger.fromEvents({ mode: "off", profile: "balanced", tokenIncreaseCap: 0.1 }, this.loadTokenLedgerEvents(runId));
+        ledger.apply(event);
+      }
       this.#appendEvent(runId, ledgerEventKind(event.type), {
         event,
         ts: new Date().toISOString(),
       });
+    });
+  }
+
+  pendingUnlaunchedSupervisorCorrections(runId: string): Extract<LedgerEvent, { type: "unlaunched_corrected" }>[] {
+    const events = this.loadTokenLedgerEvents(runId);
+    const corrected = new Set(events.filter(e => e.type === "unlaunched_corrected").map(e => e.requestId));
+    const records = new Map(this.supervisionRecords(runId).map(r => [r.id, r]));
+    return events.flatMap(event => {
+      if (event.type !== "settled" || event.usageComplete || event.actualTokens !== 0 || event.outcome !== "failed" || corrected.has(event.requestId)) return [];
+      const evidenceId = `${event.requestId}:failed`, record = records.get(evidenceId);
+      return record && isProvenUnlaunchedSupervisorFailure(record)
+        ? [{ type: "unlaunched_corrected" as const, requestId: event.requestId, evidenceId, reason: "supervisor_scope_rejected" as const }] : [];
     });
   }
 
@@ -7133,6 +7215,7 @@ export class LosslessBookStore {
         'token_ledger_dispatched',
         'token_ledger_settled',
         'token_ledger_released',
+        'token_ledger_unlaunched_corrected',
         'token_ledger_counters_patched'
       )
       ORDER BY sequence ASC
@@ -9153,7 +9236,9 @@ export class LosslessBookStore {
             "concept allowed realizations",
           ),
           concept.visibility,
-          concept.confidence,
+          // Obsolete NOT NULL compatibility column; zero is padding, never a score.
+          // Historical rows and revision IDs remain untouched.
+          0,
           concept.renderFingerprint,
         );
       }
@@ -11008,6 +11093,7 @@ const LEDGER_EVENT_KINDS = {
   dispatched: "token_ledger_dispatched",
   settled: "token_ledger_settled",
   released: "token_ledger_released",
+  unlaunched_corrected: "token_ledger_unlaunched_corrected",
   counters_patched: "token_ledger_counters_patched",
 } as const;
 
@@ -11064,6 +11150,10 @@ function validateLedgerEvent(event: LedgerEvent): void {
       if (event.patch === null || typeof event.patch !== "object") {
         throw new TypeError("counters_patched.patch invalid");
       }
+      return;
+    case "unlaunched_corrected":
+      if (typeof event.requestId !== "string" || !event.requestId.trim() || event.evidenceId !== `${event.requestId}:failed`
+        || event.reason !== "supervisor_scope_rejected") throw new TypeError("invalid unlaunched correction evidence");
       return;
     default: {
       const _exhaustive: never = event;

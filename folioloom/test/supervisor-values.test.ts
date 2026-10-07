@@ -1,16 +1,58 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, type Context } from "@earendil-works/pi-ai";
-import { runSupervisor, supervisorPrompt, validateSupervisorDecision, type SupervisorInput } from "../src/agents/supervisor.js";
-import { SupervisorValueFrame } from "../src/agents/supervisor-values.js";
+import { supervisorQueryResults } from "./helpers/supervisor-context.js";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, validateToolArguments, type Context } from "@earendil-works/pi-ai";
+import { runSupervisor, supervisorPrompt, supervisorSystemPrompt, validateSupervisorDecision, type SupervisorInput } from "../src/agents/supervisor.js";
+import { SupervisorValueFrame, supervisorValuesParameters } from "../src/agents/supervisor-values.js";
 import { evidenceReferences } from "../src/domain/evidence-reference.js";
 import { ModelProviderError, piRunUsageComplete } from "../src/agents/pi-runtime.js";
 import { bindTaskContext } from "../src/agents/task-context.js";
 
 function data(context: Context): any {
-  const message = context.messages.findLast(m => m.role === "user")!;
+  const message = context.messages.find(m => m.role === "user")!;
   return JSON.parse(typeof message.content === "string" ? message.content : message.content.filter(c => c.type === "text").map(c => c.text).join(""));
 }
+
+test("native values advertise stage-specific tuple shapes before the first response", async () => {
+  const f = fixture();
+  f.input.decisionProtocol = "ordered_values_tool";
+  f.faux.setResponses([context => {
+    const tool = context.tools!.find(t => t.name === "submit_supervisor_values")!;
+    const p = data(context);
+    const call = (values: unknown) => ({ type: "toolCall" as const, id: "check", name: tool.name, arguments: { values } });
+    const valid = ["revise", [[p.source[0].evidence[0].id, p.candidate[0].evidence[0].id, "Restore negation."]], [], "Checked."];
+    assert.doesNotThrow(() => validateToolArguments(tool, call(valid)));
+    assert.throws(() => validateToolArguments(tool, call(["revise", [{ source: 1, target: 2, problem: "wrong shape" }], [], "Bad."])));
+    assert.throws(() => validateToolArguments(tool, call(["revise", [[1, 2, "problem", "extra"]], [], "Bad."])));
+    assert.throws(() => validateToolArguments(tool, call([3, [], [], "Wrong stage."])));
+    return fauxAssistantMessage(fauxToolCall(tool.name, { values: valid }), { stopReason: "toolUse" });
+  }]);
+  assert.equal((await runSupervisor(f.input)).decision.action, "revise");
+});
+
+test("DeepSeek wire tuples use prefixItems while local validation retains exact row positions", async () => {
+  const f = fixture();
+  f.input.decisionProtocol = "ordered_values_tool";
+  f.input.model = { ...f.input.model, provider: "folioloom-deepseek" };
+  f.faux.setResponses([context => {
+    const tool = context.tools!.find(t => t.name === "submit_supervisor_values")!;
+    const values = (tool.parameters as any).properties.values;
+    assert.ok(Array.isArray(values.prefixItems));
+    assert.equal(values.items, false);
+    assert.equal(values.maxItems, 4);
+    const check = (v: any) => {
+      if (!v || typeof v !== "object") return;
+      if (Object.hasOwn(v, "items")) assert.ok(!Array.isArray(v.items), "provider uses JSON Schema 2020 array syntax");
+      Object.values(v).forEach(check);
+    };
+    check(tool.parameters);
+    const local = { ...tool, parameters: supervisorValuesParameters(f.input) };
+    assert.throws(() => validateToolArguments(local, { type: "toolCall", id: "bad", name: tool.name,
+      arguments: { values: [1, [], [], "Wrong event."] } }));
+    return fauxAssistantMessage(fauxToolCall(tool.name, { values: ["accept", [], [], "Checked."] }), { stopReason: "toolUse" });
+  }]);
+  assert.equal((await runSupervisor(f.input)).decision.action, "accept");
+});
 
 test("ordered supervisor decisions select host evidence without copying IDs, quotes or field names", async () => {
   const faux = fauxProvider();
@@ -145,8 +187,7 @@ test("queried evidence receives append-only short handles and final turn retains
     return fauxAssistantMessage(fauxToolCall("search_source", { query: "secret phrase", limit: 1 }), { stopReason: "toolUse" });
   }, context => {
     assert.deepEqual(context.tools ?? [], []);
-    const result = context.messages.findLast(m => m.role === "toolResult")!;
-    const content = JSON.parse(result.content.filter(c => c.type === "text").map(c => c.text).join(""));
+    const content = supervisorQueryResults(context).at(-1)!.result;
     const ref = content.hits[0].evidence.find((r: any) => r.text.includes("secret phrase"));
     assert.ok(ref.id > maxInitialNumber);
     assert.equal(content.hits[0].blockId, 1);
@@ -164,8 +205,7 @@ test("read_source resolves short block numbers through the same host table", asy
   f.faux.setResponses([context => fauxAssistantMessage(fauxToolCall("read_source", {
     blockId: data(context).source[0].blockId, start: 0, count: 40 }), { stopReason: "toolUse" }),
   context => {
-    const result = context.messages.findLast(m => m.role === "toolResult")!;
-    const body = JSON.parse(result.content.filter(c => c.type === "text").map(c => c.text).join(""));
+    const body = supervisorQueryResults(context).at(-1)!.result;
     assert.equal(body.blockId, 1);
     assert.equal(body.evidence[0].id, data(context).source[0].evidence[0].id);
     return fauxAssistantMessage('{"values":["accept",[],[],"Checked."]}');
@@ -248,6 +288,89 @@ test("native values retain one bounded query round and reject forged handles or 
     rejected.faux.setResponses([response]);
     await assert.rejects(() => runSupervisor(rejected.input), (error: unknown) => {
       assert.ok(error instanceof ModelProviderError && error.run && piRunUsageComplete(error.run)); return true;
+    });
+  }
+});
+
+test("native values identify the example as tool arguments, not a text response", () => {
+  const f = fixture(); f.input.decisionProtocol = "ordered_values_tool";
+  assert.match(supervisorSystemPrompt(f.input), /工具参数示例/u);
+  assert.match(supervisorSystemPrompt(f.input), /submit_supervisor_values/u);
+  assert.doesNotMatch(supervisorSystemPrompt(f.input), /结构示例/u);
+  f.input.decisionProtocol = "ordered_values";
+  assert.match(supervisorSystemPrompt(f.input), /结构示例/u);
+});
+
+test("native values use an existing turn to correct the channel without accepting prose or restarting review", async () => {
+  const f = fixture(); f.input.decisionProtocol = "ordered_values_tool"; f.input.maxTurns = 2;
+  const prose = '{"values":["accept",[],[],"A text response is not a receipt."]}';
+  const observed: number[] = [];
+  f.input.onAssistantResponse = o => { observed.push(o.assistantMessage.usage.totalTokens); };
+  f.input.streamFn = bindTaskContext(f.input.streamFn, "Synthetic task context.");
+  f.faux.setResponses([fauxAssistantMessage(prose), context => {
+    assert.ok(context.systemPrompt?.startsWith("Synthetic task context."));
+    assert.deepEqual(context.tools?.map(t => t.name), ["submit_supervisor_values"]);
+    const original = context.messages.find(m => m.role === "user")!;
+    assert.ok(JSON.stringify(original).includes("A guard did not leave."));
+    const previous = context.messages.filter(m => m.role === "assistant");
+    assert.equal(previous.length, 1);
+    assert.deepEqual(previous[0]!.content.filter(c => c.type === "text").map(c => c.text), [prose]);
+    assert.ok(!previous[0]!.content.some(c => c.type === "toolCall"));
+    const correction = JSON.stringify(context.messages.at(-1));
+    assert.match(correction, /submit_supervisor_values/u);
+    assert.match(correction, /未调用/u);
+    return fauxAssistantMessage(fauxToolCall("submit_supervisor_values", { values: ["revise", [[1, 3, "Restore negation."]], [], "Checked."] }), { stopReason: "toolUse" });
+  }]);
+  const result = await runSupervisor(f.input);
+  assert.equal(result.decision.action, "revise");
+  assert.equal(result.run.modelCalls, 2);
+  assert.deepEqual(result.run.toolNames, ["submit_supervisor_values"]);
+  assert.ok(piRunUsageComplete(result.run));
+  assert.equal(result.run.usage.totalTokens, observed.reduce((n, t) => n + t, 0));
+  assert.equal(observed.length, 2);
+});
+
+test("missing terminal correction is one-shot and never renews the session turn cap", async () => {
+  for (const maxTurns of [1, 2, 4]) {
+    const f = fixture(); f.input.decisionProtocol = "ordered_values_tool"; f.input.maxTurns = maxTurns;
+    f.faux.setResponses(Array.from({ length: 4 }, () => fauxAssistantMessage('{"values":["accept",[],[],"Not a tool"]}')));
+    await assert.rejects(() => runSupervisor(f.input), (error: unknown) => {
+      assert.ok(error instanceof ModelProviderError && error.run);
+      assert.match(error.message, /missing_terminal_tool.*submit_supervisor_values/u);
+      assert.equal(error.run.modelCalls, Math.min(maxTurns, 2));
+      assert.equal(error.run.toolNames.length, 0);
+      assert.ok(piRunUsageComplete(error.run));
+      return true;
+    });
+  }
+});
+
+test("a query followed by prose at the turn limit does not get a third call", async () => {
+  const f = fixture(); f.input.decisionProtocol = "ordered_values_tool"; f.input.maxTurns = 2;
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("read_source", { blockId: 1, start: 0, count: 10 }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("No tool receipt."),
+    fauxAssistantMessage(fauxToolCall("submit_supervisor_values", { values: ["accept", [], [], "Unused."] }), { stopReason: "toolUse" }),
+  ]);
+  await assert.rejects(() => runSupervisor(f.input), (error: unknown) => {
+    assert.ok(error instanceof ModelProviderError && error.run);
+    assert.equal(error.run.modelCalls, 2);
+    assert.equal(f.faux.state.callCount, 2);
+    assert.ok(piRunUsageComplete(error.run));
+    return true;
+  });
+});
+
+test("terminal correction never continues provider errors, truncation or cancellation", async () => {
+  for (const stopReason of ["error", "length", "aborted"] as const) {
+    const f = fixture(); f.input.decisionProtocol = "ordered_values_tool"; f.input.maxTurns = 2;
+    f.faux.setResponses([fauxAssistantMessage("No receipt.", { stopReason,
+      ...(stopReason === "error" ? { errorMessage: "401 Unauthorized" } : {}) })]);
+    await assert.rejects(() => runSupervisor(f.input), (error: unknown) => {
+      assert.ok(error instanceof ModelProviderError && error.run);
+      assert.equal(error.run.modelCalls, 1);
+      assert.ok(piRunUsageComplete(error.run));
+      return true;
     });
   }
 });

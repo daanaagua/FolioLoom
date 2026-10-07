@@ -1,12 +1,16 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
-import type { Api, Model, OpenAICompletionsCompat, OpenAIResponsesCompat } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model, OpenAICompletionsCompat, OpenAIResponsesCompat } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { ensureProviderNetwork, providerNetworkError, withProviderNetwork, type ProviderNetworkError } from "./network.js";
+import { createProviderPreflight, registerProviderPreflight } from "./preflight.js";
 
 import { providerRegistry, toInternalThinking } from "./registry.js";
 import { providerWirePolicy, type ProviderWirePolicy } from "./wire-policy.js";
 import type {
   ModelProfile,
+  ProviderModel,
   ProviderRuntime,
   ResolvedProviderProfile,
   SecretCredential,
@@ -35,7 +39,7 @@ function chatCompat(resolved: ResolvedProviderProfile, policy: ProviderWirePolic
   };
 }
 
-function createModel(resolved: ResolvedProviderProfile, baseUrl: string): Model<Api> {
+function createModel(resolved: ResolvedProviderProfile, baseUrl: string): ProviderModel {
   const capabilities = resolved.definition.capabilities;
   const policy = providerWirePolicy(resolved);
   const common = {
@@ -48,6 +52,7 @@ function createModel(resolved: ResolvedProviderProfile, baseUrl: string): Model<
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: capabilities.contextWindow,
     maxTokens: capabilities.maxTokens,
+    ...(capabilities.reviewLimits ? { reviewLimits: { ...capabilities.reviewLimits } } : {}),
     thinkingLevelMap: policy.thinkingLevelMap,
   };
   if (resolved.definition.apiFamily === "openai-responses") {
@@ -88,11 +93,37 @@ export function createProviderRuntime(
   const api = resolved.definition.apiFamily === "openai-responses"
     ? openAIResponsesApi()
     : openAICompletionsApi();
-  const streamFn: StreamFn = (streamModel, context, streamOptions) => api.streamSimple(streamModel, context, {
-    ...streamOptions,
-    apiKey,
-    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-    ...(internalThinking === undefined ? {} : { reasoning: internalThinking }),
-  });
-  return { model, streamFn };
+  const streamFn: StreamFn = (streamModel, context, streamOptions) => {
+    ensureProviderNetwork();
+    const output = createAssistantMessageEventStream();
+    const scope: { failure?: ProviderNetworkError } = {};
+    void withProviderNetwork(scope, async () => {
+      let partial: AssistantMessage | undefined;
+      try {
+        const events = api.streamSimple(streamModel, context, {
+          ...streamOptions, apiKey, maxRetries: 0,
+          ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+          ...(internalThinking === undefined ? {} : { reasoning: internalThinking }),
+        });
+        for await (const event of events) {
+          if ("partial" in event) partial = event.partial;
+          if (event.type === "error" && scope.failure) {
+            output.push({ ...event, error: { ...event.error, errorMessage: scope.failure.message } });
+          } else output.push(event);
+        }
+      } catch (error) {
+        const failure = scope.failure ?? providerNetworkError(error);
+        output.push({ type: "error", reason: "error", error: {
+          role: "assistant", content: [], api: streamModel.api, provider: streamModel.provider, model: streamModel.id,
+          timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          ...partial, stopReason: "error", errorMessage: failure?.message ?? "Provider stream could not be completed.",
+        } });
+      } finally { output.end(); }
+    });
+    return output;
+  };
+  const preflight = createProviderPreflight(baseUrl, apiKey, options.timeoutMs);
+  registerProviderPreflight(streamFn, preflight);
+  return { model, streamFn, preflight };
 }

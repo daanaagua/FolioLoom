@@ -14,7 +14,7 @@ import {
   type ValidationFailure,
 } from "../tools/repair-tools.js";
 import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
-import { applyEpubRepairValues, prepareEpubRepairPlan } from "../tools/epub-repair-patch.js";
+import { applyEpubRepairValues, prepareEpubRepairPlan, EpubRepairNoChangeError } from "../tools/epub-repair-patch.js";
 import {
   PiRuntime,
   ModelProviderError,
@@ -42,6 +42,7 @@ interface RepairInput {
 
 export interface RepairOutcome {
   candidate?: TranslationCandidate;
+  noChange?: { readonly candidateHash: string };
   run: PiRunResult;
 }
 
@@ -104,6 +105,7 @@ export class Repairer {
       systemPrompt: [
         "Repair a Chinese literary translation only for the typed validation failures.",
         "Preserve all unaffected meaning and paragraph structure.",
+        "When evidence.repairInstruction is present, it is the current candidate-bound repair direction. The original problem is historical context, not a competing instruction; do not reverse the current direction merely to reproduce the old wording. Apply only the grounded occurrence and retain all unrelated literary choices.",
         "Retain established names and terminology throughout the corrected blocks. Never override locked targets or scoped allowed forms; soft terms remain contextual, not blanket literal substitutions.",
         ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
         epubPlan ? "Do not explain. Output only the ordered JSON array of string/null values; the host owns all metadata and formatting."
@@ -135,6 +137,10 @@ export class Repairer {
         input.collector.addTranslation(repaired);
         return { candidate: repaired, run };
       } catch (error) {
+        if (error instanceof EpubRepairNoChangeError) {
+          input.budget.consume("translationToolCalls", 1);
+          return { noChange: { candidateHash: error.candidateHash }, run };
+        }
         throw new ModelProviderError(`invalid EPUB repair values: ${error instanceof Error ? error.message : String(error)}`,
           "protocol", false).withRun(run);
       }

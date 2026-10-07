@@ -659,6 +659,14 @@ async function validateAndRepair(
         : window),
     };
   }
+  if (repair.noChange) {
+    if (!onlySemanticIssues(failures) || repair.noChange.candidateHash !== supervisionCandidateHash(failedTranslations)) {
+      throw new Error("no-change repair proposal does not match the grounded semantic candidate");
+    }
+    // Preserve the finding for the existing grounded quality-closure path. Replaying
+    // an identical ordinary review would only reuse its original disputed decision.
+    return { ...failWithoutRepair("validation failed after no-change semantic repair proposal"), repairRuns: [repair.run] };
+  }
   const patchById = new Map(repair.candidate?.translations.map((item) => [
     item.blockId,
     item,

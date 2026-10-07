@@ -83,7 +83,7 @@ test("memory projection is subject-matched, position-safe, and bounded", () => {
   assert.equal(boundedActiveTail("甲".repeat(2_000)).length, 1_600);
 });
 
-test("high-confidence snapshot facts become position-scoped durable memories", () => {
+test("source-grounded snapshot facts become position-scoped durable memories without self-scores", () => {
   const snapshot = emptySnapshot();
   snapshot.questions.push({
     questionId: "q1",
@@ -107,7 +107,6 @@ test("high-confidence snapshot facts become position-scoped durable memories", (
     kind: "entity_identity",
     subjectIds: ["smoky"],
     verdict: "Same person.",
-    confidence: 0.95,
     channel: "narrative_before_target",
     visibleFromGlobalIndex: 11,
     evidenceIds: ["ev1"],

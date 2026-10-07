@@ -20,7 +20,8 @@ export interface LexicalConcept {
   readonly canonicalTarget: string;
   readonly policy: StableTermPolicy;
   readonly allowedRealizations: readonly string[];
-  readonly confidence: number;
+  /** @deprecated Historical input only; omitted from new concepts. */
+  readonly confidence?: number;
   readonly visibility: VisibilityChannel;
   readonly renderFingerprint: string;
 }
@@ -31,7 +32,7 @@ export interface LexicalConceptAnchorInput {
   readonly target: string;
   readonly mode: "stable" | "contextual";
   readonly semanticClass: LexicalSemanticClass;
-  readonly confidence: number;
+  readonly confidence?: number;
   readonly allowedRealizations?: readonly string[];
   readonly visibility?: VisibilityChannel;
 }
@@ -133,16 +134,6 @@ function visibility(value: unknown): VisibilityChannel {
   return value as VisibilityChannel;
 }
 
-function confidence(value: unknown): number {
-  if (typeof value !== "number"
-    || !Number.isFinite(value)
-    || value < 0
-    || value > 1) {
-    throw new TypeError("lexical confidence must be a finite number from 0 through 1");
-  }
-  return value;
-}
-
 interface ConceptContent {
   readonly normalizedSubject: string;
   readonly sourceForms: readonly string[];
@@ -150,7 +141,6 @@ interface ConceptContent {
   readonly canonicalTarget: string;
   readonly policy: StableTermPolicy;
   readonly allowedRealizations: readonly string[];
-  readonly confidence: number;
   readonly visibility: VisibilityChannel;
 }
 
@@ -166,7 +156,6 @@ function createConcept(
   const semantics = semanticClass(raw.semanticClass);
   const surfacePolicy = policy(raw.policy);
   const channel = visibility(raw.visibility);
-  const certainty = confidence(raw.confidence);
   const allowed = realizations(target, raw.allowedRealizations);
   const subject = normalizedText(raw.normalizedSubject, "normalized subject", 128)
     .toLocaleLowerCase("und");
@@ -183,7 +172,6 @@ function createConcept(
     conceptId,
     normalizedSubject: subject,
     ...renderContent,
-    confidence: certainty,
   }).slice(0, 24)}`;
   return Object.freeze({
     conceptId,
@@ -194,7 +182,6 @@ function createConcept(
     canonicalTarget: target,
     policy: surfacePolicy,
     allowedRealizations: Object.freeze(allowed),
-    confidence: certainty,
     visibility: channel,
     renderFingerprint,
   });
@@ -218,7 +205,6 @@ export function conceptFromAnchor(
     canonicalTarget: input.target,
     policy: input.mode === "contextual" ? "contextual" : "preferred",
     allowedRealizations: input.allowedRealizations ?? [input.target],
-    confidence: input.confidence,
     visibility: input.visibility ?? "translator_global",
   });
 }
@@ -234,7 +220,6 @@ export function reviseConcept(
     canonicalTarget: patch.canonicalTarget ?? concept.canonicalTarget,
     policy: patch.policy ?? concept.policy,
     allowedRealizations: patch.allowedRealizations ?? concept.allowedRealizations,
-    confidence: patch.confidence ?? concept.confidence,
     visibility: patch.visibility ?? concept.visibility,
   });
 }

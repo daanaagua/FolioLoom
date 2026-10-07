@@ -86,7 +86,9 @@ export class QualityQueue {
       if ((!previous && (record.state !== "pending" || record.rework !== undefined))
         || (previous && (previous.windowId !== record.windowId
           || (!reopening && (canonicalJson(previous.rework ?? null) !== canonicalJson(record.rework ?? null)
-            || !(previous.state === "pending" && record.state === "reviewing"
+            || !(previous.state === "pending" && record.state === "pending" && previous.candidateHash === record.candidateHash
+                && previous.issues.every(issue => record.issues.some(i => canonicalJson(i) === canonicalJson(issue)))
+              || previous.state === "pending" && record.state === "reviewing"
               || previous.state === "reviewing" && ["resolved", "unresolved", "blocked"].includes(record.state))))))) {
         throw new Error("invalid quality record transition");
       }
@@ -106,6 +108,17 @@ export class QualityQueue {
     const existing = this.items().find(item => item.itemId === itemId);
     if (existing) return existing;
     return this.#append({ ...input, itemId, state: "pending", closureRequired: true });
+  }
+
+  /** Chapter findings extend unclaimed evidence; they cannot reopen a spent final-review credit. */
+  mergePending(input: { windowId: string; candidateHash: string; issues: readonly ValidationFailure[] }): QualityRecord {
+    if (!onlySemanticIssues(input.issues)) throw new Error("quality merge requires grounded semantic issues only");
+    const existing = this.items().find(item => item.windowId === input.windowId);
+    if (!existing) return this.defer(input);
+    const added = input.issues.filter(i => !existing.issues.some(prior => (prior.issueKey ?? prior.message) === (i.issueKey ?? i.message)));
+    if (!added.length) return existing;
+    if (existing.state !== "pending" || existing.candidateHash !== input.candidateHash) throw new Error("quality merge requires an unclaimed matching candidate");
+    return this.#append({ ...existing, issues: [...existing.issues, ...added] });
   }
 
   claimFinal(itemId: string): QualityRecord {

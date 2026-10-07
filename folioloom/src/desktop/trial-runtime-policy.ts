@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
-import { toInternalThinking } from "../providers/registry.js";
+import { toInternalThinking } from "../providers/effort.js";
 import type { ProviderEffort } from "../providers/types.js";
 
 const PROVIDER_EFFORTS = [

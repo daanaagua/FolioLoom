@@ -142,7 +142,7 @@ test("knowledge candidates expose atomic structured relation bundles", () => {
     "entity_identity",
     "control",
   ]);
-  assert.equal(
+  assert.deepEqual(
     (candidates[0]?.payload as { payload?: unknown }).payload,
     payload,
   );
@@ -256,6 +256,25 @@ test("prepared requests serialize only selected revision ids after the stable pr
   assert.equal(selected.serializedToolSchemas, unselected.serializedToolSchemas);
   assert.equal(selected.sections[0]?.kind, "request");
   assert.equal(selected.sections[1]?.kind, "memory");
+});
+
+test("translation guidance retains read-only comparison evidence without adding another source block", () => {
+  const current = block("current", 1, "She entered the lyceum.");
+  const guidance = { blockId: current.id, sourceRef: "current-receipt", sourceQuote: current.sourceText,
+    instruction: "Keep the school sense here.", referenceEvidence: { blockId: "earlier", sourceRef: "earlier-receipt",
+      sourceQuote: "The lyceum was a school.", readOnly: true as const } };
+  const request = requestFor(current);
+  const before = JSON.stringify(request);
+  const prepared = prepareTranslationRequest({ request, blocks: [current], stableTerms: [],
+    snapshot: { id: "snapshot-guidance", revisions: [] }, sourceLanguageProfile: getSourceLanguageProfile("en"),
+    supervisorGuidance: [guidance, { blockId: "earlier", sourceQuote: "The lyceum was a school.", instruction: "Not this batch." }] });
+  const section = prepared.sections.find(s => Array.isArray(s.jsonPayload) && s.jsonPayload.includes(guidance));
+  assert.ok(section);
+  assert.deepEqual(section.jsonPayload, [guidance]);
+  assert.match(section.text, /referenceEvidence只读/u);
+  assert.equal(JSON.stringify(request), before);
+  assert.deepEqual(request.windows.flatMap(w => w.blockIds), [current.id]);
+  assert.doesNotMatch(prepared.prompt, /Not this batch/u);
 });
 
 test("selected revisions fail when missing, inapplicable, or over entry budget", () => {
@@ -394,6 +413,6 @@ test("paragraph execution narrows planned knowledge to the exact wire fragment",
   assert.deepEqual(
     admitted.fragments.map((fragment) =>
       fragment.input.selectedKnowledgeRevisionIds),
-    [[], ["revision-brin"]],
+    [["revision-brin"]],
   );
 });

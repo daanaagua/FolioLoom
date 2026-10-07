@@ -342,7 +342,6 @@ function finalizerTool(
     ),
     subjectForms: Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
     fact: Type.String(),
-    confidence: Type.Number({ minimum: 0, maximum: 1 }),
   }, { additionalProperties: false }), { maxItems: 4 });
   const styleObservationSchema = Type.Object({
     voiceId: Type.Optional(Type.String()),
@@ -661,10 +660,12 @@ export function translationBatchSystemPrompt(
     "When source text contains paired ⟦E…⟧ and ⟦/E…⟧ EPUB structural-slot markers, copy every marker byte-for-byte in the same order, translate only text inside each pair, and emit no prose outside those pairs in that paragraph.",
     ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
     "In STABLE TERMS, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
+    "A term preference includes meaning, usageScope and source evidence. Reuse its name for that sense or object; a different sense may use another surface. Do not replace ordinary wording, imagery, sentence rhythm or character voice to imitate the evidence quotes.",
     "TERM OCCURRENCES are harness-computed source facts. Apply each referenced concept at that exact source occurrence; contextual concepts may use a context-appropriate allowed surface. Never invent occurrence IDs or receipts. When the supplied occurrence list is empty, omit termUsages or return an empty array.",
     responseProtocol === "typed_tool"
       ? "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol."
       : "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the required response protocol.",
+    "Do not correct suspected source typos or OCR errors, or merge similarly spelled names on that basis. Preserve the source's unresolved spellings and ambiguity.",
     "Logical windows remain independent even though this is one physical request.",
     responseProtocol === "typed_tool"
       ? `Use typed tools only and call ${typedFinalizerName} exactly once.`
@@ -861,7 +862,7 @@ export function prepareTranslationRequest(
     const guidance = input.supervisorGuidance.filter(g => requestedBlockIds.has(g.blockId));
     if (guidance.length) sections.splice(sections.length - 1, 0, {
       kind: "memory",
-      text: ["主 agent 的原文查证提示（供理解；不得覆盖原意、歧义、锁定术语或结构约束）", JSON.stringify(guidance)].join("\n\n"),
+      text: ["主 agent 的原文查证提示（供理解；不得覆盖原意、歧义、锁定术语或结构约束）。每项blockId/sourceQuote才是本批作用位置；referenceEvidence只读，只供比较词义，不翻译或修改其中的其他块。", JSON.stringify(guidance)].join("\n\n"),
       jsonPayload: guidance,
     });
   }
@@ -871,7 +872,7 @@ export function prepareTranslationRequest(
       paragraphIndex: input.paragraphFragment ? input.paragraphFragment.paragraphs.findIndex(p => p.ordinal === m.paragraphIndex) : m.paragraphIndex,
       occurrenceInParagraph: surfaceMentions.filter(n => n.blockId === m.blockId && n.paragraphIndex === m.paragraphIndex && n.sourceForm === m.sourceForm)
         .findIndex(n => n.occurrenceId === m.occurrenceId) + 1 }))),
-      "Return surfaceUsages [{occurrenceId,targetSurface}] in the owning window, using the exact actual rendering for each listed occurrence in its corresponding target paragraph. Use an empty surface only when no explicit rendering exists. These are provisional observations, not locked terms or identity aliases. preferredTarget is a scoped continuity preference; preserve distinct names, nicknames, ambiguity and contextual meanings."].join("\n\n"),
+      "Return surfaceUsages [{occurrenceId,targetSurface}] in the owning window, using the exact actual rendering for each listed occurrence in its corresponding target paragraph. Use an empty surface only when no explicit rendering exists. These are provisional observations, not locked terms or identity aliases. preferredTarget is a scoped continuity preference; preserve distinct names, nicknames, ambiguity and contextual meanings. Technical and institutional terms may denote a place, an activity, or another attested sense: reuse a prior rendering only when its sense fits, and retain source-grounded contextual variants."].join("\n\n"),
   });
   const schemas = tools.map(serializableToolSchema);
   return {

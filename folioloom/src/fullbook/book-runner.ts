@@ -6,12 +6,17 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import { bindTaskContext, taskContextMetadata, validateTaskContextIdentity } from "../agents/task-context.js";
+import { preflightProviderStream } from "../providers/preflight.js";
 import { supervisionCandidateHash, supervisionMetadata, validateSupervisionIdentity, summarizeSupervision, type SupervisionMode, type SupervisionSummary } from "../domain/supervision.js";
-import { SupervisionController, isSupervisionBoundaryError } from "./supervision-controller.js";
+import { SupervisionController, isSupervisionBoundaryError, isDeferrableQualityReviewError } from "./supervision-controller.js";
+import { chapterReviewCoverage, chapterReviewMetadata, planChapterReviews, type ChapterReviewMode } from "./chapter-review.js";
 import { CandidateCheckpointService, CandidateRecoveryPausedError } from "./candidate-checkpoint.js";
 import { AutomaticRecovery, RecoveryPausedError } from "./automatic-recovery.js";
 import { QualityQueue, qualityReviewId, resolveDeliveryMode, type DeliveryMode } from "./delivery-policy.js";
 import { readSurfaceObservations, surfaceObservations, surfaceConsistencyEvidence, reconsiderSurfaceCandidates, surfaceMentions } from "../knowledge/surface-consistency.js";
+import { lexicalReviewHints } from "../knowledge/lexical-review-hints.js";
+import { MAX_SUPERVISOR_WINDOWS } from "../agents/supervisor.js";
+import { finalQualityScopes, runFinalizationTasks } from "./finalization-scheduler.js";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
@@ -429,6 +434,7 @@ export interface LosslessBookRunOptions {
   deliveryMode?: DeliveryMode;
   taskContext?: string;
   supervisorMode?: SupervisionMode;
+  chapterReviewMode?: ChapterReviewMode;
   manifestPath: string;
   legacyV4DbPath?: string;
   storePath: string;
@@ -828,7 +834,6 @@ function knowledgeCandidatesFor(
       }
       const payload = {
         fact: candidate.fact,
-        confidence: candidate.confidence,
         subjectForms: [...candidate.subjectForms],
       };
       const recordId = `knowledge-${createHash("sha256")
@@ -1091,13 +1096,12 @@ function waveKnowledgeCandidates(
       "technical_term",
       "role",
     ].includes(semanticClass);
-    if (conceptEligible && term !== undefined) {
+    if (conceptEligible && term !== undefined && term.preference === undefined) {
       const concept = conceptFromAnchor({
         sourceForm: anchor.sourceForm,
         target: simplifyChineseTranslation(anchor.target),
         mode: anchor.mode,
         semanticClass: semanticClass as LexicalSemanticClass,
-        confidence: anchor.confidence,
         allowedRealizations: term.allowedTargets ?? [term.target],
       });
       conceptForms.add(normalizedSource);
@@ -1117,11 +1121,11 @@ function waveKnowledgeCandidates(
     }
     const payload = {
       sourceForm: anchor.sourceForm,
+      ...(anchor.discoveryKind ? { discoveryKind: anchor.discoveryKind } : {}),
       target: simplifyChineseTranslation(anchor.target),
       mode: anchor.mode,
       semanticClass,
       proposedSemanticClass: anchor.proposedSemanticClass ?? semanticClass,
-      confidence: anchor.confidence,
     };
     result.push({
       candidate: {
@@ -1151,7 +1155,7 @@ function waveKnowledgeCandidates(
           .digest("hex")
           .slice(0, 24)}`,
         normalizedSubject: normalizedSource,
-        kind: "lexical_anchor",
+        kind: term.preference === undefined ? "lexical_anchor" : `lexical_preference:${term.preference.senseId}`,
         payload,
       },
       sourceForms: [term.sourceForm],
@@ -2358,6 +2362,9 @@ async function runLosslessBook(
   };
   const supervisorMode = options.supervisorMode ?? "off";
   if (supervisorMode !== "off" && supervisorMode !== "bounded") throw new Error("invalid supervisor mode");
+  const chapterReviewMode = options.chapterReviewMode ?? "off";
+  if (!["off", "bounded"].includes(chapterReviewMode)) throw new Error("invalid chapter review mode");
+  if (chapterReviewMode === "bounded" && supervisorMode !== "bounded") throw new Error("chapter review requires the bounded supervisor");
   if (supervisorMode === "bounded" && (runtimeSet.primary.executionPolicy !== undefined
     || runtimeSet.primary.model.provider.startsWith("external-"))) {
     throw new Error("bounded supervisor requires the native Pi/provider API backend");
@@ -2515,6 +2522,10 @@ async function runLosslessBook(
       blocks: context.losslessBlocks,
       annotations: context.annotations,
     });
+    const planned = planBookWindows(context.losslessBlocks, {
+      ...windowOptionsForRunMode(runtimeSet.mode, options.windowOptions),
+      protocolVersion,
+    });
     const initialSnapshot = createKnowledgeSnapshot(runId, []);
     const requestedMetadata = runMetadataWithLanguageProfile(
       options.runMeta.metadata,
@@ -2522,6 +2533,10 @@ async function runLosslessBook(
       runtimeSet,
     );
     if (supervisorMode === "bounded") requestedMetadata.supervision = supervisionMetadata(supervisorMode);
+    const chapterPolicy = chapterReviewMode === "bounded"
+      ? chapterReviewMetadata(planChapterReviews(context.losslessBlocks, planned, context.languageProfile)) : undefined;
+    if (chapterPolicy) requestedMetadata.chapterReview = chapterPolicy;
+    else delete requestedMetadata.chapterReview;
     if (options.taskContext !== undefined) requestedMetadata.taskContext = taskContextMetadata(options.taskContext);
     const existingRun = store.listTranslationRuns().find((item) => item.runId === runId);
     const existingRuntimeMetadata = runtimeMetadata(existingRun?.metadata);
@@ -2529,6 +2544,9 @@ async function runLosslessBook(
       const storedMetadata = existingRun.metadata as Record<string, unknown> | undefined;
       validateTaskContextIdentity(storedMetadata?.taskContext, options.taskContext);
       validateSupervisionIdentity(storedMetadata?.supervision, supervisorMode);
+      if (canonicalJson(storedMetadata?.chapterReview ?? null) !== canonicalJson(chapterPolicy ?? null)) {
+        throw new Error("chapter review policy mismatch; resume requires the original chapter review mode");
+      }
       if (existingRuntimeMetadata === undefined && runtimeSet.mode !== "quality") {
         throw new Error("legacy translation runs can only resume in quality mode");
       }
@@ -2547,10 +2565,6 @@ async function runLosslessBook(
       initialSnapshotId: initialSnapshot.id,
       initialSnapshot,
       metadata: existingRun?.metadata ?? requestedMetadata,
-    });
-    const planned = planBookWindows(context.losslessBlocks, {
-      ...windowOptionsForRunMode(runtimeSet.mode, options.windowOptions),
-      protocolVersion,
     });
     store.initializeWindowPlan(runId, planned);
     store.recoverInterruptedWindows(runId);
@@ -2599,6 +2613,10 @@ async function runLosslessBook(
       enforceDispatchLifecycle: true,
     };
     const tokenLedger = store.loadTokenLedger(runId, tokenLedgerInit);
+    for (const correction of store.pendingUnlaunchedSupervisorCorrections(runId)) {
+      store.appendTokenLedgerEvent(runId, correction);
+      tokenLedger.apply(correction);
+    }
     tokenLedgerForReconciliation = tokenLedger;
     const priorSchedulerMetrics = store.loadSchedulerMetrics(
       runId,
@@ -2755,6 +2773,7 @@ async function runLosslessBook(
       maxConcurrency: Math.min(maxConcurrency, 3),
       runId, sourceVersion: context.sourceLedger.sourceVersion, windows: planned,
       sources: context.losslessBlocks.map(b => ({ blockId: b.id, globalIndex: b.globalIndex, sourceText: b.sourceText })),
+      getTargetContext: () => store.activeTranslations(runId).map(t => ({ blockId: t.blockId, text: t.text })),
       runtime: runtimeSet.primary, admission, store, signal: options.signal, deadlineMs: options.hardDeadlineMs,
       onResponse: (requestId, observation) => store.appendProviderResponseEvidence({
         runId, requestId, snapshotId: store.latestKnowledgeSnapshot(runId).id,
@@ -3181,70 +3200,83 @@ async function runLosslessBook(
     };
 
     const drainQualityAtFinalBarrier = async (): Promise<void> => {
-      if (deliveryMode !== "standard" || !supervisor) return;
-      for (const item of qualityQueue.items().filter(item => item.state === "pending")) {
-        throwIfAborted(options.signal);
-        if (options.shouldPause?.()) return;
-        const window = store.allWindows(runId).find(w => w.windowId === item.windowId)!;
-        const current = store.activeTranslations(runId).filter(t => t.windowId === item.windowId);
-        const snapshot = store.latestKnowledgeSnapshot(runId);
-        const terms = termsForWindows(uniqueTerms([
-          ...context.stableTerms.map(term => ({ ...term, origin: term.origin ?? "legacy" as const })),
-          ...(options.glossary?.stableTerms ?? []), ...stableTermsFromKnowledge(snapshot.revisions),
-        ], context), [window], context, options.glossary);
-        const request: PhysicalRequestPlan = { requestId: `quality-${item.itemId}`, windows: [{ ...window, status: "completed_with_warnings" }], sourceTokens: window.sourceTokens };
-        const runtime = runtimeSet.escalation;
-        const reviewId = qualityReviewId(item);
-        const buildInput = (selected: PhysicalRequestPlan): TranslationRequestInput => ({ request: selected, deliveryMode: "standard",
-          blocks: context.losslessBlocks, stableTerms: terms, snapshot, strictIdentifiers: true,
-          styleState: mergeStyleState(options.styleState, persistedStyleFromKnowledge(snapshot.revisions)),
-          sourceLanguageProfile: context.languageProfile,
-          reviewCandidate: candidate => supervisor.reviewFinal(reviewId, candidate.windowId, candidate.translations, terms, item.issues, current),
-          canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, reviewId),
-        });
-        const admitted = admitTranslationRequests([request], runtime, estimator, blockById, buildInput)[0]!;
-        const baseline = baselineVariantForTask(admitted, { runtime, maxConcurrency: 1, costModel: runtimeCostModel,
-          risk: assessTaskRisk({ sourceTokens: request.sourceTokens, entityMentions: 0, pronounMentions: 0, relationKinds: [],
-            remoteEvidenceDistance: 0, lockedTermOccurrences: 0, needsRevalidate: true, priorRepairs: 1, sourceAnomalies: 0 }) });
-        const baselineId = `quality-task:${reviewId}`;
-        admission.addBaseline({ taskIds: [baselineId], baselineTokens: baseline.variant.predicted.totalTokens
-          + admitted.targetedRepairReserveTokens + admitted.paragraphRecoveryReserveTokens + admitted.paragraphRefinementReserveTokens,
-          source: "revalidate", reason: "final_quality_review" });
-        const checkpoints = new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
-          modelId: runtime.model.id, store, purpose: baselineId });
-        checkpoints.save(buildInput(request), { windowId: window.windowId, ordinal: window.ordinal, status: "completed_with_warnings",
-          translations: current.map(t => ({ blockId: t.blockId, text: t.text })),
-          termUsages: inferTermUsages(expectedTermOccurrences(context.losslessBlocks.filter(b => window.blockIds.includes(b.id)),
-            conceptsFromStableTerms(terms), context.languageProfile), new Map(current.map(t => [t.blockId, t.text]))), notes: [], memoryCandidates: [] });
-        const attemptId = nextLedgerAttemptId(baselineId, 0);
-        const transaction = admission.begin({ requestId: attemptId, taskIds: [baselineId], purpose: "revalidate",
-          predictedTokens: baseline.variant.predicted.totalTokens, attempt: 0, conservativeHorizonFloor: 0 });
-        qualityQueue.claimFinal(item.itemId);
-        transaction.markDispatched();
-        const completed = (await executePlannedTranslationRequest({ admitted, runtime, buildInput, features: baseline.features, variant: baseline.variant }, {
-          admission, recovery, candidateCheckpoints: checkpoints, nextLedgerAttemptId, runtimeSet, estimator,
-          languageProfile: context.languageProfile, blockById, signal: options.signal, hardDeadlineMs: options.hardDeadlineMs,
-          retryRound: 0, conservativeHorizonFloor: () => 0,
-          onProviderResponse: evidence => store.appendProviderResponseEvidence({ runId, requestId: evidence.requestId, snapshotId: evidence.snapshotId,
-            phase: evidence.phase, modelCallOrdinal: evidence.modelCallOrdinal, requestHash: evidence.requestHash,
-            responseProtocol: evidence.responseProtocol, assistantMessage: evidence.assistantMessage }),
-        })).value;
-        transaction.settle({ actualTokens: completed.runtime.accountingUsage.totalTokens,
-          usageComplete: completed.runtime.accountingUsage.complete, outcome: completed.error ? "failed" : "success" });
-        if (completed.error) throw completed.error;
-        const candidate = completed.result?.windows[0];
-        if (!candidate || candidate.status === "failed") throw new RevalidationOutputError(candidate?.error ?? "final quality candidate missing");
-        const replacementById = new Map(candidate.translations.map(t => [t.blockId, t]));
-        const boundary = new TranslationValidator().validateCrossBlockAlignment(context.losslessBlocks.map(losslessAsV4), {
-          translations: store.activeTranslations(runId).map(t => replacementById.get(t.blockId) ?? t), notes: [], repaired: true,
-        });
-        if (!boundary.valid) throw new RevalidationOutputError("final quality repair changed cross-block alignment");
-        store.replaceQualityWindow({ runId, itemId: item.itemId, expectedHash: supervisionCandidateHash(current), snapshotId: snapshot.id,
-          translations: candidate.translations.map(t => ({ ...t, sourceHash: blockById.get(t.blockId)!.sourceHash })),
-          bindings: { usages: candidate.termUsages, concepts: conceptsFromStableTerms(terms) }, issues: candidate.qualityIssues ?? [],
-          closure: supervisor.finalClosure(reviewId, candidate.translations) });
-        flushSchedulerProjection?.();
-      }
+      if ((deliveryMode !== "standard" && chapterReviewMode !== "bounded") || !supervisor) return;
+      const pending = qualityQueue.items().filter(item => item.state === "pending");
+      const sources = context.losslessBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText }));
+      const targets = store.activeTranslations(runId);
+      await runFinalizationTasks(pending.map(item => ({
+        scopes: finalQualityScopes(store.allWindows(runId).find(w => w.windowId === item.windowId)!.blockIds, item.issues, sources, targets),
+        run: async () => {
+          throwIfAborted(options.signal);
+          if (options.shouldPause?.()) return;
+          const window = store.allWindows(runId).find(w => w.windowId === item.windowId)!;
+          const current = store.activeTranslations(runId).filter(t => t.windowId === item.windowId);
+          const snapshot = store.latestKnowledgeSnapshot(runId);
+          const terms = termsForWindows(uniqueTerms([
+            ...context.stableTerms.map(term => ({ ...term, origin: term.origin ?? "legacy" as const })),
+            ...(options.glossary?.stableTerms ?? []), ...stableTermsFromKnowledge(snapshot.revisions),
+          ], context), [window], context, options.glossary);
+          const request: PhysicalRequestPlan = { requestId: `quality-${item.itemId}`, windows: [{ ...window, status: "completed_with_warnings" }], sourceTokens: window.sourceTokens };
+          const runtime = runtimeSet.escalation;
+          const reviewId = qualityReviewId(item);
+          const buildInput = (selected: PhysicalRequestPlan): TranslationRequestInput => ({ request: selected, deliveryMode: "standard",
+            blocks: context.losslessBlocks, stableTerms: terms, snapshot, strictIdentifiers: true,
+            styleState: mergeStyleState(options.styleState, persistedStyleFromKnowledge(snapshot.revisions)),
+            sourceLanguageProfile: context.languageProfile,
+            reviewCandidate: candidate => supervisor.reviewFinal(reviewId, candidate.windowId, candidate.translations, terms, item.issues, current),
+            canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, reviewId),
+          });
+          const admitted = admitTranslationRequests([request], runtime, estimator, blockById, buildInput)[0]!;
+          const baseline = baselineVariantForTask(admitted, { runtime, maxConcurrency: 1, costModel: runtimeCostModel,
+            risk: assessTaskRisk({ sourceTokens: request.sourceTokens, entityMentions: 0, pronounMentions: 0, relationKinds: [],
+              remoteEvidenceDistance: 0, lockedTermOccurrences: 0, needsRevalidate: true, priorRepairs: 1, sourceAnomalies: 0 }) });
+          const baselineId = `quality-task:${reviewId}`;
+          admission.addBaseline({ taskIds: [baselineId], baselineTokens: baseline.variant.predicted.totalTokens
+            + admitted.targetedRepairReserveTokens + admitted.paragraphRecoveryReserveTokens + admitted.paragraphRefinementReserveTokens,
+            source: "revalidate", reason: "final_quality_review" });
+          const checkpoints = new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
+            modelId: runtime.model.id, store, purpose: baselineId });
+          checkpoints.save(buildInput(request), { windowId: window.windowId, ordinal: window.ordinal, status: "completed_with_warnings",
+            translations: current.map(t => ({ blockId: t.blockId, text: t.text })),
+            termUsages: inferTermUsages(expectedTermOccurrences(context.losslessBlocks.filter(b => window.blockIds.includes(b.id)),
+              conceptsFromStableTerms(terms), context.languageProfile), new Map(current.map(t => [t.blockId, t.text]))), notes: [], memoryCandidates: [] });
+          const attemptId = nextLedgerAttemptId(baselineId, 0);
+          const transaction = admission.begin({ requestId: attemptId, taskIds: [baselineId], purpose: "revalidate",
+            predictedTokens: baseline.variant.predicted.totalTokens, attempt: 0, conservativeHorizonFloor: 0 });
+          qualityQueue.claimFinal(item.itemId);
+          transaction.markDispatched();
+          const completed = (await executePlannedTranslationRequest({ admitted, runtime, buildInput, features: baseline.features, variant: baseline.variant }, {
+            admission, recovery, candidateCheckpoints: checkpoints, nextLedgerAttemptId, runtimeSet, estimator,
+            languageProfile: context.languageProfile, blockById, signal: options.signal, hardDeadlineMs: options.hardDeadlineMs,
+            retryRound: 0, conservativeHorizonFloor: () => 0,
+            onProviderResponse: evidence => store.appendProviderResponseEvidence({ runId, requestId: evidence.requestId, snapshotId: evidence.snapshotId,
+              phase: evidence.phase, modelCallOrdinal: evidence.modelCallOrdinal, requestHash: evidence.requestHash,
+              responseProtocol: evidence.responseProtocol, assistantMessage: evidence.assistantMessage }),
+          })).value;
+          transaction.settle({ actualTokens: completed.runtime.accountingUsage.totalTokens,
+            usageComplete: completed.runtime.accountingUsage.complete, outcome: completed.error ? "failed" : "success" });
+          if (completed.error) {
+            if (deliveryMode !== "standard" || !isDeferrableQualityReviewError(completed.error)) throw completed.error;
+            throwIfAborted(options.signal);
+            qualityQueue.finish(item.itemId, "blocked", supervisionCandidateHash(current), item.issues,
+              completed.error instanceof Error ? completed.error.message : "Final semantic review did not produce a valid decision.");
+            flushSchedulerProjection?.();
+            return;
+          }
+          const candidate = completed.result?.windows[0];
+          if (!candidate || candidate.status === "failed") throw new RevalidationOutputError(candidate?.error ?? "final quality candidate missing");
+          const replacementById = new Map(candidate.translations.map(t => [t.blockId, t]));
+          const boundary = new TranslationValidator().validateCrossBlockAlignment(context.losslessBlocks.map(losslessAsV4), {
+            translations: store.activeTranslations(runId).map(t => replacementById.get(t.blockId) ?? t), notes: [], repaired: true,
+          });
+          if (!boundary.valid) throw new RevalidationOutputError("final quality repair changed cross-block alignment");
+          store.replaceQualityWindow({ runId, itemId: item.itemId, expectedHash: supervisionCandidateHash(current), snapshotId: snapshot.id,
+            translations: candidate.translations.map(t => ({ ...t, sourceHash: blockById.get(t.blockId)!.sourceHash })),
+            bindings: { usages: candidate.termUsages, concepts: conceptsFromStableTerms(terms) }, issues: candidate.qualityIssues ?? [],
+            closure: supervisor.finalClosure(reviewId, candidate.translations) });
+          flushSchedulerProjection?.();
+        },
+      })), maxConcurrency);
     };
 
     let paused = false;
@@ -3315,13 +3347,9 @@ async function runLosslessBook(
         ...(options.glossary?.stableTerms ?? []),
         ...stableTermsFromKnowledge(snapshot.revisions),
       ], context);
-      if (supervisor !== undefined) {
-        const decision = await supervisor.planFor(selected[0]!.windowId, establishedTerms);
-        const allowed = new Set(decision.windowIds);
-        const count = selected.findIndex(w => !allowed.has(w.windowId));
-        if (count === 0) throw new Error("supervisor approved no dispatchable window");
-        if (count > 0) selected.splice(count);
-      }
+      // Resolve lexical evidence before planning so both stages use one projection.
+      // The host bounds the discovery wave without spending a provisional model plan.
+      if (supervisor !== undefined) selected.splice(MAX_SUPERVISOR_WINDOWS);
       const selectedSourceBlocks = sourceBlocksForWindows(selected, blockById);
       const selectedBlocks = selectedSourceBlocks.map(losslessAsV4);
       const anchorStableTerms = termsForWindows(
@@ -3378,7 +3406,8 @@ async function runLosslessBook(
         }
       }
       if (anchorCandidates.length >= 2 || (anchorCandidates.length === 1
-        && surfaceMemory.some(p => p.sourceForm === anchorCandidates[0]!.sourceForm))) {
+        && (anchorCandidates[0]!.discoveryKind === "recurrent_noun"
+          || surfaceMemory.some(p => p.sourceForm === anchorCandidates[0]!.sourceForm)))) {
         const inputHash = waveAnchorInputHash(context, anchorCandidates, anchorStableTerms);
         const cached = store.waveAnchorDecision(runId, inputHash);
         if (cached !== undefined) {
@@ -3644,8 +3673,8 @@ async function runLosslessBook(
         context,
       ).filter(item => !snapshot.revisions.some(revision => revision.candidateIds.includes(item.candidate.recordId)));
       const entityLinkWarnings = unresolvedEntityWarnings(waveAnchorSnapshot);
-      if (supervisor !== undefined && entityLinkWarnings.length > 0) {
-        const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings);
+      if (supervisor !== undefined) {
+        const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings, selected.length);
         const allowed = new Set(decision.windowIds);
         const count = selected.findIndex(w => !allowed.has(w.windowId));
         if (count === 0) throw new Error("supervisor approved no conflict-safe window");
@@ -4286,13 +4315,23 @@ async function runLosslessBook(
               && !window.qualityIssues?.length
               && !boundaryFailuresByWindow.has(window.windowId))
             .map((window) => window.windowId) ?? []));
+        const structurallyAcceptedWindowIds = new Set(completionOrder.flatMap(completed => completed.result?.windows
+          .filter(window => window.status !== "failed" && !boundaryFailuresByWindow.has(window.windowId))
+          .map(window => window.windowId) ?? []));
         const assignedWaveKnowledge = assignWaveKnowledge(
-          unpersistedWaveKnowledge,
+          unpersistedWaveKnowledge.filter(item => !item.candidate.kind.startsWith("lexical_preference:")),
           selected,
           successfulWindowIds,
           blockById,
           context,
         );
+        const assignedPreferences = assignWaveKnowledge(
+          unpersistedWaveKnowledge.filter(item => item.candidate.kind.startsWith("lexical_preference:")),
+          selected, structurallyAcceptedWindowIds, blockById, context,
+        );
+        for (const [windowId, preferences] of assignedPreferences) {
+          assignedWaveKnowledge.set(windowId, [...(assignedWaveKnowledge.get(windowId) ?? []), ...preferences]);
+        }
         const assignedRecordIds = new Set([...assignedWaveKnowledge.values()]
           .flatMap((items) => items.map((item) => item.recordId)));
         for (let index = unpersistedWaveKnowledge.length - 1; index >= 0; index -= 1) {
@@ -4394,13 +4433,17 @@ async function runLosslessBook(
               sources: window.blockIds.map(blockId => ({ blockId, sourceText: blockById.get(blockId)!.sourceText })),
               translations: windowResult.translations, candidates: collectedAnchorCandidates,
               anchors: waveAnchorSnapshot?.anchors ?? [], previous: surfaceMemory, profile: context.languageProfile, usages: windowResult.surfaceUsages });
-            const candidates = [...surfaceCandidates, ...(windowResult.qualityIssues?.length ? [] : [
+            const waveKnowledge = assignedWaveKnowledge.get(window.windowId) ?? [];
+            // These preferences are grounded in immutable source concordance, not the
+            // translation's quality. Keep them even when that translation needs repair.
+            const preferences = waveKnowledge.filter(candidate => candidate.kind.startsWith("lexical_preference:"));
+            const candidates = [...surfaceCandidates, ...preferences, ...(windowResult.qualityIssues?.length ? [] : [
               ...knowledgeCandidatesFor(
                 runId,
                 window.windowId,
                 windowResult.memoryCandidates,
               ),
-              ...(assignedWaveKnowledge.get(window.windowId) ?? []),
+              ...waveKnowledge.filter(candidate => !candidate.kind.startsWith("lexical_preference:")),
             ])];
             // Validate domain reconciliation before any durable stage is written.
             coordinator.knowledge.fork().reconcileCandidates(candidates, window.windowId);
@@ -4512,24 +4555,59 @@ async function runLosslessBook(
       store.syncScopedKnowledge(runId);
       if (firstUncommitted(store.allWindows(runId)) === undefined) {
         await drainRevalidationAtFinalBarrier();
-        await drainQualityAtFinalBarrier();
+        if (chapterPolicy && supervisor) {
+          let coverage = chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId))!;
+          while (coverage.pendingScopes.length) {
+            throwIfAborted(options.signal);
+            if (options.shouldPause?.()) break;
+            const terms = uniqueTerms([
+              ...context.stableTerms, ...(options.glossary?.stableTerms ?? []),
+              ...stableTermsFromKnowledge(store.latestKnowledgeSnapshot(runId).revisions),
+            ], context);
+            let chapterBlocked = false;
+            const batches = coverage.pendingScopes.flatMap(scope => Array.from({ length: Math.ceil(scope.windowIds.length / MAX_SUPERVISOR_WINDOWS) },
+              (_, i) => ({ ...scope, windowIds: scope.windowIds.slice(i * MAX_SUPERVISOR_WINDOWS, (i + 1) * MAX_SUPERVISOR_WINDOWS) })));
+            await runFinalizationTasks(batches.map(scope => ({ scopes: scope.windowIds, run: async () => {
+              throwIfAborted(options.signal);
+              if (chapterBlocked || options.shouldPause?.()) return;
+              try {
+                const hints = lexicalReviewHints({ revisions: store.latestKnowledgeSnapshot(runId).revisions,
+                  sources: context.losslessBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText })),
+                  translations: store.activeTranslations(runId),
+                  scopeBlockIds: scope.windowIds.flatMap(id => store.allWindows(runId).find(w => w.windowId === id)?.blockIds ?? []) });
+                const review = await supervisor.reviewChapter(scope.id, scope.title, scope.windowIds, terms, hints);
+                store.commitChapterReview(runId, review.decisionId);
+              } catch (error) {
+                if (deliveryMode !== "standard" || !isDeferrableQualityReviewError(error)) throw error;
+                throwIfAborted(options.signal);
+                // Coverage stays pending; queued work stops and in-flight receipts drain.
+                chapterBlocked = true;
+              }
+            } })), maxConcurrency);
+            coverage = chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId))!;
+            if (chapterBlocked) break;
+          }
+          // Partial chapter coverage must not consume the one final repair pass yet.
+          if (!coverage.pendingScopes.length) await drainQualityAtFinalBarrier();
+        } else {
+          await drainQualityAtFinalBarrier();
+        }
         store.ensureConceptCoverageRevalidationTasks(runId, store.latestKnowledgeSnapshot(runId).id);
         await drainRevalidationAtFinalBarrier();
       }
     }
 
     const status = store.statusSummary(runId);
+    const chapterPending = (chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId))?.pendingScopes.length ?? 0) > 0;
     const supervision = supervisorMode === "bounded" ? summarizeSupervision(supervisorMode, store.supervisionRecords(runId), store.allWindows(runId), store.activeTranslations(runId)) : undefined;
-    const outcome: LosslessBookRunResult["outcome"] = status.humanRequiredWindows > 0
-      || qualityQueue.items().some(item => item.state === "blocked")
-      || (deliveryMode === "strict" && qualityQueue.items().some(item => item.state !== "resolved"))
-      || (supervision?.paused.length ?? 0) > 0 || (supervision?.pendingReviewWindowIds ?? []).some(id =>
-        deliveryMode === "strict" || !qualityQueue.items().some(item => item.windowId === id))
+    const qualityAttention = qualityQueue.items().some(item => item.state !== "resolved")
+      || chapterPending || (supervision?.paused.length ?? 0) > 0 || (supervision?.pendingReviewWindowIds.length ?? 0) > 0;
+    const outcome: LosslessBookRunResult["outcome"] = status.humanRequiredWindows > 0 || status.failedWindows > 0
+      || (deliveryMode === "strict" && qualityAttention)
       ? "human_required"
       : status.pendingWindows > 0 || status.runningWindows > 0 || status.stagedWindows > 0
-        || qualityQueue.items().some(item => item.state === "pending" || item.state === "reviewing")
         ? "partial"
-        : status.warningWindows > 0
+        : status.warningWindows > 0 || qualityAttention
           ? "completed_with_warnings"
           : "completed";
     tokenLedger.assertReconciled();
@@ -4572,9 +4650,16 @@ async function runLosslessBook(
 
 export function runBook(options: BookRunOptions): Promise<BookRunResult>;
 export function runBook(options: LosslessBookRunOptions): Promise<LosslessBookRunResult>;
-export function runBook(
+export async function runBook(
   options: BookRunOptions | LosslessBookRunOptions,
 ): Promise<BookRunResult | LosslessBookRunResult> {
+  const streams = new Set([options.streamFn]);
+  if ("manifestPath" in options && options.runtimeSet) {
+    streams.add(options.runtimeSet.primary.streamFn);
+    streams.add(options.runtimeSet.escalation.streamFn);
+    for (const variant of options.runtimeSet.variants ?? []) streams.add(variant.streamFn);
+  }
+  for (const stream of streams) await preflightProviderStream(stream, "signal" in options ? options.signal : undefined, true);
   return "manifestPath" in options
     ? runLosslessBook(options)
     : runLegacyBook(options);

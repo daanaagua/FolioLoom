@@ -1,4 +1,5 @@
 import type { BudgetLedger } from "../kernel/budget.js";
+import { boundedTextExcerpt, type ExcerptRange } from "../text/bounded-excerpt.js";
 import { validateRecoveryParameters } from "../recovery/registry.js";
 import type {
   RecoveryIncident,
@@ -59,12 +60,18 @@ export class RecoveryTools {
   async inspectSourceSpan(
     _args: Record<string, never> = {},
     signal?: AbortSignal,
-  ): Promise<{ range: RecoveryIncident["range"]; excerpt: string }> {
+  ): Promise<{ range: RecoveryIncident["range"]; excerpt: string; excerptRange: ExcerptRange }> {
     assertNotAborted(signal);
     this.#budget.consume("recoveryToolCalls", 1);
+    const preview = boundedTextExcerpt(this.#incident.sourceExcerpt, 2_000);
     return {
       range: structuredClone(this.#incident.range),
-      excerpt: this.#incident.sourceExcerpt.slice(0, 2_000),
+      excerpt: preview.text,
+      excerptRange: this.#incident.sourceExcerptRange ? { ...this.#incident.sourceExcerptRange,
+        start: this.#incident.sourceExcerptRange.start + preview.range.start,
+        end: this.#incident.sourceExcerptRange.start + preview.range.end,
+        truncatedStart: this.#incident.sourceExcerptRange.truncatedStart || preview.range.truncatedStart,
+        truncatedEnd: this.#incident.sourceExcerptRange.truncatedEnd || preview.range.truncatedEnd } : preview.range,
     };
   }
 

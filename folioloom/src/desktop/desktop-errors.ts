@@ -19,6 +19,21 @@ interface PublicErrorDefinition {
 }
 
 const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.freeze({
+  PROVIDER_TLS: {
+    message: "模型连接的证书校验失败",
+    nextAction: "请检查代理路径与证书来源；只配置已核验的可信证书机构，不要关闭证书校验。",
+    retryable: false,
+  },
+  PROVIDER_PROXY_CONFIGURATION: {
+    message: "模型连接的代理配置不可用",
+    nextAction: "请检查 HTTP_PROXY、HTTPS_PROXY、NO_PROXY 及当前 Node.js 运行环境，修改后重新启动程序。",
+    retryable: false,
+  },
+  PROVIDER_PREFLIGHT_FAILED: {
+    message: "模型连接预检未通过",
+    nextAction: "请检查模型服务的地址、认证及网络连接；正文请求尚未启动。",
+    retryable: false,
+  },
   CANDIDATE_RECOVERY_PAUSED: {
     message: "候选译文的自动修复已暂停",
     nextAction: "候选已保存。请检查审校问题及术语约束，解决原因后释放对应监督检查点；普通续跑不会重置已用修复额度。",

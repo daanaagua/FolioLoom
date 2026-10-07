@@ -61,7 +61,8 @@ test("optional translation memory drops reserved or malformed candidates", () =>
   ]);
 
   assert.deepEqual(sanitized.candidates, [{
-    ...valid,
+    kind: valid.kind,
+    fact: valid.fact,
     subjectForms: ["Sentry Pod"],
   }]);
   assert.deepEqual(sanitized.warnings, [

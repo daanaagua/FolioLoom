@@ -8,15 +8,24 @@ export const SUPERVISION_POLICY = Object.freeze({
   maxAttemptsPerCheckpoint: 2, maxReviewsPerWindow: 3,
 });
 export interface SupervisionRecord {
+  readonly reviewMode?: "occurrence_cards";
+  readonly repairIntents?: readonly { issueId: string; instruction: string }[];
   readonly id: string;
   readonly key: string;
   readonly event: "plan" | "review";
   readonly state: "started" | "completed" | "paused" | "failed" | "released";
   /** Host-owned wire transport version; older canonical records omit it. */
   readonly wireProtocol?: string;
+  readonly evidenceProjectionVersion?: string;
   readonly windowIds: readonly string[];
   readonly inputHash: string;
   readonly candidateHash?: string;
+  /** Complete read-only translation snapshot used by a chapter judgment. */
+  readonly reviewContextHash?: string;
+  /** Actual comparison dependencies; absent in legacy whole-snapshot receipts. */
+  readonly comparisonQueries?: readonly { query: string; limit: number; resultHash: string }[];
+  readonly comparisonBlockHashes?: Readonly<Record<string, string>>;
+  readonly reusedFromDecisionId?: string;
   readonly conflictHash?: string;
   readonly dependencyHash?: string;
   readonly reviewedCandidate?: readonly { blockId: string; text: string }[];
@@ -27,7 +36,8 @@ export interface SupervisionRecord {
   readonly windowDependencyHashes?: Readonly<Record<string, string>>;
   readonly qualityItemId?: string;
   readonly qualityReviewStage?: "disposition" | "verification";
-  readonly origin?: "model" | "host_revalidation";
+  readonly chapterReview?: { readonly scopeId: string; readonly title: string };
+  readonly origin?: "model" | "host_revalidation" | "host_reuse";
   readonly decision?: SupervisorDecision;
   readonly modelCalls?: number;
   readonly totalTokens?: number;
@@ -51,6 +61,15 @@ export function supervisionHash(value: unknown): string {
 export function supervisionCandidateHash(translations: readonly { blockId: string; text: string }[]): string {
   return supervisionHash(translations.map(t => ({ blockId: t.blockId, text: t.text }))
     .sort((a, b) => a.blockId < b.blockId ? -1 : a.blockId > b.blockId ? 1 : 0));
+}
+export function supervisorIssueFailures(issues: SupervisorDecision["issues"]): import("../tools/repair-tools.js").ValidationFailure[] {
+  return issues.map(issue => ({
+    issueKey: supervisionHash([issue.blockId, issue.sourceQuote.normalize("NFKC").trim(), issue.problem.normalize("NFKC").trim()]),
+    code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: issue.blockId, repairable: true,
+    evidence: { sourceQuote: issue.sourceFocus ?? issue.sourceQuote, targetQuote: issue.targetFocus ?? issue.targetQuote, problem: issue.problem,
+      sourceRef: issue.sourceRef, targetRef: issue.targetRef, sourceScopeQuote: issue.sourceQuote, targetScopeQuote: issue.targetQuote },
+    message: `原文 ${JSON.stringify(issue.sourceQuote)}；当前译文 ${JSON.stringify(issue.targetQuote)}；问题：${issue.problem}。只修正该实质问题，不改无关内容。`,
+  }));
 }
 export function supervisionMetadata(mode: SupervisionMode): unknown {
   return mode === "off" ? undefined : { ...SUPERVISION_POLICY, mode };
@@ -90,9 +109,16 @@ export function summarizeSupervision(
     revisionsRequested: completed.filter(r => r.decision?.action === "revise").length,
     modelCalls: finished.reduce((n, r) => n + (r.modelCalls ?? 0), 0),
     knownTokens: finished.filter(r => r.usageComplete).reduce((n, r) => n + (r.totalTokens ?? 0), 0),
-    usageComplete: finished.every(r => r.usageComplete !== false)
+    usageComplete: finished.every(r => r.usageComplete !== false || isProvenUnlaunchedSupervisorFailure(r))
       && records.filter(r => r.state === "started").every(r => finished.some(f =>
         f.id === r.id.replace(/:started$/u, ":result") || f.id === r.id.replace(/:started$/u, ":failed"))),
     paused, pendingReviewWindowIds,
   };
+}
+
+/** This exact legacy guard threw before constructing or invoking the provider runtime. */
+export function isProvenUnlaunchedSupervisorFailure(record: SupervisionRecord): boolean {
+  return record.state === "failed" && record.reason === "supervisor scope requires 1..4 windows"
+    && record.windowIds.length > 4 && new Set(record.windowIds).size === record.windowIds.length
+    && record.modelCalls === 0 && record.totalTokens === 0 && record.usageComplete === false;
 }

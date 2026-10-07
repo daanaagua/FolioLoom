@@ -14,7 +14,7 @@ import {
   INCIDENT_CODES,
   RECOVERY_RULES,
 } from "../src/recovery/registry.js";
-import { RecoveryEngine } from "../src/recovery/recovery-engine.js";
+import { RecoveryEngine, createStoreRecoveryIncident } from "../src/recovery/recovery-engine.js";
 import type {
   IncidentCode,
   RecoveryAudit,
@@ -40,6 +40,15 @@ function incident(code: IncidentCode): RecoveryIncident {
     suggestedAction: "apply one registered recovery policy",
   };
 }
+
+test("store incident excerpts preserve scalar coordinates before reaching recovery tools", () => {
+  const text="x".repeat(1999)+"🙂tail";
+  const store={auditState:()=>({blocks:[{sourceText:text}],canonicalChars:Array.from(text).length})};
+  const value=createStoreRecoveryIncident(store as any,'run','BLOCK_MEMBERSHIP_INVALID');
+  assert.ok(value.sourceExcerpt.isWellFormed());
+  assert.equal(Array.from(value.sourceExcerpt).length,value.range.end-value.range.start);
+  assert.equal(value.sourceExcerptRange?.truncatedEnd,true);
+});
 
 class FixtureKernel implements RecoveryKernel {
   readonly calls: string[] = [];
@@ -290,6 +299,15 @@ test("shadow creation and Recovery Pi provider failures become structured quaran
   assert.match(plannerResult.reason ?? "", /provider unavailable/);
   assert.equal(plannerResult.attempts, 1);
   assert.equal(plannerKernel.calls.some((call) => call.startsWith("create:")), false);
+});
+
+test("recovery source previews do not split Unicode scalars or conceal truncation", async () => {
+  const value = {...incident("BLOCK_MEMBERSHIP_INVALID"),sourceExcerpt:"x".repeat(1999)+"🙂"+"tail"};
+  const tools = new RecoveryTools({incident:value,rule:RECOVERY_RULES[value.code],budget:new BudgetLedger()});
+  const result = await tools.inspectSourceSpan();
+  assert.ok(result.excerpt.isWellFormed());
+  assert.equal(Array.from(result.excerpt).length,2000);
+  assert.equal(result.excerptRange.truncatedEnd,true);
 });
 
 test("recovery tools expose only read inspections, registered choice, and submit", async () => {

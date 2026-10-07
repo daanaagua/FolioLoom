@@ -93,7 +93,7 @@ function windows(): BookWindowPlan[] {
   }];
 }
 
-function openRunStore(): {
+function openRunStore(windowCount = 1): {
   store: LosslessBookStore;
   runId: string;
   path: string;
@@ -102,7 +102,14 @@ function openRunStore(): {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
   store.registerSource(sourceInput());
-  store.replaceDerivedPlan("source-v1", { blocks: blocks(), annotations: [] });
+  const chosenBlocks = windowCount === 1 ? blocks() : Array.from({ length: windowCount }, (_, i) => {
+    const canonicalStart = Math.floor(CANONICAL_SOURCE.length * i / windowCount);
+    const canonicalEnd = Math.floor(CANONICAL_SOURCE.length * (i + 1) / windowCount);
+    const sourceText = CANONICAL_SOURCE.slice(canonicalStart, canonicalEnd);
+    return { ...blocks()[0]!, id: blockId("source-v1", canonicalStart, canonicalEnd, sourceText), canonicalStart, canonicalEnd,
+      sourceText, sourceHash: sha256(sourceText), globalIndex: i };
+  });
+  store.replaceDerivedPlan("source-v1", { blocks: chosenBlocks, annotations: [] });
   const runId = "run-ledger";
   const initialSnapshot = createKnowledgeSnapshot(runId, []);
   const meta: TranslationRunMeta = {
@@ -115,7 +122,8 @@ function openRunStore(): {
     metadata: { fixture: "ledger" },
   };
   store.createTranslationRun(meta);
-  store.initializeWindowPlan(runId, windows());
+  store.initializeWindowPlan(runId, windowCount === 1 ? windows() : chosenBlocks.map((b, i) => ({ ...windows()[0]!,
+    windowId: `w${i + 1}`, ordinal: i, blockIds: [b.id], globalIndexes: [i], sourceTokens: b.tokenCount, sourceChars: b.sourceText.length })));
   return { store, runId, path, snapshotId: initialSnapshot.id };
 }
 
@@ -124,6 +132,32 @@ const LEDGER_INIT = {
   profile: "balanced" as const,
   tokenIncreaseCap: 0.1,
 };
+
+test("SQLite unlaunched corrections require the exact durable preflight failure and preserve history", () => {
+  const { store, runId } = openRunStore(5);
+  try {
+    for (const requestId of ["local", "network"]) {
+      store.appendTokenLedgerEvent(runId, { type: "reserved", requestId, purpose: "supervision", taskIds: [], predictedTokens: 100, attempt: 0 });
+      store.appendTokenLedgerEvent(runId, { type: "dispatched", requestId });
+      store.appendTokenLedgerEvent(runId, { type: "settled", requestId, actualTokens: 0, usageComplete: false, outcome: "failed" });
+      store.appendSupervisionRecord(runId, { id: `${requestId}:failed`, key: requestId, event: "review", state: "failed",
+        inputHash: "a".repeat(64), windowIds: ["w1", "w2", "w3", "w4", "w5"], modelCalls: 0, totalTokens: 0, usageComplete: false,
+        reason: requestId === "local" ? "supervisor scope requires 1..4 windows" : "Connection error" });
+    }
+    assert.throws(() => store.appendTokenLedgerEvent(runId, { type: "unlaunched_corrected", requestId: "network", evidenceId: "network:failed", reason: "supervisor_scope_rejected" }), /unlaunched.*evidence/u);
+    assert.throws(() => store.appendTokenLedgerEvent(runId, { type: "unlaunched_corrected", requestId: "network", evidenceId: "local:failed", reason: "supervisor_scope_rejected" }), /unlaunched.*evidence/u);
+    assert.deepEqual(store.pendingUnlaunchedSupervisorCorrections(runId).map(e => e.requestId), ["local"]);
+    store.appendTokenLedgerEvent(runId, { type: "unlaunched_corrected", requestId: "local", evidenceId: "local:failed", reason: "supervisor_scope_rejected" });
+    const events = store.loadTokenLedgerEvents(runId);
+    assert.equal(events.filter(e => e.type === "settled").length, 2);
+    assert.equal(events.filter(e => e.type === "unlaunched_corrected").length, 1);
+    assert.deepEqual(store.pendingUnlaunchedSupervisorCorrections(runId), []);
+    const ledger = store.loadTokenLedger(runId, LEDGER_INIT);
+    assert.equal(ledger.state().spentTokens, 100);
+    assert.equal(ledger.state().tokenUsageComplete, false);
+    assert.throws(() => store.appendTokenLedgerEvent(runId, { type: "unlaunched_corrected", requestId: "local", evidenceId: "local:failed", reason: "supervisor_scope_rejected" }), /unknown.*settlement/u);
+  } finally { store.close(); }
+});
 
 test("loadSchedulerMetrics is undefined without ledger events", () => {
   const { store, runId } = openRunStore();

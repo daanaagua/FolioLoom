@@ -10,6 +10,7 @@ import type {
   SourceToken,
   StructureHeading,
 } from "./types.js";
+import { boundedTextExcerpt } from "../text/bounded-excerpt.js";
 
 const PROFILE_VERSION = "source-language-profile-5";
 const DEFAULT_CANDIDATE_LIMIT = 24;
@@ -415,7 +416,9 @@ function compactContext(text: string, offset: number): string {
   const right = candidates.length === 0
     ? text.length
     : offset + Math.min(...candidates) + 1;
-  return text.slice(left + 1, right).replace(/\s+/gu, " ").trim().slice(0, 360);
+  const sentence = text.slice(left + 1, right);
+  const focus = Array.from(sentence.slice(0, offset - left - 1)).length;
+  return boundedTextExcerpt(sentence, 360, focus).text.replace(/\s+/gu, " ").trim();
 }
 
 function cjkCandidateToken(token: SourceToken, definition: ProfileDefinition): boolean {

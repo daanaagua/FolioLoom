@@ -305,7 +305,8 @@ test("strict export fails closed when durable provider usage is incomplete", () 
       () => writeLosslessBookArtifacts(item.store, "run-a", item.output),
       /TOKEN_USAGE_INCOMPLETE/u,
     );
-    assert.throws(() => writeLosslessBookArtifacts(item.store, "run-a", item.output, { deliveryMode: "standard" }), /TOKEN_USAGE_INCOMPLETE/u);
+    const standard = writeLosslessBookArtifacts(item.store, "run-a", item.output, { deliveryMode: "standard" });
+    assert.equal(verifyExport(standard, item.store, "run-a", "standard").ok, true);
     const paths = writeLosslessBookArtifacts(
       item.store,
       "run-a",

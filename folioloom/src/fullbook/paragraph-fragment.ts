@@ -14,6 +14,8 @@ export const PARAGRAPH_FRAGMENT_POLICY_VERSION =
 export const DEFAULT_MAX_TARGET_PARAGRAPHS_PER_FRAGMENT = 10;
 export const DEFAULT_MAX_SOURCE_TOKENS_PER_FRAGMENT = 720;
 export const PARAGRAPH_FRAGMENT_FIRST_THRESHOLD = 12;
+/** Primary generation retains typed paragraph coverage without recovery-sized calls. */
+export const PRIMARY_PARAGRAPH_FRAGMENT_LIMITS = Object.freeze({ maxTargetParagraphs: 24, maxSourceTokens: 2400 });
 const DEFAULT_TARGET_PARAGRAPHS_PER_FRAGMENT = 8;
 const DEFAULT_TARGET_SOURCE_TOKENS_PER_FRAGMENT = 640;
 

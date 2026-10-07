@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evidenceReferences, resolveEvidenceReference } from "../src/domain/evidence-reference.js";
+import { evidenceReferences, paragraphEvidenceReferences, allEvidenceReferences, resolveEvidenceReference } from "../src/domain/evidence-reference.js";
 import { resolveEpubVisibleQuote } from "../src/source/epub-structure.js";
 
 test("visible focus projection ignores only host EPUB markers and rejects ambiguity", () => {
@@ -39,4 +39,19 @@ test("reference identity binds the complete version and cannot be guessed into v
   assert.notEqual(original[0]!.id, edited[0]!.id);
   assert.throws(() => resolveEvidenceReference(edited, original[0]!.id, "source", "b", "sourceRef"), /stale/u);
   assert.throws(() => resolveEvidenceReference(original, original[0]!.id, "source", "b", "sourceRef", new Set()), /unissued/u);
+});
+
+test("complete paragraph evidence preserves exact scalar identity and legacy range resolution", () => {
+  const text = "🦉 First statement. ".repeat(45) + "\r\n\r\n短句。\r\n\r\nA complete closing reply.";
+  const legacy = evidenceReferences("target", "b", text);
+  const paragraphs = paragraphEvidenceReferences("target", "b", text);
+  const all = allEvidenceReferences("target", "b", text);
+  assert.equal(paragraphs.length, 3);
+  assert.ok(paragraphs[0]!.text.length > 480, "review context is complete rather than cut at a transport limit");
+  for (const ref of [...legacy, ...paragraphs]) {
+    assert.equal(resolveEvidenceReference(all, ref.id, "target", "b", "targetRef").text, ref.text);
+    assert.equal(Array.from(text).slice(ref.start, ref.end).join(""), ref.text);
+  }
+  assert.equal(paragraphs[1]!.text, "短句。");
+  assert.equal(new Set(all.map(r=>r.id)).size, all.length);
 });

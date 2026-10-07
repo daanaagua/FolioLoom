@@ -307,7 +307,6 @@ export async function runTranslationWindow(
       ...persistedAnchors
         .filter((anchor) =>
           anchor.mode === "stable"
-          && anchor.confidence >= 0.85
           && anchor.target.trim().length > 0)
         .map(anchorAsTerm),
     ];

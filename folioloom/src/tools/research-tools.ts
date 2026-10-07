@@ -53,7 +53,6 @@ const VisibilitySchema = Type.Union([
 const ResolutionSchema = Type.Object({
   questionId: Type.String(),
   verdict: Type.String(),
-  confidence: Type.Number({ minimum: 0, maximum: 1 }),
   evidenceIds: Type.Array(Type.String()),
   unresolved: Type.String(),
 });
@@ -292,9 +291,6 @@ export class ResearchTools {
     const question = this.#questions.get(args.questionId);
     if (question === undefined) {
       throw new Error(`unknown question: ${args.questionId}`);
-    }
-    if (!Number.isFinite(args.confidence) || args.confidence < 0 || args.confidence > 1) {
-      throw new TypeError("confidence must be between 0 and 1");
     }
     const evidenceIds = uniqueStrings(args.evidenceIds, "evidenceIds");
     for (const id of evidenceIds) {

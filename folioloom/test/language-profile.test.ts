@@ -8,6 +8,16 @@ import {
 import { detectLanguage } from "../src/source/language-detector.js";
 import { annotateStructure } from "../src/source/structure-annotator.js";
 
+test("anchor contexts retain a late named occurrence in a long sentence", () => {
+  const prefix = "the quiet corridor stretched away ".repeat(35);
+  const texts = [`${prefix}and Mira entered the hall.`, `${prefix}while Mira waited outside.`];
+  const candidates = getSourceLanguageProfile("en").collectAnchorCandidates({targetTexts:texts,corpusTexts:texts,establishedSourceForms:[],limit:24});
+  const name = candidates.find(c=>c.sourceForm==='Mira');
+  assert.ok(name);
+  assert.ok(name.contexts.every(c=>c.includes('Mira')));
+  assert.ok(name.contexts.every(c=>Array.from(c).length<=360));
+});
+
 test("language profile registry resolves supported ids deterministically", () => {
   assert.deepEqual(supportedSourceLanguageIds(), [
     "de", "en", "es", "fr", "ja", "ko", "ru", "und",

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { inheritProviderPreflight } from "../providers/preflight.js";
 
 /** Caller-supplied purpose/context, independent of literary style instructions. */
 export interface TaskContextMetadata {
@@ -37,7 +38,7 @@ export function bindTaskContext(streamFn: StreamFn, text: string | undefined): S
   taskContextMetadata(text);
   const bound: StreamFn = (model, context, options) => streamFn(model, context, options);
   contexts.set(bound, text);
-  return bound;
+  return inheritProviderPreflight(streamFn, bound);
 }
 
 export function effectiveSystemPrompt(streamFn: StreamFn | undefined, prompt: string): string {
@@ -46,5 +47,5 @@ export function effectiveSystemPrompt(streamFn: StreamFn | undefined, prompt: st
 }
 
 export function inheritedTaskContext(from: StreamFn, to: StreamFn): StreamFn {
-  return bindTaskContext(to, contexts.get(from));
+  return inheritProviderPreflight(from, bindTaskContext(to, contexts.get(from)));
 }

@@ -61,6 +61,15 @@ export interface StableTerm {
   authorityRank?: number;
   priority?: number;
   applicableBlockIds?: readonly string[];
+  /** Source-grounded semantic preference, not a global replacement instruction. */
+  preference?: {
+    senseId: string;
+    meaning: string;
+    usageScope: string;
+    evidenceQuotes: readonly string[];
+    /** @deprecated Historical records only; never used for admission or ranking. */
+    confidence?: number;
+  };
 }
 
 export interface EvidenceHit {
@@ -69,6 +78,8 @@ export interface EvidenceHit {
   globalIndex: number;
   paragraphIndex: number;
   quote: string;
+  /** When clipped for a model, bounds are relative to the visible paragraph quote. */
+  excerpt?: import("../text/bounded-excerpt.js").ExcerptRange;
   sourceHash: string;
   channel: VisibilityChannel;
 }

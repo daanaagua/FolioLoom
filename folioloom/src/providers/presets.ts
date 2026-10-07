@@ -39,6 +39,9 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
     allowCustomBaseUrl: false,
     capabilities: {
       ...COMMON_LIMITS,
+      // Keep ordinary generation conservative. Review output stays well below
+      // the documented 384K maximum within the provider's 1M context window.
+      reviewLimits: { contextWindow: 1_000_000, maxTokens: 65_536 },
       reasoning: true,
       efforts: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
       thinkingFormat: "deepseek",

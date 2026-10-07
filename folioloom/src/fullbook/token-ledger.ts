@@ -106,6 +106,12 @@ export type LedgerEvent =
       readonly reason: LedgerReleaseReason;
     }
   | {
+      readonly type: "unlaunched_corrected";
+      readonly requestId: string;
+      readonly evidenceId: string;
+      readonly reason: "supervisor_scope_rejected";
+    }
+  | {
       readonly type: "counters_patched";
       readonly patch: SchedulerCountersPatch;
     };
@@ -203,6 +209,7 @@ export class TokenLedger {
   #baselineTokens = 0;
   #spentTokens = 0;
   #tokenUsageComplete = true;
+  readonly #incompleteSettlements = new Map<string, { purpose: LedgerPurpose; actualTokens: number; chargedTokens: number; outcome: LedgerSettleOutcome }>();
   readonly #baselinedTaskIds = new Set<string>();
   readonly #openReservations = new Map<string, OpenReservation>();
   readonly #dispatchedRequestIds = new Set<string>();
@@ -276,6 +283,9 @@ export class TokenLedger {
         return;
       case "released":
         this.#applyReleased(event);
+        return;
+      case "unlaunched_corrected":
+        this.#applyUnlaunchedCorrection(event);
         return;
       case "counters_patched":
         this.#applyCounters(event.patch);
@@ -449,9 +459,24 @@ export class TokenLedger {
     if (event.usageComplete) {
       this.#spentTokens += actualTokens;
     } else {
-      this.#spentTokens += Math.max(actualTokens, open.predictedTokens);
+      const chargedTokens = Math.max(actualTokens, open.predictedTokens);
+      this.#spentTokens += chargedTokens;
+      this.#incompleteSettlements.set(requestId, { purpose: open.purpose, actualTokens, chargedTokens, outcome: event.outcome });
       this.#tokenUsageComplete = false;
     }
+  }
+
+  #applyUnlaunchedCorrection(event: Extract<LedgerEvent, { type: "unlaunched_corrected" }>): void {
+    const requestId = nonemptyId(event.requestId, "requestId");
+    const prior = this.#incompleteSettlements.get(requestId);
+    if (!prior) throw new Error("unlaunched correction requires an unknown-usage settlement");
+    if (prior.purpose !== "supervision" || prior.actualTokens !== 0 || prior.outcome !== "failed"
+      || event.reason !== "supervisor_scope_rejected" || event.evidenceId !== `${requestId}:failed`) {
+      throw new Error("invalid unlaunched correction");
+    }
+    this.#spentTokens -= prior.chargedTokens;
+    this.#incompleteSettlements.delete(requestId);
+    this.#tokenUsageComplete = this.#incompleteSettlements.size === 0;
   }
 
   #applyReleased(event: Extract<LedgerEvent, { type: "released" }>): void {

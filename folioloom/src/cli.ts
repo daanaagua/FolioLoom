@@ -116,6 +116,7 @@ export type CliCommand =
 
 export interface CliOptions {
   supervisorMode?: SupervisionMode;
+  chapterReviewMode?: "off" | "bounded";
   deliveryMode?: "standard" | "strict";
   taskContextFile?: string;
   supervisorReason?: string;
@@ -941,7 +942,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--runtime-profile-store",
         "--worker", "--codex-model", "--codex-context-window",
         "--codex-max-output-tokens", "--codex-executable", "--worker-profile",
-        "--supervisor", "--task-context-file", "--delivery-mode",
+        "--supervisor", "--task-context-file", "--delivery-mode", "--chapter-review",
       ],
     );
     const explicitProfile = optimizationProfileFlag(
@@ -970,6 +971,9 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     const supervisorMode = identifierValue(values, "--supervisor");
     if (supervisorMode !== undefined && supervisorMode !== "bounded" && supervisorMode !== "off") throw new Error("--supervisor must be bounded or off");
     if (worker !== undefined && supervisorMode === "bounded") throw new Error("bounded supervisor requires native Pi; do not combine it with --worker");
+    const chapterReviewMode = identifierValue(values, "--chapter-review");
+    if (chapterReviewMode !== undefined && chapterReviewMode !== "off" && chapterReviewMode !== "bounded") throw new Error("--chapter-review must be bounded or off");
+    if (chapterReviewMode === "bounded" && (worker !== undefined || supervisorMode === "off")) throw new Error("chapter review requires the native bounded supervisor");
     const workerProfile = pathValue(values, "--worker-profile", false);
     if (worker === "external" && workerProfile === undefined) throw new Error("--worker-profile is required with --worker external");
     if (worker !== "external" && workerProfile !== undefined) throw new Error("--worker-profile requires --worker external");
@@ -1012,6 +1016,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       command: "book-run",
       deliveryMode: deliveryModeFlag(values),
       ...(supervisorMode === undefined ? {} : { supervisorMode }),
+      ...(chapterReviewMode === undefined ? {} : { chapterReviewMode }),
       taskContextFile: pathValue(values, "--task-context-file", false),
       manifest: pathValue(values, "--manifest"),
       legacyV4Db: pathValue(values, "--v4-db", false),
@@ -1491,6 +1496,8 @@ export async function main(
     const supervisorMode = options.supervisorMode ?? (selectedRun === undefined
       ? options.worker === undefined ? "bounded" : "off"
       : (selectedRun.metadata as { supervision?: { mode?: string } } | undefined)?.supervision?.mode === "bounded" ? "bounded" : "off");
+    const chapterReviewMode = options.chapterReviewMode
+      ?? ((selectedRun?.metadata as { chapterReview?: { mode?: string } } | undefined)?.chapterReview?.mode === "bounded" ? "bounded" : "off");
     const style = loadStyleProfile({
       ...(options.styleProfile === undefined ? {} : { profilePath: options.styleProfile }),
       ...(options.prompt === undefined ? {} : { cliPrompt: options.prompt }),
@@ -1570,6 +1577,7 @@ export async function main(
     try {
       result = await bookRunner({
         supervisorMode,
+        chapterReviewMode,
         deliveryMode: options.deliveryMode,
         ...(taskContext === undefined ? {} : { taskContext }),
         manifestPath: requireOption(options, "manifest"),

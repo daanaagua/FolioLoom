@@ -101,6 +101,35 @@ function singleWindowRequest(sourceBlocks: readonly LosslessBlock[]): PhysicalRe
   };
 }
 
+test("no-change semantic repair defers the original issue without another ordinary review or a fake fixed result", async () => {
+  const source = [block("b", 0, "the keeper waited beside the gate.\n\nhe quietly asked the visitor to wait outside.")];
+  const req = singleWindowRequest(source);
+  const text = "守门人站在大门旁边等候。\n\n他轻声请那位来访者在外面稍等片刻。";
+  const issue = { code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: "b", repairable: true,
+    message: "The claimed pronoun error needs checking.", issueKey: "pronoun-dispute",
+    evidence: { sourceQuote: "he quietly asked the visitor to wait outside.", targetQuote: text.split("\n\n")[1]!,
+      problem: "The male keeper is rendered with a female pronoun." } };
+  for (const deliveryMode of ["standard", "strict"] as const) {
+    const faux = fauxProvider();
+    faux.setResponses([fauxAssistantMessage("[null]")]);
+    let reviews = 0, savedRepairs = 0;
+    const result = await reviewAndRepairTranslationBatchCandidate({ request: req, blocks: source, stableTerms: [],
+      snapshot: { id: "s", revisions: [] }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+      budget: new BudgetLedger(), deliveryMode, reviewCandidate: async () => { reviews++; return [issue]; },
+      onCandidate: (_candidate, phase) => { if (phase === "repaired") savedRepairs++; },
+    }, { responseErrors: [], windows: [{ windowId: req.windows[0]!.windowId, ordinal: 0, status: "completed",
+      translations: [{ blockId: "b", text }], termUsages: [], notes: [], memoryCandidates: [] }] });
+    assert.equal(result.windows[0]?.status, deliveryMode === "standard" ? "completed_with_warnings" : "failed");
+    assert.deepEqual(result.windows[0]?.qualityIssues, deliveryMode === "standard" ? [issue] : undefined);
+    assert.deepEqual(result.windows[0]?.translations, deliveryMode === "standard" ? [{ blockId: "b", text }] : []);
+    assert.equal(reviews, 1);
+    assert.equal(savedRepairs, 0);
+    assert.equal(faux.state.callCount, 1);
+    assert.equal(result.repairRuns.length, 1);
+    assert.ok(result.repairRuns[0]!.usage.totalTokens > 0);
+  }
+});
+
 test("supervised recovery handles novel findings once and carries scoped terms into repair", async () => {
   const source = [block("b", 0, "The keeper entered the tower and closed the gate.")];
   const req = singleWindowRequest(source);

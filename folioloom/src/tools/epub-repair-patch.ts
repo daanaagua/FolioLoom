@@ -1,13 +1,20 @@
 import type { V4Block } from "../domain/types.js";
 import { priorQualityIssues } from "../domain/quality-closure.js";
 import { supervisionCandidateHash } from "../domain/supervision.js";
-import { evidenceReferences } from "../domain/evidence-reference.js";
+import { allEvidenceReferences } from "../domain/evidence-reference.js";
 import { epubStructuralTranslationError, resolveEpubVisibleQuote, stripEpubStructuralMarkers } from "../source/epub-structure.js";
 import { semanticParagraphSpans } from "../text/paragraph-spans.js";
 import type { TranslationCandidate } from "./candidate-collector.js";
 import type { ValidationFailure } from "./repair-tools.js";
 
 export const EPUB_TEXT_PATCH_PROTOCOL = "epub-text-patch-1";
+/** A valid, candidate-bound no-change proposal is unresolved semantic evidence, not a repaired candidate. */
+export class EpubRepairNoChangeError extends Error {
+  constructor(readonly candidateHash: string) {
+    super("EPUB repair proposed no text change");
+    this.name = "EpubRepairNoChangeError";
+  }
+}
 interface TextSlot {
   readonly blockId: string;
   readonly slotId: string;
@@ -52,8 +59,8 @@ export function prepareEpubRepairPlan(
     if (sources.length !== targets.length) throw new Error("EPUB patch paragraph alignment mismatch");
     const owned = new Set<number>();
     for (const issue of issues.filter(i => i.blockId === block.id)) {
-      const sourceRef = issue.sourceRef ? evidenceReferences("source", block.id, block.sourceText).find(r => r.id === issue.sourceRef) : undefined;
-      const targetRef = issue.targetRef ? evidenceReferences("target", block.id, target).find(r => r.id === issue.targetRef) : undefined;
+      const sourceRef = issue.sourceRef ? allEvidenceReferences("source", block.id, block.sourceText).find(r => r.id === issue.sourceRef) : undefined;
+      const targetRef = issue.targetRef ? allEvidenceReferences("target", block.id, target).find(r => r.id === issue.targetRef) : undefined;
       if (issue.sourceRef && !sourceRef || issue.targetRef && !targetRef) throw new Error("EPUB patch issue reference is stale");
       if (sourceRef && issue.sourceScopeQuote !== undefined && issue.sourceScopeQuote !== sourceRef.text
         || targetRef && issue.targetScopeQuote !== undefined && issue.targetScopeQuote !== targetRef.text)
@@ -135,7 +142,7 @@ export function applyEpubTextPatch(plan: EpubRepairPlan, current: TranslationCan
   exactKeys(patch, ["baseCandidateHash", "patches", "notes"]);
   if (patch.baseCandidateHash !== plan.baseCandidateHash || supervisionCandidateHash(current.translations) !== plan.baseCandidateHash)
     throw new Error("stale EPUB patch candidate");
-  if (!Array.isArray(patch.patches) || !patch.patches.length || patch.patches.length > plan.slots.length
+  if (!Array.isArray(patch.patches) || patch.patches.length > plan.slots.length
     || !Array.isArray(patch.notes) || patch.notes.some(n => typeof n !== "string")) throw new Error("invalid EPUB patch payload");
   const seen = new Set<string>();
   const edits: { slot: TextSlot; text: string }[] = [];
@@ -149,7 +156,7 @@ export function applyEpubTextPatch(plan: EpubRepairPlan, current: TranslationCan
     if (/[⟦⟧\r\n]/u.test(edit.text) || edit.text.includes("[[]]")) throw new Error("EPUB patch cannot contain structural markers or separators");
     if (edit.text !== edit.expectedText) edits.push({ slot, text: edit.text });
   }
-  if (!edits.length) throw new Error("EPUB patch made no text progress");
+  if (!edits.length) throw new EpubRepairNoChangeError(plan.baseCandidateHash);
   const translations = current.translations.map(t => {
     let text = t.text;
     for (const { slot, text: replacement } of edits.filter(e => e.slot.blockId === t.blockId).sort((a, b) => b.slot.start - a.slot.start))

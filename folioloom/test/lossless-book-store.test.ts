@@ -20,6 +20,7 @@ import {
   reviseConcept,
 } from "../src/knowledge/lexical-concept.js";
 import { KnowledgeStore } from "../src/knowledge/knowledge-store.js";
+import { createLexicalPreference } from "../src/knowledge/lexical-preference.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   expectedTermOccurrences,
@@ -783,6 +784,29 @@ test("stage writes only inactive rows and promote commits the complete window at
   store.close();
 });
 
+test("quality deferral admits only source-attested soft preferences and still rejects arbitrary memory", () => {
+  const store = new LosslessBookStore(fixturePath());
+  try {
+    initialize(store);
+    store.claimWindow("run-a", "window-0");
+    const term = createLexicalPreference({ sourceForm: "Alpha", target: "阿尔法", mode: "stable", confidence: 0.65,
+      meaning: "a fixture label", usageScope: "this source", contexts: ["Alpha."] });
+    const candidate = { recordId: "preference", normalizedSubject: "alpha", kind: `lexical_preference:${term.preference!.senseId}`, payload: term };
+    const stage: WindowStageInput = { ...validStage(), styleTail: "", qualityIssues: [{ code: "SUPERVISOR_SEMANTIC_REVIEW",
+      blockId: blocks()[0]!.id, message: "A semantic issue remains.", repairable: true }] };
+    assert.throws(() => store.stageWindow(stage), /cannot publish memory or style/u);
+    assert.throws(() => store.stageWindow({ ...stage, knowledgeCandidates: [{ ...candidate,
+      payload: { ...term, locked: true, policy: "locked" } }] }), /immutable source evidence and soft policy/u);
+    const invented = createLexicalPreference({ sourceForm: "Alpha", target: "阿尔法", mode: "stable", confidence: 0.65,
+      meaning: "a fixture label", usageScope: "this source", contexts: ["Omega."] });
+    assert.throws(() => store.stageWindow({ ...stage, knowledgeCandidates: [{ ...candidate, payload: invented }] }), /immutable source evidence/u);
+    assert.equal(store.auditRows("run-a").windows[0]?.status, "running");
+    store.stageWindow({ ...stage, knowledgeCandidates: [candidate] });
+    assert.equal(store.auditRows("run-a").windows[0]?.status, "staged");
+    assert.equal(store.qualityRecords("run-a")[0]?.state, "pending");
+  } finally { store.close(); }
+});
+
 test("terminal protocol-tail repair creates an audited translation version", () => {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
@@ -862,11 +886,11 @@ test("lexical concept revisions and occurrence replacement are idempotent", () =
   assert.deepEqual(secondChanges.map((change) => ({
     revision: change.revision,
     renderChanged: change.renderChanged,
-  })), [{ revision: 2, renderChanged: false }]);
+  })), []);
   assert.deepEqual(store.upsertLexicalConcepts(runId, [confidenceOnly]), []);
   assert.equal(
     store.activeLexicalConcept(runId, concept.conceptId)?.revision,
-    2,
+    1,
   );
   assert.equal(
     store.conceptOccurrences(runId, concept.conceptId).length,

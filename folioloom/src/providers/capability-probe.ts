@@ -1,5 +1,6 @@
 import { ProviderRegistry, providerRegistry } from "./registry.js";
 import { providerWirePolicy, type ProviderWirePolicy } from "./wire-policy.js";
+import { providerFetch, providerNetworkError } from "./network.js";
 import type {
   CapabilityCheck,
   CapabilityCheckId,
@@ -322,6 +323,8 @@ async function postStream(
       if (controller.signal.aborted) {
         throw new ProbeFailure("REQUEST_TIMEOUT", "The provider did not respond before the probe timeout.");
       }
+      const networkFailure = providerNetworkError(error);
+      if (networkFailure) throw new ProbeFailure(networkFailure.code, networkFailure.message, networkFailure.transportCode);
       const message = error instanceof Error ? error.message : String(error);
       throw new ProbeFailure("PROVIDER_UNREACHABLE", "FolioLoom could not reach the provider.", redact(message, credential));
     }
@@ -490,7 +493,7 @@ export async function probeProviderCapabilities(request: ProviderCapabilityProbe
   const resolved = registry.resolve(request.profile);
   const policy = providerWirePolicy(resolved);
   const checks = initialChecks();
-  const fetcher = request.fetch ?? globalThis.fetch;
+  const fetcher = request.fetch ?? providerFetch;
   const timeout = timeoutMs(request.timeoutMs);
   const deadline = Date.now() + timeout;
   const isResponses = policy.apiFamily === "openai-responses";

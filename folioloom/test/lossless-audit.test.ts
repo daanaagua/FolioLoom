@@ -301,6 +301,22 @@ test("knowledge convergence blocks strict export without hiding structural compl
   }
 });
 
+test("complete standard delivery documents unresolved knowledge without pretending convergence", () => {
+  const fixture = completeRun();
+  injectKnowledgeRevalidation(fixture.storePath, fixture.runId, { bindingStatus: "warning_stale", taskStatus: "completed_with_warning" });
+  const store = LosslessBookStore.openReadOnly(fixture.storePath);
+  try {
+    const audit = auditLosslessBookStore(store, fixture.runId);
+    assert.equal(audit.structurallyComplete, true);
+    assert.equal(audit.knowledgeConverged, false);
+    assert.equal(audit.strictExportable, false);
+    assert.equal(audit.deliveryReady, true);
+    const paths = writeLosslessBookArtifacts(store, fixture.runId, join(dirname(fixture.storePath), "standard"), { deliveryMode: "standard" });
+    assert.ok(readFileSync(paths.qualityReport!, "utf8").includes("STALE_KNOWLEDGE_BINDING"));
+    assert.throws(() => writeLosslessBookArtifacts(store, fixture.runId, join(dirname(fixture.storePath), "strict"), { deliveryMode: "strict" }));
+  } finally { store.close(); }
+});
+
 test("queued knowledge edits and unfinished retrofit items block strict export", () => {
   const fixture = completeRun();
   const database = new DatabaseSync(fixture.storePath);

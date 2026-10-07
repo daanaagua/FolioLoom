@@ -288,9 +288,17 @@ function parseRevision(value: unknown): ParsedRevision | undefined {
     normalizedSubject,
     kind,
     status,
-    payload: raw.payload,
-    alternatives: raw.alternatives,
+    payload: withoutLegacySelfScores(raw.payload),
+    alternatives: raw.alternatives.map(withoutLegacySelfScores),
   };
+}
+
+/** Only a wire copy is stripped; durable payloads keep their audit hashes. */
+function withoutLegacySelfScores(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutLegacySelfScores);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "confidence")
+    .map(([key, item]) => [key, withoutLegacySelfScores(item)]));
 }
 
 function formsForRevision(revision: ParsedRevision): string[] {
@@ -654,17 +662,11 @@ function candidateUtility(candidate: Candidate): number {
   const statusUtility = candidate.revision.status === "needs_revalidate"
     ? 4
     : candidate.revision.status === "active" ? 3 : 1;
-  const payload = record(candidate.revision.payload);
-  const confidence = payload !== undefined
-    && typeof payload.confidence === "number"
-    && Number.isFinite(payload.confidence)
-    ? Math.min(1, Math.max(0, payload.confidence))
-    : 0;
   const distanceUtility = candidate.evidenceDistance === undefined
     ? 0
     : 2 * Math.exp(-candidate.evidenceDistance / 12);
   return Math.round(
-    (scopeUtility + statusUtility + confidence * 2 + distanceUtility)
+    (scopeUtility + statusUtility + distanceUtility)
       * 1_000_000,
   ) / 1_000_000;
 }

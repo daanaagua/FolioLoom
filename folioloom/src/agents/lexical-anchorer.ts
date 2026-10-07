@@ -17,6 +17,8 @@ import {
   type LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
+import { createLexicalPreference } from "../knowledge/lexical-preference.js";
+import { collectEnglishContextualTermCandidates, isEnglishPronounContraction } from "../language/contextual-term-candidates.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import { sourceTextForTranslation } from "../source/layout-separators.js";
@@ -31,6 +33,7 @@ import {
 
 export interface AnchorCandidate {
   sourceForm: string;
+  discoveryKind?: "recurrent_noun";
   sourceAuthoredTarget?: string;
   likelyProperName?: boolean;
   contexts: string[];
@@ -50,6 +53,13 @@ export type LexicalAnchorSemanticClass =
   | "unclassified";
 
 export interface LexicalAnchor {
+  /** Host discovery evidence, independent of the model's lexical classification. */
+  discoveryKind?: "recurrent_noun";
+  meaning?: string;
+  usageScope?: string;
+  allowedTargets?: string[];
+  /** Context quotes are attached by the host, never accepted from model output. */
+  sourceContexts?: string[];
   /** Preserve the model's weak classification without making it an eligible concept. */
   proposedSemanticClass?: LexicalAnchorSemanticClass;
   sourceForm: string;
@@ -57,7 +67,8 @@ export interface LexicalAnchor {
   mode: "stable" | "contextual";
   semanticClass?: LexicalAnchorSemanticClass;
   lockEligible?: boolean;
-  confidence: number;
+  /** @deprecated Historical input only; ignored by decisions and projections. */
+  confidence?: number;
 }
 
 export interface LexicalAnchorInput {
@@ -122,7 +133,7 @@ function hasIndependentConceptEvidence(
   candidate: AnchorCandidate | undefined,
 ): boolean {
   if (candidate?.sourceAuthoredTarget !== undefined) return true;
-  if (anchor.confidence < 0.9 || candidate === undefined) return false;
+  if (candidate === undefined) return false;
   const semanticClass = anchor.semanticClass ?? "unclassified";
   if (semanticClass === "proper_name" || semanticClass === "unique_title") {
     return candidate.likelyProperName === true;
@@ -150,7 +161,9 @@ function lexicalAnchorParameters() {
         Type.Literal("ordinary_word"),
         Type.Literal("unclassified"),
       ]),
-      confidence: Type.Number({ minimum: 0, maximum: 1 }),
+      meaning: Type.Optional(Type.String({ minLength: 1, maxLength: 240 })),
+      usageScope: Type.Optional(Type.String({ minLength: 1, maxLength: 240 })),
+      allowedTargets: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 64 }), { maxItems: 4 })),
     }), { maxItems: 24 }),
     entityLinks: Type.Optional(Type.Array(Type.Object({
       sourceForms: Type.Array(Type.String(), { minItems: 2, maxItems: 4 }),
@@ -162,7 +175,6 @@ function lexicalAnchorParameters() {
         Type.Literal("distributional_compatibility"),
       ]),
       evidenceQuote: Type.String(),
-      confidence: Type.Number({ minimum: 0, maximum: 1 }),
     }, { additionalProperties: false }), { maxItems: 6 })),
   });
 }
@@ -196,22 +208,23 @@ export function prepareLexicalAnchorRequest(
         "You recover a small set of safe run-local lexical preferences when structured tool calls are unavailable.",
         `The source language is ${profile.displayName} (${profile.id}).`,
         "Return only proper names, unique titles, and invariant technical terms that can safely keep one concise Simplified-Chinese rendering across the supplied contexts.",
-        "Omit ordinary words, forms of address, relationship labels, ambiguous forms, and anything below 0.8 confidence. Omission means undecided and is safer than guessing.",
+        "Omit ordinary words, forms of address, relationship labels, and forms for which the supplied contexts do not establish a lexical sense.",
         "Every proper-name or unique-title target must be a usable Chinese rendering containing Chinese characters. When no Hanja/Chinese spelling is printed, choose one conservative Chinese transliteration; never copy Hangul, hiragana, or katakana into target.",
         "For sourceAuthoredTarget, copy that printed Hanja/Chinese target exactly; the harness will normalize its Chinese script.",
         "Do not infer aliases or entity identity in this compatibility path. Every returned binding is only a preferred rendering, never a hard constraint.",
-        "Inside the exact response frame, emit one JSON array and nothing else. Each item must contain exactly sourceForm, target, semanticClass, and confidence.",
-        "semanticClass must be proper_name, unique_title, technical_term, or role. Use role for a profession, office, or institutional function whose Chinese wording may vary by sentence. confidence must be from 0.8 through 1.",
+        "Preserve source spellings; do not correct suspected typos or OCR errors.",
+        "Inside the exact response frame, emit one JSON array and nothing else. Each item must contain sourceForm, target, semanticClass, and mode (stable or contextual). For technical_term, also give brief meaning and usageScope (each at most 240 characters) and optionally allowedTargets (up to four concise short forms, not rival translations).",
+        "semanticClass must be proper_name, unique_title, technical_term, or role. Use role for a profession, office, or institutional function whose Chinese wording may vary by sentence. Preserve contextual modes and genuine sense-specific variants.",
       ].join("\n"),
       prompt: [
         "CANDIDATES AND COMPACT CONCORDANCE",
-        JSON.stringify(input.candidates),
+        JSON.stringify(input.candidates.map(c => ({ ...c, contextScope: "bounded_source_excerpt" }))),
         "ESTABLISHED TERMS (do not duplicate or contradict)",
         input.stableTerms.map((term) =>
           `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",
         "EXACT RESPONSE FRAME",
         protocol.beginLine,
-        "[{\"sourceForm\":\"...\",\"target\":\"...\",\"semanticClass\":\"proper_name\",\"confidence\":0.9}]",
+        "[{\"sourceForm\":\"...\",\"target\":\"...\",\"semanticClass\":\"proper_name\",\"mode\":\"stable\"}]",
         protocol.endLine,
       ].join("\n\n"),
       serializedToolSchemas: "[]",
@@ -228,6 +241,10 @@ export function prepareLexicalAnchorRequest(
       "For every anchor, classify semanticClass. Use proper_name only for a concrete named entity; common nouns, pronouns, verbs, and forms of address must use their corresponding non-name class.",
       "A sourceAuthoredTarget is an explicit Hanja/Chinese gloss printed immediately after that source form. For a stable proper name, unique title, or technical term, use that target exactly; the harness treats this source-authored evidence as authoritative.",
       "Every single-pass lexical classification remains a preference; only independently confirmed entity links or user-supplied glossary policy may become exact constraints.",
+      "For recurrent lowercase places, institutions, practices and devices, establish a concise default only when the supplied contexts support the same meaning. Ordinary nouns and polysemous readings remain contextual; recurrence alone does not make a proper name.",
+      "Book-specific building, institutional and ritual nouns can be technical_term even when lowercase. Use contextual mode when a place word also denotes its service or activity; do not force the literal building label into that use.",
+      "For technical_term, include a brief meaning and usageScope describing which sense/object the target names; optionally list concise allowedTargets for genuine short forms. Do not list rival translations as interchangeable aliases. These fields share this call and do not authorize global replacement. Establish source-grounded preferences directly, keeping distinct senses and contextual usage explicit.",
+      "Preserve source spellings. Do not correct suspected typos or OCR errors, or infer alias links from a presumed spelling mistake.",
       "Write every Chinese target in Simplified Chinese (zh-Hans); the harness will normalize model-created targets before persistence.",
       "Mark ordinary words and forms of address as contextual. A role may also be contextual while remaining translator-visible semantic knowledge.",
       "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
@@ -238,7 +255,7 @@ export function prepareLexicalAnchorRequest(
     ].join("\n"),
     prompt: [
       "SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE",
-      JSON.stringify(input.candidates),
+      JSON.stringify(input.candidates.map(c => ({ ...c, contextScope: "bounded_source_excerpt" }))),
       "ESTABLISHED TERMS",
       input.stableTerms.map((term) =>
         `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",
@@ -353,7 +370,10 @@ export function parseLexicalPreferredFallbackResponse(
   const submitted = new Map<string, {
     target: string;
     semanticClass: LexicalAnchorSemanticClass;
-    confidence: number;
+    mode: "stable" | "contextual";
+    meaning?: string;
+    usageScope?: string;
+    allowedTargets?: string[];
   }>();
   for (const [index, item] of raw.entries()) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -363,7 +383,6 @@ export function parseLexicalPreferredFallbackResponse(
     const sourceForm = value.sourceForm;
     const target = value.target;
     const semanticClass = value.semanticClass;
-    const confidence = value.confidence;
     if (typeof sourceForm !== "string") {
       throw lexicalProtocolError(`item ${index} has no sourceForm`);
     }
@@ -382,13 +401,20 @@ export function parseLexicalPreferredFallbackResponse(
       || !PREFERRED_FALLBACK_CLASSES.has(semanticClass as LexicalAnchorSemanticClass)) {
       throw lexicalProtocolError(`item ${index} is not an invariant lexical class`);
     }
-    if (typeof confidence !== "number"
-      || !Number.isFinite(confidence)
-      || confidence < 0.8
-      || confidence > 1) {
-      throw lexicalProtocolError(`item ${index} has invalid confidence`);
+    if (value.mode !== undefined && value.mode !== "stable" && value.mode !== "contextual") {
+      throw lexicalProtocolError(`item ${index} has invalid mode`);
     }
     const normalizedTarget = simplifyChineseTranslation(target.trim());
+    for (const field of ["meaning", "usageScope"]) {
+      if (value[field] !== undefined && (typeof value[field] !== "string"
+        || !(value[field] as string).trim() || (value[field] as string).length > 240)) {
+        throw lexicalProtocolError(`item ${index} has invalid ${field}`);
+      }
+    }
+    if (value.allowedTargets !== undefined && (!Array.isArray(value.allowedTargets) || value.allowedTargets.length > 4
+      || !value.allowedTargets.every(t => typeof t === "string" && t.trim() && t.length <= 64))) {
+      throw lexicalProtocolError(`item ${index} has invalid allowedTargets`);
+    }
     const copiedSourceScript = /[\p{Script=Hangul}\p{Script=Hiragana}\p{Script=Katakana}]/u
       .test(normalizedTarget);
     const entityClass = semanticClass === "proper_name" || semanticClass === "unique_title";
@@ -398,7 +424,10 @@ export function parseLexicalPreferredFallbackResponse(
     submitted.set(normalizedSource, {
       target: normalizedTarget,
       semanticClass: semanticClass as LexicalAnchorSemanticClass,
-      confidence,
+      mode: value.mode === "contextual" || (value.mode === undefined && semanticClass === "role") ? "contextual" : "stable",
+      ...(value.meaning === undefined ? {} : { meaning: value.meaning as string }),
+      ...(value.usageScope === undefined ? {} : { usageScope: value.usageScope as string }),
+      ...(value.allowedTargets === undefined ? {} : { allowedTargets: (value.allowedTargets as string[]).map(t => simplifyChineseTranslation(t)) }),
     });
   }
 
@@ -409,22 +438,24 @@ export function parseLexicalPreferredFallbackResponse(
       return [];
     }
     return [{
+      ...(decision ?? {}),
       sourceForm: candidate.sourceForm,
+      sourceContexts: candidate.contexts.slice(0, 3),
       target: simplifyChineseTranslation(
         candidate.sourceAuthoredTarget ?? decision?.target ?? "",
       ),
-      mode: decision?.semanticClass === "role" ? "contextual" : "stable",
+      mode: decision?.mode ?? "stable",
       semanticClass: decision?.semanticClass ?? "unclassified",
       lockEligible: false,
-      confidence: candidate.sourceAuthoredTarget === undefined
-        ? decision!.confidence
-        : Math.max(0.9, decision?.confidence ?? 0),
     }];
   });
   return {
     anchors,
     entityLinks: [],
-    terms: anchors.map(anchorAsTerm),
+    terms: anchors.map(anchor => anchor.semanticClass === "technical_term"
+      && (candidateByForm.get(profile.normalizeSourceForm(anchor.sourceForm))?.corpusFrequency ?? 0) >= 2
+      && anchor.sourceContexts?.length
+      ? createLexicalPreference({ ...anchor, contexts: anchor.sourceContexts }) : anchorAsTerm(anchor)),
   };
 }
 
@@ -437,7 +468,6 @@ interface EntityLinkSubmission {
     | "contextual_compatibility"
     | "distributional_compatibility">;
   evidenceQuote: string;
-  confidence: number;
 }
 
 function canonicalEntityTarget(value: string): string {
@@ -488,7 +518,7 @@ export function collectWindowAnchorCandidates(
   decidedSourceForms: readonly string[] = [],
   profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
-  return profile.collectAnchorCandidates({
+  const discoveryInput = {
     targetTexts: targetBlocks.map((block) => stripEpubStructuralMarkers(sourceTextForTranslation(block.sourceText))),
     corpusTexts: corpusBlocks.map((block) => stripEpubStructuralMarkers(sourceTextForTranslation(block.sourceText))),
     establishedSourceForms: [
@@ -496,8 +526,15 @@ export function collectWindowAnchorCandidates(
       ...decidedSourceForms,
     ],
     limit: 16,
-  }).map((candidate) => ({
+  };
+  const contextual = profile.id === "en" ? collectEnglishContextualTermCandidates({ ...discoveryInput, limit: 4 }) : [];
+  const named = profile.collectAnchorCandidates(discoveryInput)
+    .filter(candidate => profile.id !== "en" || !isEnglishPronounContraction(candidate.sourceForm));
+  const namedForms = new Set(named.map(c => c.normalizedSource));
+  const additions = contextual.filter(c => !namedForms.has(c.normalizedSource));
+  return [...named.slice(0, 16 - additions.length), ...additions].map((candidate) => ({
     sourceForm: candidate.sourceForm,
+    ...(additions.includes(candidate) ? { discoveryKind: "recurrent_noun" as const } : {}),
     ...(candidate.sourceAuthoredTarget === undefined
       ? {}
       : { sourceAuthoredTarget: candidate.sourceAuthoredTarget }),
@@ -565,6 +602,7 @@ export class LexicalAnchorer {
     let anchors: LexicalAnchor[] = [];
     let entityLinks: EntityLink[] = [];
     const uncorroboratedConceptForms = new Set<string>();
+    const specializedPreferenceForms = new Set<string>();
     let submitted = false;
     const tool: TypedToolSpec = {
       name: "submit_lexical_anchors",
@@ -589,10 +627,6 @@ export class LexicalAnchorer {
           }
           if (anchor.mode === "stable" && anchor.target.trim().length === 0) {
             throw new Error(`stable anchor requires a Chinese target: ${anchor.sourceForm}`);
-          }
-          if (!Number.isFinite(anchor.confidence)
-            || anchor.confidence < 0 || anchor.confidence > 1) {
-            throw new Error(`invalid anchor confidence: ${anchor.sourceForm}`);
           }
           seen.add(key);
         }
@@ -632,8 +666,7 @@ export class LexicalAnchorer {
               profile.normalizeSourceForm(anchor.sourceForm) === form);
             return decision?.mode === "stable"
               && (decision.semanticClass === "proper_name"
-                || decision.semanticClass === "unique_title")
-              && decision.confidence >= 0.95;
+                || decision.semanticClass === "unique_title");
           });
           const normalizedQuote = profile.normalizeSourceForm(quote);
           const quoteCoversAllForms = normalizedForms.every((form) =>
@@ -655,12 +688,13 @@ export class LexicalAnchorer {
             evidence: [{
               evidenceId: `anchor-evidence-${evidenceBase}`,
               kind: evidenceKind,
-              weight: link.confidence,
+              // Presence of a host-verified source receipt, not a model self-rating.
+              weight: 1,
               sourceForms: link.sourceForms,
             }, {
               evidenceId: `anchor-model-${evidenceBase}`,
               kind: "model_verdict",
-              weight: link.confidence,
+              weight: 1,
               sourceForms: link.sourceForms,
             }],
           });
@@ -670,23 +704,29 @@ export class LexicalAnchorer {
         anchors = args.anchors.map((anchor) => {
           const normalizedSource = profile.normalizeSourceForm(anchor.sourceForm);
           const candidate = candidateByForm.get(normalizedSource);
+          if (anchor.semanticClass === "technical_term"
+            && (candidate?.corpusFrequency ?? 0) >= 2 && candidate?.contexts.length
+            && anchor.target.trim()) specializedPreferenceForms.add(normalizedSource);
           let semanticClass = anchor.semanticClass ?? "unclassified";
           if (CONCEPT_ELIGIBLE_CLASSES.has(semanticClass)
             && !hasIndependentConceptEvidence(anchor, candidate)) {
             semanticClass = "unclassified";
-            if (anchor.confidence >= 0.9) {
-              uncorroboratedConceptForms.add(normalizedSource);
-            }
+            uncorroboratedConceptForms.add(normalizedSource);
           }
           const sourceAuthoredTarget = candidate?.sourceAuthoredTarget;
           const sourceAuthoredBinding = anchor.mode === "stable"
-            && anchor.confidence >= 0.75
             && sourceAuthoredTarget !== undefined;
+          const { confidence: _legacyScore, discoveryKind: _untrustedKind, ...decision } = anchor;
           return {
-            ...anchor,
+            ...decision,
+            ...(candidate?.discoveryKind ? { discoveryKind: candidate.discoveryKind } : {}),
             proposedSemanticClass: anchor.semanticClass ?? "unclassified",
             semanticClass,
             lockEligible: false,
+            sourceContexts: candidate?.contexts.slice(0, 3),
+            ...(anchor.allowedTargets === undefined ? {} : {
+              allowedTargets: anchor.allowedTargets.map(target => simplifyChineseTranslation(target)),
+            }),
             target: simplifyChineseTranslation(
               sourceAuthoredBinding ? sourceAuthoredTarget : anchor.target.trim(),
             ),
@@ -727,18 +767,20 @@ export class LexicalAnchorer {
     const anchorTerms = anchors
       .filter((anchor) =>
         CONCEPT_ELIGIBLE_CLASSES.has(anchor.semanticClass ?? "unclassified")
-        && (anchor.lockEligible === true || anchor.confidence >= 0.8)
+        && !specializedPreferenceForms.has(profile.normalizeSourceForm(anchor.sourceForm))
         && anchor.target.trim().length > 0
         && !confirmedForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
       .map(anchorAsTerm);
     const softAnchorTerms = anchors
       .filter((anchor) =>
-        uncorroboratedConceptForms.has(
+        (uncorroboratedConceptForms.has(
           profile.normalizeSourceForm(anchor.sourceForm),
-        )
+        ) || specializedPreferenceForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
         && anchor.target.trim().length > 0
         && !confirmedForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
-      .map(anchorAsTerm);
+      .map(anchor => specializedPreferenceForms.has(profile.normalizeSourceForm(anchor.sourceForm))
+        ? createLexicalPreference({ ...anchor, contexts: anchor.sourceContexts ?? [] })
+        : anchorAsTerm(anchor));
     const projectedForms = new Set([
       ...confirmedForms,
       ...anchorTerms.map((term) => profile.normalizeSourceForm(term.sourceForm)),
@@ -757,7 +799,6 @@ export class LexicalAnchorer {
         mode: "stable",
         semanticClass: "unclassified",
         lockEligible: false,
-        confidence: 0.9,
       })];
     });
     return {
@@ -787,7 +828,6 @@ export function sourceAuthoredAnchorFallback(
       mode: "stable",
       semanticClass: "unclassified",
       lockEligible: false,
-      confidence: 0.9,
     }];
   });
   return {
@@ -804,7 +844,7 @@ export function anchorAsTerm(anchor: LexicalAnchor): StableTerm {
       target: anchor.target,
       mode: anchor.mode,
       semanticClass: anchor.semanticClass as LexicalSemanticClass,
-      confidence: anchor.confidence,
+      allowedRealizations: anchor.allowedTargets,
     });
     return {
       conceptId: concept.conceptId,
@@ -835,9 +875,10 @@ export function anchorAsTerm(anchor: LexicalAnchor): StableTerm {
     canonicalSource: anchor.sourceForm,
     target: anchor.target,
     locked,
-    policy: locked ? "locked" : "preferred",
+    policy: locked ? "locked" : anchor.mode === "contextual" ? "contextual" : "preferred",
+    ...(anchor.allowedTargets === undefined ? {} : { allowedTargets: anchor.allowedTargets }),
     note: locked
-      ? "source-grounded evidence and a high-confidence stable semantic classification"
+      ? "source-grounded evidence and a stable semantic classification"
       : "single-pass model anchor; prefer this rendering but allow context-sensitive Chinese wording",
   });
 }
@@ -850,7 +891,7 @@ export function softenModelAnchorTerm(term: StableTerm): StableTerm {
   return {
     ...term,
     locked: false,
-    policy: "preferred",
+    policy: term.policy === "contextual" ? "contextual" : "preferred",
     note: "single-pass model anchor; prefer this rendering but allow context-sensitive Chinese wording",
   };
 }

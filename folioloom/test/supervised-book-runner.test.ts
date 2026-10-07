@@ -78,7 +78,7 @@ for (const finalRepairSucceeds of [true, false]) {
       const records = store.qualityRecords("standard");
       assert.equal(records.at(-1)?.state, finalRepairSucceeds ? "resolved" : "unresolved");
       if (finalRepairSucceeds) {
-        assert.equal(records.at(-1)?.closure?.policy, "issue-closure-1");
+        assert.equal(records.at(-1)?.closure?.policy, "issue-closure-2");
         assert.equal(records.at(-1)?.closure?.dispositions[0]?.status, "fixed");
         assert.ok(records.at(-1)?.closure?.dispositions.every(d => d.note.length <= 160));
       }

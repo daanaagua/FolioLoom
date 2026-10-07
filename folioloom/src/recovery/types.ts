@@ -65,6 +65,7 @@ export interface RecoveryIncident {
   readonly range: RecoveryRange;
   readonly invariant: string;
   readonly sourceExcerpt: string;
+  readonly sourceExcerptRange?: import("../text/bounded-excerpt.js").ExcerptRange;
   readonly structureAnnotations: readonly RecoveryStructureAnnotation[];
   readonly attemptedStrategies: readonly RecoveryStrategy[];
   readonly suggestedAction: string;

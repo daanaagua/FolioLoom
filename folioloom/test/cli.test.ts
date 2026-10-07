@@ -30,6 +30,15 @@ import {
 import { auditLosslessBookStore, bookArtifactFileNames } from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
+test("CLI chapter review is explicit, bounded, and native-supervisor only", () => {
+  const run = ["book", "run", "--manifest", "source_manifest.json", "--store", "book.db", "--config", "model.json"];
+  assert.equal(parseArgs(run).chapterReviewMode, undefined);
+  assert.equal(parseArgs([...run, "--chapter-review", "bounded"]).chapterReviewMode, "bounded");
+  assert.equal(parseArgs([...run, "--chapter-review", "off"]).chapterReviewMode, "off");
+  assert.throws(() => parseArgs([...run, "--chapter-review", "unlimited"]), /chapter-review/u);
+  assert.throws(() => parseArgs([...run, "--chapter-review", "bounded", "--supervisor", "off"]), /chapter review/u);
+});
+
 test("CLI accepts explicit delivery policies without changing defaults on resume", () => {
   const run = ["book", "run", "--manifest", "source_manifest.json", "--store", "book.db", "--config", "model.json"];
   assert.equal(parseArgs(run).deliveryMode, undefined);

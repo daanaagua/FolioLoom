@@ -16,6 +16,8 @@ export interface ValidationFailure {
   /** Host-owned identity excluding mutable candidate quotations. */
   issueKey?: string;
   evidence?: { sourceQuote: string; targetQuote: string; problem: string;
+    /** Candidate-bound current direction; problem remains the historical finding. */
+    repairInstruction?: string;
     sourceRef?: string; targetRef?: string;
     sourceScopeQuote?: string; targetScopeQuote?: string };
   code: string;

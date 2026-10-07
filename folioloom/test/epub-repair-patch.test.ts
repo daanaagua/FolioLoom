@@ -29,6 +29,22 @@ test("EPUB semantic repair accepts only ordered values and preserves every host 
   assert.equal(faux.state.callCount, 1);
 });
 
+test("a valid unchanged-slot proposal preserves usage and candidate identity without fabricating a repair", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage("[null,null,null]")]);
+  const before = structuredClone(candidate);
+  const result = await new Repairer(new PiRuntime()).repairBatch({ blocks, failedCandidate: candidate, failures,
+    budget: new BudgetLedger(), model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider) });
+  assert.equal(result.candidate, undefined, "unchanged proposal is not an accepted translation or a repair");
+  assert.equal(result.noChange?.candidateHash, prepareEpubRepairPlan(blocks, candidate, failures)!.baseCandidateHash);
+  assert.equal(result.run.modelCalls, 1);
+  assert.ok(result.run.usage.totalTokens > 0);
+  assert.deepEqual(candidate, before);
+  const plan = prepareEpubRepairPlan(blocks, candidate, failures)!;
+  assert.throws(() => applyEpubRepairValues(plan, { ...candidate, translations: [{ blockId: "b", text: target + "变更" }] },
+    [null, null, null]), /stale/u);
+});
+
 test("EPUB text patches reject stale, duplicate, injected and out-of-scope edits atomically", () => {
   const plan = prepareEpubRepairPlan(blocks, candidate, failures)!;
   const edit = { blockId: "b", slotId: "E0.0.1", expectedText: "能", text: "不能" };

@@ -1,5 +1,5 @@
 import { supervisionHash } from "../domain/supervision.js";
-import { evidenceReferences } from "../domain/evidence-reference.js";
+import { paragraphEvidenceReferences } from "../domain/evidence-reference.js";
 import type { AnchorCandidate, LexicalAnchor } from "../agents/lexical-anchorer.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import type { StableTerm } from "../domain/types.js";
@@ -29,8 +29,8 @@ export function scopedSurfaceMentions(mentions: readonly SurfaceMention[], scope
 
 /** Bounded host identities; preferences are rendering conventions, never entity facts. */
 export function surfaceMentions(sources: readonly Source[], anchors: readonly LexicalAnchor[], previous: readonly SurfaceObservation[], profile: SourceLanguageProfile): SurfaceMention[] {
-  const forms = [...new Set([...anchors.filter(a => nameLike({ semanticClass: a.proposedSemanticClass ?? a.semanticClass ?? "unclassified" })).map(a => a.sourceForm),
-    ...previous.filter(p => nameLike(p) && hasSemanticSurfaceEvidence(p) && !surfaceObservationNoiseReason(p)).map(p => p.sourceForm)])]
+  const forms = [...new Set([...anchors.filter(a => surfaceTrackable({ semanticClass: a.proposedSemanticClass ?? a.semanticClass ?? "unclassified", discoveryKind: a.discoveryKind })).map(a => a.sourceForm),
+    ...previous.filter(p => surfaceTrackable(p) && hasSemanticSurfaceEvidence(p) && !surfaceObservationNoiseReason(p)).map(p => p.sourceForm)])]
     .filter(form => sources.some(s => mention(s.sourceText, form, profile) >= 0)).slice(0, 16);
   const result: SurfaceMention[] = [];
   for (const source of sources) {
@@ -43,7 +43,14 @@ export function surfaceMentions(sources: readonly Source[], anchors: readonly Le
         for (let at = masked.indexOf(sourceForm); at >= 0; at = masked.indexOf(sourceForm, at + sourceForm.length)) {
           if (/[\p{L}\p{N}]/u.test(masked[at - 1] ?? "") || /[\p{L}\p{N}]/u.test(masked[at + sourceForm.length] ?? "")) continue;
           const sourceStart = start + at;
-          const preferredTarget = previous.find(p => p.sourceForm === sourceForm && p.observedTarget)?.observedTarget ?? undefined;
+          const history = previous.filter(p => p.sourceForm === sourceForm && p.observedTarget);
+          const localAnchor = anchors.find(a => a.sourceForm === sourceForm);
+          const technical = (localAnchor?.proposedSemanticClass ?? localAnchor?.semanticClass ?? history.at(-1)?.semanticClass) === "technical_term"
+            || (localAnchor?.discoveryKind ?? history.at(-1)?.discoveryKind) === "recurrent_noun";
+          // Multiple attested senses remain evidence, not one arbitrarily chosen universal rendering.
+          const knownTargets = [...new Set(history.map(p => p.observedTarget!))];
+          const preferredTarget = technical ? (knownTargets.length === 1 ? knownTargets[0] : undefined)
+            : history[0]?.observedTarget ?? undefined;
           result.push({ occurrenceId: `surface-${supervisionHash([source.blockId, sourceForm, sourceStart])}`, sourceForm,
             blockId: source.blockId, paragraphIndex, sourceStart, sourceQuote: excerpt(paragraph, sourceForm, at), ...(preferredTarget ? { preferredTarget } : {}) });
           if (result.length >= 64) return result;
@@ -73,6 +80,7 @@ export function groundSurfaceUsages(mentions: readonly SurfaceMention[], submiss
   return result;
 }
 export interface SurfaceObservation {
+  discoveryKind?: "recurrent_noun";
   schema: "surface-observation-1";
   sourceForm: string;
   blockId: string;
@@ -82,7 +90,8 @@ export interface SurfaceObservation {
   proposedTarget: string;
   observedTarget: string | null;
   semanticClass: string;
-  confidence: number;
+  /** @deprecated Historical observation metadata, ignored by validation and reuse. */
+  confidence?: number;
   evidenceHash: string;
   candidateHash: string;
   policy: "provisional-no-lock";
@@ -110,8 +119,9 @@ function excerpt(text: string, form: string, at = text.indexOf(form)): string {
   const index = Math.max(0, at);
   return text.slice(Math.max(0, index - 80), index + form.length + 160);
 }
-function nameLike(value: { semanticClass: string }): boolean {
-  return ["proper_name", "unique_title", "form_of_address", "unclassified"].includes(value.semanticClass);
+function surfaceTrackable(value: { semanticClass: string; discoveryKind?: string }): boolean {
+  return ["proper_name", "unique_title", "form_of_address", "technical_term", "unclassified"].includes(value.semanticClass)
+    || (value.semanticClass === "ordinary_word" && value.discoveryKind === "recurrent_noun");
 }
 
 export function hasSemanticSurfaceEvidence(value: unknown): boolean {
@@ -166,7 +176,6 @@ export function validateSurfaceObservation(value: unknown, windowId: string, sou
     || typeof p.sourceForm !== "string" || !p.sourceForm || !source?.includes(p.sourceForm)
     || typeof p.sourceQuote !== "string" || !p.sourceQuote || !source.includes(p.sourceQuote) || !hasSemanticSurfaceEvidence(p)
     || typeof p.proposedTarget !== "string" || typeof p.targetQuote !== "string" || typeof p.semanticClass !== "string"
-    || !Number.isFinite(p.confidence) || p.confidence < 0 || p.confidence > 1
     || target === undefined || supervisionHash(target) !== p.candidateHash || supervisionHash(p.sourceQuote) !== p.evidenceHash
     || (p.observedTarget === null ? p.targetQuote !== "" : typeof p.observedTarget !== "string" || !p.observedTarget
       || !target.includes(p.observedTarget) || !p.targetQuote.includes(p.observedTarget) || !target.includes(p.targetQuote)))
@@ -198,13 +207,14 @@ export function surfaceObservations(input: {
   usages?: readonly SurfaceUsage[];
 }): KnowledgeCandidate[] {
   const forms = new Set([...input.candidates.filter(c => c.likelyProperName).map(c => c.sourceForm),
-    ...input.anchors.map(a => a.sourceForm), ...input.previous.filter(nameLike).map(p => p.sourceForm)]);
+    ...input.anchors.map(a => a.sourceForm), ...input.previous.filter(surfaceTrackable).map(p => p.sourceForm)]);
   const result: KnowledgeCandidate[] = [];
   for (const sourceForm of forms) {
     const anchor = input.anchors.find(a => a.sourceForm === sourceForm);
     const previous = input.previous.filter(p => p.sourceForm === sourceForm);
     const semanticClass = anchor?.proposedSemanticClass ?? anchor?.semanticClass ?? previous.at(-1)?.semanticClass ?? "unclassified";
-    if (!nameLike({ semanticClass })) continue;
+    const discoveryKind = anchor?.discoveryKind ?? previous.at(-1)?.discoveryKind;
+    if (!surfaceTrackable({ semanticClass, discoveryKind })) continue;
     const proposedTarget = anchor?.target ?? previous.at(-1)?.proposedTarget ?? "";
     for (const source of input.sources.filter(s => mention(s.sourceText, sourceForm, input.profile) >= 0)) {
       const translation = input.translations.find(t => t.blockId === source.blockId);
@@ -213,12 +223,13 @@ export function surfaceObservations(input: {
       const receipts = groundSurfaceUsages(mentions, input.usages ?? [], [translation]);
       const localReceipts = receipts.filter(r => r.sourceForm === sourceForm);
       const localMentions = mentions.filter(m => m.sourceForm === sourceForm);
-      if (localMentions.length && (localReceipts.length || input.usages !== undefined)) {
+      if (localMentions.length && (localReceipts.length || input.usages !== undefined || semanticClass === "technical_term" || discoveryKind === "recurrent_noun")) {
         for (const mention of localMentions) {
           const receipt = localReceipts.find(r => r.occurrenceId === mention.occurrenceId);
           const payload: SurfaceObservation = { schema: "surface-observation-1", sourceForm, blockId: source.blockId, windowId: input.windowId,
+            ...(discoveryKind ? { discoveryKind } : {}),
             sourceQuote: mention.sourceQuote, targetQuote: receipt?.targetQuote ?? "", proposedTarget, observedTarget: receipt?.targetSurface ?? null,
-            semanticClass, confidence: anchor?.confidence ?? previous.at(-1)?.confidence ?? 0, evidenceHash: supervisionHash(mention.sourceQuote),
+            semanticClass, evidenceHash: supervisionHash(mention.sourceQuote),
             candidateHash: supervisionHash(translation.text), policy: "provisional-no-lock", occurrenceId: mention.occurrenceId, paragraphIndex: mention.paragraphIndex };
           result.push({ recordId: `surface-${supervisionHash([mention.occurrenceId, payload.candidateHash])}`,
             normalizedSubject: `${input.profile.normalizeSourceForm(sourceForm)}:${mention.occurrenceId}`, kind: "lexical_surface_observation", payload });
@@ -229,8 +240,9 @@ export function surfaceObservations(input: {
       const observedTarget = knownTargets.find(t => translation.text.includes(t)) ?? null;
       const sourceQuote = excerpt(source.sourceText, sourceForm, mention(source.sourceText, sourceForm, input.profile));
       const payload: SurfaceObservation = { schema: "surface-observation-1", sourceForm, blockId: source.blockId, windowId: input.windowId,
+        ...(discoveryKind ? { discoveryKind } : {}),
         sourceQuote, targetQuote: observedTarget ? excerpt(translation.text, observedTarget) : "", proposedTarget, observedTarget,
-        semanticClass, confidence: anchor?.confidence ?? previous.at(-1)?.confidence ?? 0,
+        semanticClass,
         evidenceHash: supervisionHash(sourceQuote), candidateHash: supervisionHash(translation.text), policy: "provisional-no-lock" };
       const id = supervisionHash([sourceForm, source.blockId, payload.candidateHash]);
       result.push({ recordId: `surface-${id}`, normalizedSubject: `${input.profile.normalizeSourceForm(sourceForm)}:${source.blockId}`,
@@ -247,7 +259,7 @@ export function surfaceConsistencyEvidence(input: {
 }): SurfaceConsistencyEvidence[] {
   const result: SurfaceConsistencyEvidence[] = [];
   const byForm = new Map<string, SurfaceObservation[]>();
-  for (const observation of input.observations.filter(o => nameLike(o) && hasSemanticSurfaceEvidence(o))) {
+  for (const observation of input.observations.filter(o => surfaceTrackable(o) && hasSemanticSurfaceEvidence(o))) {
     const history = byForm.get(observation.sourceForm) ?? [];
     history.push(observation);
     byForm.set(observation.sourceForm, history);
@@ -270,11 +282,16 @@ export function surfaceConsistencyEvidence(input: {
       if (!unknown && localTargets.length <= 1 && known.length === 1 && (localTargets.length ? localTargets.every(t => t === known[0]) : target.includes(known[0]!))) continue;
       const distinct = [...new Map(history.map(p => [p.observedTarget ?? "unknown", p])).values()].slice(-2);
       const changed = local.find(p => p.observedTarget && (known.length !== 1 || p.observedTarget !== known[0])) ?? local[0];
-      const sourceRef = evidenceReferences("source", source.blockId, source.sourceText).find(r => changed
-        ? r.text.includes(changed.sourceQuote) || changed.sourceQuote.includes(r.text) : stripEpubStructuralMarkers(r.text).includes(sourceForm));
+      const sourceRefs = paragraphEvidenceReferences("source", source.blockId, source.sourceText);
+      const knownIndex = changed?.paragraphIndex;
+      const index = knownIndex !== undefined && Number.isSafeInteger(knownIndex)
+        && sourceRefs[knownIndex] && mention(sourceRefs[knownIndex]!.text, sourceForm, input.profile) >= 0 ? knownIndex
+        : sourceRefs.findIndex(r => mention(r.text, sourceForm, input.profile) >= 0);
+      const sourceRef = sourceRefs[index];
       if (!sourceRef) continue;
+      const targetRefs = paragraphEvidenceReferences("target", source.blockId, target);
       result.push({ sourceForm, blockId: source.blockId, sourceQuote: sourceRef.text,
-        currentTargetQuote: evidenceReferences("target", source.blockId, target).find(r => changed?.observedTarget ? r.text.includes(changed.observedTarget) : true)?.text ?? "",
+        currentTargetQuote: targetRefs.length === sourceRefs.length ? targetRefs[index]?.text ?? "" : "",
         previous: distinct.map(p => ({ blockId: p.blockId, sourceQuote: p.sourceQuote, targetQuote: p.targetQuote, target: p.observedTarget })) });
       if (result.length >= 8) return result;
     }

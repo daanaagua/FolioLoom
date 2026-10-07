@@ -114,7 +114,7 @@ export async function writeLosslessBookEpub(
 ): Promise<string> {
   const audit = auditLosslessBookExport(store, runId).audit;
   const mode = options.deliveryMode ?? audit.deliveryMode;
-  if (mode === "standard" && !audit.deliveryReady) throw new Error("standard EPUB export requires complete validated coverage and reconciled usage");
+  if (mode === "standard" && !audit.deliveryReady) throw new Error("standard EPUB export requires complete validated coverage and intact export evidence");
   const lineage = deliveryLineage(store, runId, mode);
   const qualityReport = mode === "standard" ? qualityReportJson(store, runId) : undefined;
   const translations = losslessBookTranslations(store, runId);

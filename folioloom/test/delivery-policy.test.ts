@@ -17,6 +17,21 @@ function fixture() {
   return { records, queue, input };
 }
 
+test("chapter findings merge only into the same unclaimed candidate without replacing old evidence", () => {
+  const f = fixture();
+  const first = f.queue().defer(f.input);
+  const added = { ...f.input.issues[0]!, issueKey: "second", message: "An unsupported time shift was added." };
+  const merged = f.queue().mergePending({ ...f.input, issues: [added] });
+  assert.equal(merged.itemId, first.itemId);
+  assert.equal(merged.issues.length, 2);
+  assert.deepEqual(merged.issues[0], f.input.issues[0]);
+  assert.equal(f.queue().mergePending({ ...f.input, issues: [added] }).id, merged.id);
+  assert.throws(() => f.queue().mergePending({ ...f.input, candidateHash: "b".repeat(64),
+    issues: [{ ...added, issueKey: "third" }] }), /matching candidate/u);
+  f.queue().claimFinal(first.itemId);
+  assert.throws(() => f.queue().mergePending({ ...f.input, issues: [{ ...added, issueKey: "third" }] }), /unclaimed/u);
+});
+
 test("new runs default to standard; legacy runs keep strict unless explicitly changed", () => {
   assert.equal(resolveDeliveryMode(undefined, undefined, false), "standard");
   assert.equal(resolveDeliveryMode(undefined, undefined, true), "strict");

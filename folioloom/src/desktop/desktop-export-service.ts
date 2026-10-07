@@ -161,7 +161,7 @@ function candidateFor(
   try {
     const audit = auditStore(store, run.runId);
     deliveryMode = audit.deliveryMode ?? "strict";
-    unresolvedQualityItems = audit.quality?.unresolved ?? 0;
+    unresolvedQualityItems = (audit.quality?.unresolved ?? 0) + (audit.quality?.pending ?? 0);
     auditComplete = deliveryMode === "standard" ? audit.deliveryReady : audit.complete;
     if (!auditComplete && audit.incidentCodes.length > 0) {
       blockers.push(`完整性校验未通过：${audit.incidentCodes.join("、")}`);

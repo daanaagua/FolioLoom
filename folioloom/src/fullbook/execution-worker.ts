@@ -46,6 +46,7 @@ import {
   assembleParagraphFragmentCandidates,
   paragraphFragmentExecutionScope,
   paragraphFragmentFirstRequired,
+  PRIMARY_PARAGRAPH_FRAGMENT_LIMITS,
   planParagraphFragments,
   sourceParagraphSpans,
   type ParagraphFragmentCandidate,
@@ -584,6 +585,7 @@ function paragraphPlanForWindow(
   return planParagraphFragments({
     windowId: window.windowId,
     block,
+    ...(requireHighRisk ? PRIMARY_PARAGRAPH_FRAGMENT_LIMITS : {}),
     snapshotId: baseInput.snapshot.id,
     protectedSourceRanges: expectedTermOccurrencesForTranslationInput(baseInput)
       .filter((occurrence) => occurrence.blockId === block.id)

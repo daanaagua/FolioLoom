@@ -8,6 +8,8 @@ import { importSource } from "../src/source/source-importer.js";
 import { runBook } from "../src/fullbook/book-runner.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 import { auditLosslessBookExport } from "../src/report.js";
+import { QualityQueue } from "../src/fullbook/delivery-policy.js";
+import { supervisionCandidateHash } from "../src/domain/supervision.js";
 
 test("value supervision, scoped value repair and durable native book resume share one canonical journal", async () => {
   const root = mkdtempSync(join(tmpdir(), "folioloom-value-wire-"));
@@ -56,3 +58,56 @@ test("value supervision, scoped value repair and durable native book resume shar
   await runBook(options);
   assert.equal(faux.state.callCount, calls);
 });
+
+for (const status of ["dismissed", "variant"] as const) {
+  test(`a grounded ${status} receipt persists without another vote or changing committed text`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "folioloom-grounded-closure-"));
+    const source = join(root, "source.txt");
+    const original = "the quiet traveler waited beside the house. he stayed near the door until the rain stopped.";
+    const translated = "那位安静的旅人等在屋旁。他一直待在门边，直到外面的雨停了下来。";
+    writeFileSync(source, original, "utf8");
+    const imported = await importSource({ sourcePath: source, projectDirectory: join(root, "project"), sourceLanguage: "en" });
+    const faux = fauxProvider();
+    const reply = (context: Context) => {
+      const user = context.messages.findLast(m => m.role === "user")!;
+      const prompt = typeof user.content === "string" ? user.content : user.content.filter(c => c.type === "text").map(c => c.text).join("");
+      if (context.tools?.some(t => t.name === "finalize_translation_batch")) {
+        const windows = JSON.parse(/WINDOWS\n\n([^\n]+)\n\nSTABLE TERMS/u.exec(prompt)![1]!);
+        return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", { windows: windows.map((w: any) => ({ windowId: w.windowId,
+          translations: w.blocks.map((b: any) => ({ blockId: b.blockId, text: translated })), notes: [] })) }), { stopReason: "toolUse" });
+      }
+      const p = JSON.parse(prompt);
+      assert.notEqual(p.qualityReviewStage, "verification");
+      const values = p.event === "plan" ? [p.windows.length, [], [], "Translate."] : ["accept", [],
+        (p.priorIssues ?? []).map(() => [status, p.source[0].evidence[0].id, p.candidate[0].evidence[0].id, "Meaning is preserved in context."]), "Checked."];
+      return fauxAssistantMessage(fauxToolCall("submit_supervisor_values", { values }), { stopReason: "toolUse" });
+    };
+    faux.setResponses(Array.from({ length: 6 }, () => reply));
+    const options = { manifestPath: imported.manifestPath, storePath: join(root, "book.db"), runMeta: { runId: "grounded", protocolVersion: "test" },
+      model: { ...faux.getModel(), provider: "folioloom-deepseek" }, streamFn: faux.provider.streamSimple.bind(faux.provider),
+      supervisorMode: "bounded" as const, deliveryMode: "standard" as const, maxConcurrency: 1, maxAttempts: 1, hardDeadlineMs: 10000 };
+    await runBook(options);
+    const writable = new LosslessBookStore(options.storePath);
+    let active;
+    try {
+      active = writable.activeTranslations("grounded");
+      new QualityQueue("grounded", writable).defer({ windowId: active[0]!.windowId, candidateHash: supervisionCandidateHash(active),
+        issues: [{ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: active[0]!.blockId, issueKey: "wording", repairable: true,
+          message: "Check the wording.", evidence: { sourceQuote: original, targetQuote: translated, problem: "Check the wording." } }] });
+    } finally { writable.close(); }
+    const calls = faux.state.callCount;
+    await runBook(options);
+    assert.equal(faux.state.callCount, calls + 1);
+    const store = LosslessBookStore.openReadOnly(options.storePath);
+    try {
+      const item = new QualityQueue("grounded", store).items()[0]!;
+      assert.equal(item.state, "resolved");
+      assert.equal(item.closure?.policy, "issue-closure-2");
+      assert.equal(item.closure?.dispositions[0]?.status, status);
+      assert.equal(item.closure?.verificationDecisionId, undefined);
+      assert.deepEqual(store.activeTranslations("grounded"), active);
+      assert.ok(auditLosslessBookExport(store, "grounded").audit.strictExportable);
+      assert.ok(store.loadTokenLedgerEvents("grounded").filter(e => e.type === "settled").every(e => e.usageComplete));
+    } finally { store.close(); }
+  });
+}

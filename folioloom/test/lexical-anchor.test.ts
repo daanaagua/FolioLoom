@@ -44,6 +44,45 @@ const typhonTerm: StableTerm = {
   locked: true,
 };
 
+test("recurrent specialized words retain a grounded soft preference below the hard concept threshold", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+    anchors: [
+      { sourceForm: "tallyrod", target: "筹杆", mode: "stable", semanticClass: "technical_term", confidence: 0.65,
+        meaning: "a counting implement", usageScope: "the same wooden implement, not a metaphor", allowedTargets: ["短筹杆"] },
+      { sourceForm: "door", target: "门", mode: "contextual", semanticClass: "ordinary_word", confidence: 0.99 },
+    ],
+  }), { stopReason: "toolUse" })]);
+  const result = await new LexicalAnchorer(new PiRuntime()).run({
+    candidates: [
+      { sourceForm: "tallyrod", discoveryKind: "recurrent_noun", corpusFrequency: 3, currentWaveOccurrences: 1,
+        contexts: ["She raised her old tallyrod.", "The tallyrod fell."] },
+      { sourceForm: "door", corpusFrequency: 6, contexts: ["The door opened."] },
+    ], stableTerms: [], model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+  assert.equal(result.anchors[0]?.semanticClass, "unclassified");
+  assert.equal(result.terms.length, 1);
+  const term = result.terms[0]!;
+  assert.equal(term.policy, "preferred");
+  assert.equal(term.locked, false);
+  assert.equal(term.preference?.meaning, "a counting implement");
+  assert.deepEqual(term.allowedTargets, ["筹杆", "短筹杆"]);
+  assert.deepEqual(term.preference?.evidenceQuotes, ["She raised her old tallyrod.", "The tallyrod fell."]);
+  assert.match(term.note ?? "", /not a metaphor/u);
+  assert.equal(faux.state.callCount, 1);
+});
+
+test("framed fallback retains specialized meaning with the same soft memory protocol", () => {
+  const candidates = [{ sourceForm: "tallyrod", corpusFrequency: 3, contexts: ["Her tallyrod fell."] }];
+  const profile = getSourceLanguageProfile("en");
+  const protocol = createLexicalPreferredFallbackProtocol(candidates, profile);
+  const result = parseLexicalPreferredFallbackResponse(JSON.stringify([{ sourceForm: "tallyrod", target: "筹杆",
+    semanticClass: "technical_term", confidence: 0.85, meaning: "counting implement", usageScope: "wooden object" }]), protocol, candidates, profile);
+  assert.equal(result.terms[0]?.preference?.meaning, "counting implement");
+  assert.equal(result.terms[0]?.locked, false);
+});
+
 test("EPUB slot identifiers never enter name concordance or consume candidate slots", () => {
   const sources = [block("⟦E1.0.0⟧Copper called Nara.⟦/E1.0.0⟧ Copper greeted Nara.", 0)];
   const candidates = collectWindowAnchorCandidates(sources, sources, []);
@@ -371,7 +410,6 @@ test("a provisional alias claim cannot override an explicit source-authored targ
       proposedTarget: "\u7389\u51a0\u724c",
       evidenceKind: "explicit_naming",
       evidenceQuote: context,
-      confidence: 0.99,
     }],
   }), { stopReason: "toolUse" })]);
   const outcome = await new LexicalAnchorer(new PiRuntime()).run({
@@ -418,7 +456,6 @@ test("an explicit-naming claim without a source-language naming cue stays provis
       proposedTarget: "\u4eba",
       evidenceKind: "explicit_naming",
       evidenceQuote: context,
-      confidence: 0.99,
     }],
   }), { stopReason: "toolUse" })]);
   const outcome = await new LexicalAnchorer(new PiRuntime()).run({
@@ -456,7 +493,6 @@ test("an alias quote that omits one linked form stays provisional", async () => 
       proposedTarget: "\u7ea6\u7ff0",
       evidenceKind: "explicit_naming",
       evidenceQuote: johnContext,
-      confidence: 0.99,
     }],
   }), { stopReason: "toolUse" })]);
   const outcome = await new LexicalAnchorer(new PiRuntime()).run({
@@ -892,7 +928,6 @@ test("Pi lexical anchor evidence records a provisional entity link", async () =>
       proposedTarget: "盧奇安",
       evidenceKind: "explicit_naming",
       evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
-      confidence: 0.95,
     }],
   }), { stopReason: "toolUse" })]);
 
@@ -927,7 +962,6 @@ test("entity alias proposals remain provisional even with an explanatory target"
       proposedTarget,
       evidenceKind: "explicit_naming" as const,
       evidenceQuote: source,
-      confidence: 0.95,
     }],
   });
   const faux = fauxProvider();

@@ -19,6 +19,10 @@ import { optimizationPolicy } from "./fullbook/optimization-policy.js";
 import { summarizeSupervision, supervisionMetadata, type SupervisionSummary } from "./domain/supervision.js";
 import { supervisionCandidateHash } from "./domain/supervision.js";
 import { QualityQueue, type QualityRecord, type DeliveryMode } from "./fullbook/delivery-policy.js";
+import { chapterReviewCoverage } from "./fullbook/chapter-review.js";
+import { auditLexicalPreferences, type LexicalPreferenceCheck } from "./knowledge/lexical-preference-audit.js";
+import { stableTermsFromKnowledge } from "./knowledge/stable-terms-from-knowledge.js";
+import { getSourceLanguageProfile } from "./language/profiles.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -163,6 +167,7 @@ function friendlyBookArtifactFileNames(
 }
 
 export interface LosslessBookAuditReport {
+  lexicalPreferences?: LexicalPreferenceCheck[];
   supervision?: SupervisionSummary;
   schema: "v5-book-store-audit-1";
   runId: string;
@@ -204,6 +209,7 @@ export interface LosslessBookAuditReport {
 const KNOWLEDGE_CONVERGENCE_INCIDENTS = new Set([
   "SUPERVISION_PAUSED",
   "SUPERVISION_REVIEW_PENDING",
+  "CHAPTER_REVIEW_PENDING",
   "STALE_KNOWLEDGE_BINDING",
   "PENDING_KNOWLEDGE_CHANGE",
   "PENDING_TERM_IMPACT",
@@ -584,6 +590,12 @@ export function auditLosslessBookStore(
   if (supervisionPolicy !== undefined && canonicalJson(supervisionPolicy) !== canonicalJson(supervisionMetadata("bounded"))) incidents.push("SUPERVISION_POLICY_INVALID");
   if (supervision?.paused.length) incidents.push("SUPERVISION_PAUSED");
   if (supervision?.pendingReviewWindowIds.length) incidents.push("SUPERVISION_REVIEW_PENDING");
+  let chaptersComplete = true;
+  try {
+    const chapterPolicy = (state.runMetadata as { chapterReview?: unknown } | undefined)?.chapterReview;
+    const coverage = chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId));
+    if (coverage?.pendingScopes.length) { chaptersComplete = false; incidents.push("CHAPTER_REVIEW_PENDING"); }
+  } catch { chaptersComplete = false; incidents.push("CHAPTER_REVIEW_INVALID"); }
   const incidentCodes = [...new Set(incidents)].sort();
   const supervisionComplete = supervision === undefined || (!supervision.paused.length && !supervision.pendingReviewWindowIds.length
     && !incidents.includes("SUPERVISION_POLICY_INVALID"));
@@ -592,6 +604,10 @@ export function auditLosslessBookStore(
   try {
     deliveryMode = store.deliveryMode(runId) ?? "strict";
     qualityItems = new QualityQueue(runId, store).items();
+    if (store.chapterReviewCheckpoints(runId).some(checkpoint => checkpoint.qualityItemIds.some(id =>
+      !qualityItems.some(item => item.itemId === id && checkpoint.windowIds.includes(item.windowId))))) {
+      incidents.push("QUALITY_EVIDENCE_INVALID");
+    }
     const active = store.activeTranslations(runId);
     for (const item of qualityItems) {
       if (!windowById.has(item.windowId) || item.issues.some(issue => membershipByBlock.get(issue.blockId ?? "") !== item.windowId)
@@ -604,12 +620,20 @@ export function auditLosslessBookStore(
     resolved: qualityItems.filter(item => item.state === "resolved").length, unresolved: qualityItems.filter(item => item.state === "unresolved").length };
   if (quality.pending) incidents.push("QUALITY_REVIEW_PENDING");
   if (quality.unresolved) incidents.push("QUALITY_UNRESOLVED");
-  const strictExportable = structurallyComplete && knowledgeConverged && supervisionComplete && !quality.pending && !quality.unresolved
+  const strictExportable = structurallyComplete && knowledgeConverged && supervisionComplete && chaptersComplete && !quality.pending && !quality.unresolved
     && !incidents.includes("QUALITY_EVIDENCE_INVALID");
-  const documentedReviews = supervision?.pendingReviewWindowIds.every(id => qualityItems.some(item => item.windowId === id && item.state === "unresolved")) ?? true;
-  const deliveryReady = structurallyComplete && knowledgeConverged && !quality.pending && documentedReviews
-    && incidents.every(code => code === "SUPERVISION_REVIEW_PENDING" || code === "QUALITY_UNRESOLVED");
+  // Complete text is independently deliverable. Review uncertainty remains in
+  // the sidecar and strict audit; it is not a missing or corrupt translation.
+  const deliveryReady = structurallyComplete
+    && incidents.every(code => ["SUPERVISION_REVIEW_PENDING", "SUPERVISION_PAUSED", "CHAPTER_REVIEW_PENDING",
+      "QUALITY_REVIEW_PENDING", "QUALITY_UNRESOLVED", "STALE_KNOWLEDGE_BINDING", "PENDING_KNOWLEDGE_CHANGE",
+      "PENDING_TERM_IMPACT", "TERM_RETROFIT_INCOMPLETE"].includes(code));
+  const lexicalPreferences = auditLexicalPreferences({ sources: blocks,
+    translations: store.activeTranslations(runId),
+    terms: stableTermsFromKnowledge(projectedKnowledge?.projectableRevisions() ?? []),
+    profile: getSourceLanguageProfile(state.sourceLanguage) });
   return {
+    ...(lexicalPreferences.length ? { lexicalPreferences } : {}),
     ...(supervision === undefined ? {} : { supervision }),
     schema: "v5-book-store-audit-1",
     runId: state.runId,
@@ -667,20 +691,30 @@ export function losslessBookLineage(
 
 export function qualityReportJson(store: LosslessBookStore, runId: string): string {
   const sourceVersion = store.auditState(runId).sourceVersion;
+  const audit = auditLosslessBookExport(store, runId).audit;
   return `${JSON.stringify({ schema: "folioloom-quality-report-1", runId, sourceVersion,
+    assurance: { completeText: audit.structurallyComplete, strictExportable: audit.strictExportable,
+      knowledgeConverged: audit.knowledgeConverged, usageComplete: !audit.incidentCodes.includes("TOKEN_USAGE_INCOMPLETE"),
+      incidentCodes: audit.incidentCodes },
+    ...(audit.lexicalPreferences?.length ? { lexicalPreferences: audit.lexicalPreferences } : {}),
     items: new QualityQueue(runId, store).items() }, null, 2)}\n`;
 }
 
 export function qualityReportText(store: LosslessBookStore, runId: string): string {
   const items = new QualityQueue(runId, store).items();
+  const audit = auditLosslessBookExport(store, runId).audit;
   const unresolved = items.filter(item => item.state !== "resolved");
   const dispositions = items.flatMap(item => item.closure?.dispositions ?? []);
-  return ["译文疑点清单", `未解决：${unresolved.length}；已解决：${items.length - unresolved.length}`, "",
+  return ["译文疑点清单", `未解决：${unresolved.length}；已解决：${items.length - unresolved.length}`,
+    `正文覆盖：${audit.structurallyComplete ? "完整" : "不完整"}；严格验收：${audit.strictExportable ? "通过" : "未通过"}`,
+    ...(audit.incidentCodes.length ? [`检查记录：${audit.incidentCodes.join("、")}`] : []), "",
     ...(dispositions.length ? [`逐项结论：实际修复 ${dispositions.filter(d => d.status === "fixed").length}；误报 ${dispositions.filter(d => d.status === "dismissed").length}；合理变体 ${dispositions.filter(d => d.status === "variant").length}；未决 ${dispositions.filter(d => d.status === "unresolved").length}`, ""] : []),
     ...unresolved.flatMap((item, index) => [`${index + 1}. ${item.windowId}`, `状态：${item.state}`,
       ...item.issues.map(issue => `[${issue.blockId}] ${issue.message}`), ""]),
     ...items.filter(item => item.closure).flatMap(item => [`${item.windowId} 逐项结案：`,
       ...item.closure!.dispositions.map(d => `${d.issueId.slice(0, 12)} [${d.status}] ${d.note}`), ""]),
+    ...(audit.lexicalPreferences?.length ? ["专用词全位置核对（译名出现不等于语义已确认；差异可能是合理变体）：",
+      ...audit.lexicalPreferences.map(check => `[${check.blockId} 段${check.paragraphIndex + 1} @${check.sourceStart}] ${check.sourceForm} → ${check.preferredTarget}：${check.status}`), ""] : []),
   ].join("\n") + "\n";
 }
 
@@ -957,7 +991,9 @@ export function auditLosslessBookExport(
       ...baseAudit,
       complete: strictExportable,
       strictExportable,
-      deliveryReady: baseAudit.deliveryReady && ledgerIncidents.length === 0,
+      // Unknown historical consumption is retained, never estimated or cleared.
+      // Accounting corruption/open attempts still prevent a verified export.
+      deliveryReady: baseAudit.deliveryReady && ledgerIncidents.every(code => code === "TOKEN_USAGE_INCOMPLETE"),
       incidentCodes,
     },
     scheduler,

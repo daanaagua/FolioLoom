@@ -83,7 +83,8 @@ export interface NarrativeMemoryRecord {
   kind: string;
   subjectIds: string[];
   verdict: string;
-  confidence: number;
+  /** @deprecated Historical records only; not an admission criterion. */
+  confidence?: number;
   channel: "narrative_before_target" | "translator_global";
   visibleFromGlobalIndex: number;
   evidenceIds: string[];

@@ -12,6 +12,69 @@ const anchors = [{ sourceForm: "Copper", target: "铜铃", mode: "stable" as con
   proposedSemanticClass: "proper_name" as const, confidence: 0.55 }];
 const candidates = [{ sourceForm: "Copper", likelyProperName: true, corpusFrequency: 4, contexts: [source[0]!.sourceText] }];
 
+test("weak lowercase technical terms retain grounded soft memory without concept promotion", () => {
+  const sources = [{ blockId: "b1", sourceText: "The lyceum has a classroom. The lyceum closes at dusk." }];
+  const proposals = [{ sourceForm: "lyceum", target: "学馆", mode: "contextual" as const, semanticClass: "unclassified" as const,
+    proposedSemanticClass: "technical_term" as const, confidence: 0.65 }];
+  const discovered = [{ sourceForm: "lyceum", contexts: [sources[0]!.sourceText], corpusFrequency: 4 }];
+  const mentions = surfaceMentions(sources, proposals, [], profile);
+  assert.equal(mentions.length, 2);
+  const translations = [{ blockId: "b1", text: "学馆里有一间教室。学馆日落时闭门。" }];
+  const usages = groundSurfaceUsages(mentions, mentions.map(m => ({ occurrenceId: m.occurrenceId, targetSurface: "学馆" })), translations);
+  const records = surfaceObservations({ windowId: "w1", sources, translations, candidates: discovered, anchors: proposals,
+    previous: [], profile, usages });
+  const knowledge = new KnowledgeStore();
+  knowledge.reconcileCandidates(records, "w1");
+  const revisions = knowledge.projectableRevisions(), memory = readSurfaceObservations(revisions);
+  assert.equal(memory.length, 2);
+  assert.ok(memory.every(m => m.semanticClass === "technical_term" && m.observedTarget === "学馆" && m.confidence === undefined));
+  assert.equal(stableTermsFromKnowledge(revisions).length, 0);
+  const next = [{ blockId: "b2", sourceText: "The lyceum opened its doors." }];
+  assert.equal(reconsiderSurfaceCandidates(discovered, memory, next, profile).length, 0);
+  assert.equal(surfaceMentions(next, [], memory, profile)[0]?.preferredTarget, "学馆");
+  assert.ok(projectKnowledgeForTranslation(revisions, next.map(s => s.sourceText), profile).revisions.length > 0);
+  assert.equal(surfaceConsistencyEvidence({ sources: next, translations: [{ blockId: "b2", text: "学宫开门了。" }],
+    observations: memory, terms: [], profile }).length, 1);
+});
+
+test("technical term observations require occurrence receipts and never infer a rendering from another paragraph", () => {
+  const sources = [{ blockId: "b1", sourceText: "The lyceum opened.\n\nA separate lesson began." }];
+  const proposals = [{ sourceForm: "lyceum", target: "学馆", mode: "stable" as const,
+    proposedSemanticClass: "technical_term" as const, semanticClass: "unclassified" as const, confidence: 0.6 }];
+  const records = surfaceObservations({ windowId: "w1", sources, translations: [{ blockId: "b1", text: "它开门了。\n\n学馆另开了一堂课。" }],
+    candidates: [], anchors: proposals, previous: [], profile });
+  assert.equal(records.length, 1);
+  assert.equal((records[0]!.payload as any).observedTarget, null);
+  assert.equal((records[0]!.payload as any).targetQuote, "");
+});
+
+test("multiple technical-term realizations remain contextual evidence, not a single forced preference", () => {
+  const sources = [{ blockId: "b1", sourceText: "The lyceum opened.\n\nAfter lyceum, they left." }];
+  const proposals = [{ sourceForm: "lyceum", target: "学馆", mode: "contextual" as const,
+    proposedSemanticClass: "technical_term" as const, semanticClass: "unclassified" as const, confidence: 0.6 }];
+  const translations = [{ blockId: "b1", text: "学馆开门了。\n\n授课结束后，他们离开了。" }];
+  const mentions = surfaceMentions(sources, proposals, [], profile);
+  assert.equal(mentions.length, 2);
+  const usages = groundSurfaceUsages(mentions, mentions.map((m, i) => ({ occurrenceId: m.occurrenceId, targetSurface: i ? "授课" : "学馆" })), translations);
+  const memory = surfaceObservations({ windowId: "w1", sources, translations, candidates: [], anchors: proposals,
+    previous: [], profile, usages }).map(r => r.payload as any);
+  assert.deepEqual(memory.map(m => m.observedTarget), ["学馆", "授课"]);
+  assert.equal(surfaceMentions([{ blockId: "b2", sourceText: "After lyceum, they talked." }], [], memory, profile)[0]?.preferredTarget, undefined);
+});
+
+test("unknown surface evidence uses the matching complete paragraph, never the block prefix", () => {
+  const sources = [{ blockId: "b2", sourceText: "An unrelated introduction.\n\nCopper waited by the gate.\n\nThe bell rang." }];
+  const current = "开场与称呼无关。\n\n小铜在门边等着。" + "旁白仍在继续。".repeat(90) + "她没有离开😀。\n\n钟响了。";
+  const evidence = surfaceConsistencyEvidence({ sources, translations: [{ blockId: "b2", text: current }],
+    observations: observations().map(r => r.payload as any), terms: [], profile });
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0]!.sourceQuote, sources[0]!.sourceText.split("\n\n")[1]);
+  assert.equal(evidence[0]!.currentTargetQuote, current.split("\n\n")[1]);
+  const mismatched = surfaceConsistencyEvidence({ sources, translations: [{ blockId: "b2", text: "小铜。" }],
+    observations: observations().map(r => r.payload as any), terms: [], profile });
+  assert.equal(mismatched[0]!.currentTargetQuote, "", "unknown alignment must not pretend the first target is corresponding evidence");
+});
+
 test("fragment receipts ground only owned source occurrences in local target paragraphs", () => {
   const sources = [{ blockId: "b1", sourceText: "Copper waited.\n\nThe bell rang.\n\nCopper returned." }];
   const mentions = surfaceMentions(sources, anchors, [], profile);
@@ -83,7 +146,7 @@ test("weak name proposals remain durable provisional observations, never locked 
   assert.equal(stableTermsFromKnowledge(revisions).length, 0);
   const memory = readSurfaceObservations(revisions);
   assert.equal(memory[0]?.observedTarget, "铜铃");
-  assert.equal(memory[0]?.confidence, 0.55);
+  assert.equal(memory[0]?.confidence, undefined);
   assert.equal(memory[0]?.semanticClass, "proper_name");
   assert.equal(memory[0]?.blockId, "b1");
 });

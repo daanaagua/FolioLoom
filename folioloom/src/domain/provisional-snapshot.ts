@@ -12,7 +12,8 @@ export interface ProvisionalFact {
   questionId: string;
   kind: string;
   verdict: string;
-  confidence: number;
+  /** @deprecated Historical snapshots only; not projected to model requests. */
+  confidence?: number;
   evidenceIds: string[];
   channel: VisibilityChannel;
 }
@@ -81,7 +82,6 @@ export function buildProvisionalSnapshot(input: SnapshotInput): ProvisionalSnaps
       questionId: resolution.questionId,
       kind: question.kind,
       verdict: resolution.verdict,
-      confidence: resolution.confidence,
       evidenceIds: [...resolution.evidenceIds],
       channel: question.channel,
     };
