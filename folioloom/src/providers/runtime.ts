@@ -3,7 +3,7 @@ import type { Api, AssistantMessage, Model, OpenAICompletionsCompat, OpenAIRespo
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { ensureProviderNetwork, providerNetworkError, withProviderNetwork, type ProviderNetworkError } from "./network.js";
+import { ensureProviderNetwork, providerNetworkError, withProviderNetwork, providerTlsCompatibility, type ProviderNetworkError, type ProviderTlsCompatibility } from "./network.js";
 import { createProviderPreflight, registerProviderPreflight } from "./preflight.js";
 
 import { providerRegistry, toInternalThinking } from "./registry.js";
@@ -19,6 +19,7 @@ import type {
 export interface ProviderRuntimeOptions {
   trustedBaseUrl?: string;
   timeoutMs?: number;
+  tlsCompatibility?: ProviderTlsCompatibility;
 }
 
 function requireCredential(value: SecretCredential): SecretCredential {
@@ -80,6 +81,7 @@ export function createProviderRuntime(
 ): ProviderRuntime {
   const resolved = providerRegistry.resolve(profile);
   const apiKey = requireCredential(credential);
+  const tlsCompatibility = providerTlsCompatibility(options.tlsCompatibility);
   const baseUrl = options.trustedBaseUrl === undefined
     ? resolved.baseUrl
     : options.trustedBaseUrl.trim().replace(/\/$/, "");
@@ -96,7 +98,7 @@ export function createProviderRuntime(
   const streamFn: StreamFn = (streamModel, context, streamOptions) => {
     ensureProviderNetwork();
     const output = createAssistantMessageEventStream();
-    const scope: { failure?: ProviderNetworkError } = {};
+    const scope: { failure?: ProviderNetworkError; tlsCompatibility: ProviderTlsCompatibility } = { tlsCompatibility };
     void withProviderNetwork(scope, async () => {
       let partial: AssistantMessage | undefined;
       try {
@@ -123,7 +125,7 @@ export function createProviderRuntime(
     });
     return output;
   };
-  const preflight = createProviderPreflight(baseUrl, apiKey, options.timeoutMs);
+  const preflight = createProviderPreflight(baseUrl, apiKey, options.timeoutMs, tlsCompatibility);
   registerProviderPreflight(streamFn, preflight);
   return { model, streamFn, preflight };
 }

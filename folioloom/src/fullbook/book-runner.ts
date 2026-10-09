@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import type { StreamFn } from "@earendil-works/pi-agent-core";
@@ -17,6 +17,7 @@ import { readSurfaceObservations, surfaceObservations, surfaceConsistencyEvidenc
 import { lexicalReviewHints } from "../knowledge/lexical-review-hints.js";
 import { MAX_SUPERVISOR_WINDOWS } from "../agents/supervisor.js";
 import { finalQualityScopes, runFinalizationTasks } from "./finalization-scheduler.js";
+import { planSourceExecution, sourceFrontier, type PlanningMode } from "./source-execution-plan.js";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
@@ -214,6 +215,9 @@ import {
   planBookWindows,
   type WindowPlanOptions,
 } from "./window-planner.js";
+
+import { runDirectBook } from "./direct-book-runner.js";
+import type { TranslationWorkflow } from "./direct-translation.js";
 
 export const LOSSLESS_BOOK_PROTOCOL_VERSION = "v5-book-3";
 export { drainKnowledgeRevalidationTasks };
@@ -431,6 +435,8 @@ export interface LosslessBookRunMeta {
 }
 
 export interface LosslessBookRunOptions {
+  workflow?: TranslationWorkflow;
+  planningMode?: PlanningMode;
   deliveryMode?: DeliveryMode;
   taskContext?: string;
   supervisorMode?: SupervisionMode;
@@ -1685,6 +1691,7 @@ function dynamicRequestPlanning(
     readonly runtimeSet: TranslationRuntimeSet;
     readonly executionRuntime: TranslationRuntime;
     readonly mode: SchedulerMode;
+    readonly sourcePlanned?: boolean;
     readonly buildBaseInput: (
       request: PhysicalRequestPlan,
     ) => TranslationRequestInput;
@@ -1721,7 +1728,7 @@ function dynamicRequestPlanning(
 
   const tasks: SchedulerTask[] = requests.map((request, ordinal) => {
     const baseInput = options.buildBaseInput(request);
-    const contextPlan = options.mode === "off"
+    const contextPlan = options.mode === "off" || options.sourcePlanned
       ? undefined
       : translationContextPlan(
         request,
@@ -1741,7 +1748,8 @@ function dynamicRequestPlanning(
         lockedTermOccurrences: 0,
         needsRevalidate: false,
         priorRepairs: options.retryRound,
-        sourceAnomalies: 0,
+        sourceAnomalies: options.sourcePlanned
+          ? sourceAnomaliesForRequest(request, options.sourceAnomalyReport, options.blockById) : 0,
       })
       : contextPlan.risk;
     const legacy = legacyRequestById.get(request.requestId);
@@ -2361,10 +2369,15 @@ async function runLosslessBook(
     variants: originalRuntimeSet.variants?.map(contextualRuntime),
   };
   const supervisorMode = options.supervisorMode ?? "off";
+  const planningMode = options.planningMode ?? "supervised";
+  if (planningMode !== "supervised" && planningMode !== "source") throw new Error("invalid planning mode");
   if (supervisorMode !== "off" && supervisorMode !== "bounded") throw new Error("invalid supervisor mode");
   const chapterReviewMode = options.chapterReviewMode ?? "off";
   if (!["off", "bounded"].includes(chapterReviewMode)) throw new Error("invalid chapter review mode");
   if (chapterReviewMode === "bounded" && supervisorMode !== "bounded") throw new Error("chapter review requires the bounded supervisor");
+  if (planningMode === "source" && (supervisorMode !== "bounded" || chapterReviewMode !== "bounded")) {
+    throw new Error("source planning requires bounded supervision and complete chapter review");
+  }
   if (supervisorMode === "bounded" && (runtimeSet.primary.executionPolicy !== undefined
     || runtimeSet.primary.model.provider.startsWith("external-"))) {
     throw new Error("bounded supervisor requires the native Pi/provider API backend");
@@ -2527,14 +2540,18 @@ async function runLosslessBook(
       protocolVersion,
     });
     const initialSnapshot = createKnowledgeSnapshot(runId, []);
+    const chapterPolicy = chapterReviewMode === "bounded"
+      ? chapterReviewMetadata(planChapterReviews(context.losslessBlocks, planned, context.languageProfile)) : undefined;
+    const sourcePlan = planningMode === "source"
+      ? planSourceExecution(context.sourceLedger.sourceVersion, planned, context.losslessBlocks, chapterPolicy?.scopes) : undefined;
     const requestedMetadata = runMetadataWithLanguageProfile(
       options.runMeta.metadata,
       context,
       runtimeSet,
     );
     if (supervisorMode === "bounded") requestedMetadata.supervision = supervisionMetadata(supervisorMode);
-    const chapterPolicy = chapterReviewMode === "bounded"
-      ? chapterReviewMetadata(planChapterReviews(context.losslessBlocks, planned, context.languageProfile)) : undefined;
+    if (sourcePlan) requestedMetadata.sourceExecutionPlan = sourcePlan;
+    else delete requestedMetadata.sourceExecutionPlan;
     if (chapterPolicy) requestedMetadata.chapterReview = chapterPolicy;
     else delete requestedMetadata.chapterReview;
     if (options.taskContext !== undefined) requestedMetadata.taskContext = taskContextMetadata(options.taskContext);
@@ -2544,6 +2561,9 @@ async function runLosslessBook(
       const storedMetadata = existingRun.metadata as Record<string, unknown> | undefined;
       validateTaskContextIdentity(storedMetadata?.taskContext, options.taskContext);
       validateSupervisionIdentity(storedMetadata?.supervision, supervisorMode);
+      if (canonicalJson(storedMetadata?.sourceExecutionPlan ?? null) !== canonicalJson(sourcePlan ?? null)) {
+        throw new Error("source execution planning policy mismatch; resume requires the original plan");
+      }
       if (canonicalJson(storedMetadata?.chapterReview ?? null) !== canonicalJson(chapterPolicy ?? null)) {
         throw new Error("chapter review policy mismatch; resume requires the original chapter review mode");
       }
@@ -2769,6 +2789,7 @@ async function runLosslessBook(
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
     const recovery = new AutomaticRecovery({ runId, store });
     const supervisor = supervisorMode === "bounded" ? new SupervisionController({
+      sourcePlan,
       recovery,
       maxConcurrency: Math.min(maxConcurrency, 3),
       runId, sourceVersion: context.sourceLedger.sourceVersion, windows: planned,
@@ -3300,9 +3321,11 @@ async function runLosslessBook(
       }
       const remaining = maxWindows - processedWindows;
       const selected: PersistedLosslessWindow[] = [];
-      const physicalRequestHorizon = maxConcurrency * waveHorizonMultiplier;
+      const sourceFrontierIds = sourcePlan ? new Set(sourceFrontier(sourcePlan, barrier.windowId)) : undefined;
+      const physicalRequestHorizon = sourceFrontierIds?.size ?? maxConcurrency * waveHorizonMultiplier;
       for (const window of allWindows.slice(barrier.ordinal)) {
         if (window.status !== "pending"
+          || sourceFrontierIds !== undefined && !sourceFrontierIds.has(window.windowId)
           || selected.length >= remaining) {
           break;
         }
@@ -3674,11 +3697,14 @@ async function runLosslessBook(
       ).filter(item => !snapshot.revisions.some(revision => revision.candidateIds.includes(item.candidate.recordId)));
       const entityLinkWarnings = unresolvedEntityWarnings(waveAnchorSnapshot);
       if (supervisor !== undefined) {
-        const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings, selected.length);
-        const allowed = new Set(decision.windowIds);
-        const count = selected.findIndex(w => !allowed.has(w.windowId));
-        if (count === 0) throw new Error("supervisor approved no conflict-safe window");
-        if (count > 0) selected.splice(count);
+        if (sourcePlan) supervisor.planSourceFrontier(selected.map(w => w.windowId), activeTerms);
+        else {
+          const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings, selected.length);
+          const allowed = new Set(decision.windowIds);
+          const count = selected.findIndex(w => !allowed.has(w.windowId));
+          if (count === 0) throw new Error("supervisor approved no conflict-safe window");
+          if (count > 0) selected.splice(count);
+        }
       }
       const coordinator = new CommitCoordinator(
         runId,
@@ -3788,6 +3814,7 @@ async function runLosslessBook(
           runtimeSet,
           executionRuntime,
           mode: schedulerMode,
+          sourcePlanned: sourcePlan !== undefined,
           buildBaseInput: buildTranslationInput,
           estimator,
           sourceAnomalyReport,
@@ -4653,6 +4680,17 @@ export function runBook(options: LosslessBookRunOptions): Promise<LosslessBookRu
 export async function runBook(
   options: BookRunOptions | LosslessBookRunOptions,
 ): Promise<BookRunResult | LosslessBookRunResult> {
+  if ("manifestPath" in options && options.workflow === "direct") return runDirectBook(options);
+  if ("manifestPath" in options && existsSync(options.storePath)) {
+    const store = LosslessBookStore.openReadOnly(options.storePath);
+    try {
+      const existing = store.listTranslationRuns().find(r => r.runId === options.runMeta.runId);
+      if ((existing?.metadata as { workflow?: { name?: string } } | undefined)?.workflow?.name === "direct") {
+        if (options.workflow === "supervised") throw new Error("translation workflow mismatch; existing run uses direct workflow");
+        return runDirectBook(options);
+      }
+    } finally { store.close(); }
+  }
   const streams = new Set([options.streamFn]);
   if ("manifestPath" in options && options.runtimeSet) {
     streams.add(options.runtimeSet.primary.streamFn);

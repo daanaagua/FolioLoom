@@ -37,7 +37,7 @@ export interface SupervisionRecord {
   readonly qualityItemId?: string;
   readonly qualityReviewStage?: "disposition" | "verification";
   readonly chapterReview?: { readonly scopeId: string; readonly title: string };
-  readonly origin?: "model" | "host_revalidation" | "host_reuse";
+  readonly origin?: "model" | "host_revalidation" | "host_reuse" | "host_source_plan";
   readonly decision?: SupervisorDecision;
   readonly modelCalls?: number;
   readonly totalTokens?: number;

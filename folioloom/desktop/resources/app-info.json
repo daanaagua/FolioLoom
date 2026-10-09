@@ -1,6 +1,6 @@
 {
   "schema": "folioloom-desktop-resource-1",
-  "version": "1.9.0",
+  "version": "1.11.0",
   "apiKeyPolicy": "never-packaged",
   "projectDataPolicy": "user-selected",
   "translationWritePolicy": "single-window-trial-and-durable-fullbook",

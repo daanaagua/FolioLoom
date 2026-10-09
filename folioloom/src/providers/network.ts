@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import http from "node:http";
+import { EnvHttpProxyAgent } from "undici";
 import type { ProviderProbeErrorCode } from "./types.js";
 
 const TLS_CODES = new Set([
@@ -38,7 +39,27 @@ export function providerNetworkError(error: unknown): ProviderNetworkError | und
 
 let initialized = false;
 let installedFetch: typeof fetch | undefined;
-const scopes = new AsyncLocalStorage<{ failure?: ProviderNetworkError }>();
+export type ProviderTlsCompatibility = "default" | "classical";
+interface NetworkScope { failure?: ProviderNetworkError; tlsCompatibility?: ProviderTlsCompatibility }
+const scopes = new AsyncLocalStorage<NetworkScope>();
+let proxySnapshot: Record<string, string> = {};
+let classicalDispatcher: EnvHttpProxyAgent | undefined;
+
+export function providerTlsCompatibility(explicit?: ProviderTlsCompatibility): ProviderTlsCompatibility {
+  const value = explicit ?? process.env.FOLIOLOOM_TLS_COMPATIBILITY ?? "default";
+  if (value !== "default" && value !== "classical") throw new TypeError("TLS compatibility must be default or classical");
+  return value;
+}
+
+function compatibleDispatcher(): EnvHttpProxyAgent {
+  // Explicit opt-in for middleboxes incompatible with hybrid TLS key shares.
+  // Preserve certificate validation and TLS version negotiation, including 1.3.
+  const tls = { ecdhCurve: "X25519:P-256:P-384" };
+  return classicalDispatcher ??= new EnvHttpProxyAgent({
+    httpProxy: proxySnapshot.HTTP_PROXY ?? "", httpsProxy: proxySnapshot.HTTPS_PROXY ?? "",
+    noProxy: proxySnapshot.NO_PROXY ?? "", connect: tls, requestTls: tls, proxyTls: tls,
+  });
+}
 
 /** One process-local snapshot: never mutate the environment or switch active requests to a different route. */
 export function ensureProviderNetwork(): void {
@@ -57,8 +78,10 @@ export function ensureProviderNetwork(): void {
       }
       environment[key] = proxy.toString().replace(/\/$/u, "");
     }
-    if (Object.keys(environment).length) {
-      environment.NO_PROXY = [value("NO_PROXY"), "localhost", "127.0.0.1", "::1", "[::1]"].filter(Boolean).join(",");
+    const hasProxy = Object.keys(environment).length > 0;
+    environment.NO_PROXY = [value("NO_PROXY"), "localhost", "127.0.0.1", "::1", "[::1]"].filter(Boolean).join(",");
+    proxySnapshot = environment;
+    if (hasProxy) {
       const configure = (http as typeof http & { setGlobalProxyFromEnv?: (env: Record<string, string>) => () => void }).setGlobalProxyFromEnv;
       if (!configure) {
         throw new ProviderNetworkError("PROVIDER_PROXY_CONFIGURATION",
@@ -71,9 +94,12 @@ export function ensureProviderNetwork(): void {
   if (globalThis.fetch !== installedFetch) {
     const underlyingFetch = globalThis.fetch;
     installedFetch = async (input, init) => {
-      try { return await underlyingFetch(input, init); }
+      const scope = scopes.getStore();
+      try {
+        const request = scope?.tlsCompatibility === "classical" ? { ...init, dispatcher: compatibleDispatcher() } : init;
+        return await underlyingFetch(input, request);
+      }
       catch (error) {
-        const scope = scopes.getStore();
         const failure = scope && providerNetworkError(error);
         if (scope && failure) { scope.failure = failure; throw failure; }
         throw error;
@@ -83,9 +109,10 @@ export function ensureProviderNetwork(): void {
   }
 }
 
-export function withProviderNetwork<T>(scope: { failure?: ProviderNetworkError }, work: () => T): T {
+export function withProviderNetwork<T>(scope: NetworkScope, work: () => T): T {
   ensureProviderNetwork();
   return scopes.run(scope, work);
 }
 
-export const providerFetch: typeof fetch = (input, init) => withProviderNetwork({}, () => fetch(input, init));
+export const providerFetch = (input: Parameters<typeof fetch>[0], init?: RequestInit, tlsCompatibility?: ProviderTlsCompatibility): Promise<Response> =>
+  withProviderNetwork({ tlsCompatibility: providerTlsCompatibility(tlsCompatibility) }, () => fetch(input, init));

@@ -113,7 +113,7 @@ export function RunWorkspace({
 }: RunWorkspaceProps): JSX.Element {
   const [selectedProfile, setSelectedProfile] =
     useState<DesktopOptimizationProfile>("balanced");
-  const [supervisorEnabled, setSupervisorEnabled] = useState(true);
+  const [supervisorEnabled, setSupervisorEnabled] = useState(false);
   const [deliveryMode, setDeliveryMode] = useState<"standard" | "strict">("standard");
   const [taskContext, setTaskContext] = useState("");
   const run = useMemo(() => currentRun(snapshot), [snapshot]);
@@ -163,29 +163,29 @@ export function RunWorkspace({
             <label className="knowledge-field">
               <span>交付模式</span>
               <select value={deliveryMode} disabled={busy} onChange={event => setDeliveryMode(event.target.value as "standard" | "strict")}>
-                <option value="standard">完整译本＋疑点清单（默认）</option>
-                <option value="strict">严格模式：所有审校通过后交付</option>
+                <option value="standard">完整译本＋运行记录（默认）</option>
+                <option value="strict">严格验收：完整性与用量检查</option>
               </select>
             </label>
-            <p className="workspace-hint">普通模式会自动修复、继续翻译并在书末复核；剩余语义疑点随译本列出。两种模式都要求完整覆盖和真实用量记录。</p>
+            <p className="workspace-hint">默认直接翻译：实体译名持续记录，专用术语按语境参考，普通词不入表；每轮收齐后按原文顺序确定约定，只修复冲突批次，不添加独立模型审校。两种交付模式都保留完整性检查；严格验收还要求用量完整。</p>
             <label className="workspace-copy">
               <input type="checkbox" checked={supervisorEnabled} disabled={busy}
                 onChange={event => setSupervisorEnabled(event.target.checked)} />{" "}
-              启用 Pi 主 agent 监督
+              启用旧式监督审校
             </label>
-            <p className="workspace-hint">主 agent 按批次查证和审校，内核控制预算与提交；模型由内嵌 Pi 直接调用。</p>
+            <p className="workspace-hint">可选旧流程会额外进行模型规划、查证与审校。已有任务继续沿用创建时的流程。</p>
             <label className="knowledge-field">
               <span>任务背景前缀</span>
               <textarea value={taskContext} maxLength={16000} rows={3} disabled={busy}
                 placeholder="例如：原文由使用者提供，仅供个人阅读。请忠实保留作品的原意和叙述声音。"
                 onChange={event => setTaskContext(event.target.value)} />
             </label>
-            <p className="workspace-hint">背景会发送给翻译、修复和监督模型，并随运行保存；续跑沿用原背景。</p>
+            <p className="workspace-hint">背景随翻译请求发送；续跑沿用原背景和译名约定。</p>
             <button
               className="primary-button"
               type="button"
               disabled={!modelReady || busy}
-              onClick={() => onStart(selectedProfile, { deliveryMode, supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
+              onClick={() => onStart(selectedProfile, { workflow: supervisorEnabled ? "supervised" : "direct", deliveryMode, supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
             >
               {busy ? "正在启动" : "开始整本翻译"}
             </button>

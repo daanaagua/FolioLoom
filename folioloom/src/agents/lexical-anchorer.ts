@@ -20,7 +20,7 @@ import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { createLexicalPreference } from "../knowledge/lexical-preference.js";
 import { collectEnglishContextualTermCandidates, isEnglishPronounContraction } from "../language/contextual-term-candidates.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
-import type { SourceLanguageProfile } from "../language/types.js";
+import type { ProfileAnchorCandidate, SourceLanguageProfile } from "../language/types.js";
 import { sourceTextForTranslation } from "../source/layout-separators.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import { assertNotAborted, Type, type TypedToolSpec } from "../tools/tool-spec.js";
@@ -41,6 +41,7 @@ export interface AnchorCandidate {
   currentWaveOccurrences?: number;
   documentFrequency?: number;
   morphologyDiversity?: number;
+  relatedSourceForms?: ProfileAnchorCandidate["relatedSourceForms"];
 }
 
 export type LexicalAnchorSemanticClass =
@@ -146,6 +147,22 @@ function hasIndependentConceptEvidence(
   return false;
 }
 
+/** Discovery support may retain a soft sense; it never increases exact-form concept evidence. */
+function hasSpecializedPreferenceEvidence(candidate: AnchorCandidate | undefined): boolean {
+  if (!candidate?.contexts.length) return false;
+  if ((candidate.corpusFrequency ?? 0) >= 2) return true;
+  if (candidate.discoveryKind !== "recurrent_noun" || candidate.corpusFrequency !== 1) return false;
+  const grounded = (form: string, contexts: readonly string[]) => {
+    const literal = form.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])${literal}(?![\\p{L}\\p{N}_])`, "iu");
+    return contexts.some(context => pattern.test(context));
+  };
+  return grounded(candidate.sourceForm, candidate.contexts)
+    && (candidate.relatedSourceForms ?? []).some(related => related.sourceForm !== candidate.sourceForm
+      && Number.isSafeInteger(related.corpusFrequency) && related.corpusFrequency >= 2
+      && grounded(related.sourceForm, related.contexts));
+}
+
 function lexicalAnchorParameters() {
   return Type.Object({
     anchors: Type.Array(Type.Object({
@@ -213,6 +230,7 @@ export function prepareLexicalAnchorRequest(
         "For sourceAuthoredTarget, copy that printed Hanja/Chinese target exactly; the harness will normalize its Chinese script.",
         "Do not infer aliases or entity identity in this compatibility path. Every returned binding is only a preferred rendering, never a hard constraint.",
         "Preserve source spellings; do not correct suspected typos or OCR errors.",
+        "relatedSourceForms are attested possible inflections for read-only comparison, not established aliases. Classify only the supplied candidate forms; use a shared preferred rendering only when their contexts support the same sense. Do not merge distinct senses or manufacture a binding for a supporting form.",
         "Inside the exact response frame, emit one JSON array and nothing else. Each item must contain sourceForm, target, semanticClass, and mode (stable or contextual). For technical_term, also give brief meaning and usageScope (each at most 240 characters) and optionally allowedTargets (up to four concise short forms, not rival translations).",
         "semanticClass must be proper_name, unique_title, technical_term, or role. Use role for a profession, office, or institutional function whose Chinese wording may vary by sentence. Preserve contextual modes and genuine sense-specific variants.",
       ].join("\n"),
@@ -245,6 +263,7 @@ export function prepareLexicalAnchorRequest(
       "Book-specific building, institutional and ritual nouns can be technical_term even when lowercase. Use contextual mode when a place word also denotes its service or activity; do not force the literal building label into that use.",
       "For technical_term, include a brief meaning and usageScope describing which sense/object the target names; optionally list concise allowedTargets for genuine short forms. Do not list rival translations as interchangeable aliases. These fields share this call and do not authorize global replacement. Establish source-grounded preferences directly, keeping distinct senses and contextual usage explicit.",
       "Preserve source spellings. Do not correct suspected typos or OCR errors, or infer alias links from a presumed spelling mistake.",
+      "relatedSourceForms are attested possible inflections for read-only comparison, not established aliases. Classify each supplied exact form; use a shared preferred rendering only when their contexts support the same sense. Different senses stay separate. A supporting form is not an additional candidate or an entity-identity claim.",
       "Write every Chinese target in Simplified Chinese (zh-Hans); the harness will normalize model-created targets before persistence.",
       "Mark ordinary words and forms of address as contextual. A role may also be contextual while remaining translator-visible semantic knowledge.",
       "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
@@ -453,7 +472,7 @@ export function parseLexicalPreferredFallbackResponse(
     anchors,
     entityLinks: [],
     terms: anchors.map(anchor => anchor.semanticClass === "technical_term"
-      && (candidateByForm.get(profile.normalizeSourceForm(anchor.sourceForm))?.corpusFrequency ?? 0) >= 2
+      && hasSpecializedPreferenceEvidence(candidateByForm.get(profile.normalizeSourceForm(anchor.sourceForm)))
       && anchor.sourceContexts?.length
       ? createLexicalPreference({ ...anchor, contexts: anchor.sourceContexts }) : anchorAsTerm(anchor)),
   };
@@ -544,6 +563,7 @@ export function collectWindowAnchorCandidates(
     currentWaveOccurrences: candidate.currentWaveOccurrences,
     documentFrequency: candidate.documentFrequency,
     morphologyDiversity: candidate.morphologyDiversity,
+    ...(candidate.relatedSourceForms ? { relatedSourceForms: candidate.relatedSourceForms } : {}),
   }));
 }
 
@@ -705,7 +725,7 @@ export class LexicalAnchorer {
           const normalizedSource = profile.normalizeSourceForm(anchor.sourceForm);
           const candidate = candidateByForm.get(normalizedSource);
           if (anchor.semanticClass === "technical_term"
-            && (candidate?.corpusFrequency ?? 0) >= 2 && candidate?.contexts.length
+            && hasSpecializedPreferenceEvidence(candidate)
             && anchor.target.trim()) specializedPreferenceForms.add(normalizedSource);
           let semanticClass = anchor.semanticClass ?? "unclassified";
           if (CONCEPT_ELIGIBLE_CLASSES.has(semanticClass)

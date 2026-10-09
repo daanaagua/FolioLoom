@@ -302,6 +302,7 @@ export interface DesktopFullBookSnapshot {
 }
 
 export interface DesktopStartFullBookRequest {
+  workflow?: "direct" | "supervised";
   deliveryMode?: "standard" | "strict";
   optimizationProfile: DesktopOptimizationProfile;
   supervisorMode?: "bounded" | "off";

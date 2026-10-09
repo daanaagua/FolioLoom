@@ -1,5 +1,5 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
-import { providerFetch, ProviderNetworkError, providerNetworkError } from "./network.js";
+import { providerFetch, ProviderNetworkError, providerNetworkError, type ProviderTlsCompatibility } from "./network.js";
 
 export interface ProviderConnectionReport {
   readonly httpStatus: number;
@@ -20,7 +20,7 @@ export async function preflightProviderStream(streamFn: StreamFn, signal?: Abort
   await checks.get(streamFn)?.(signal, fresh);
 }
 
-export function createProviderPreflight(baseUrl: string, credential: string, timeoutMs = 15_000): Preflight {
+export function createProviderPreflight(baseUrl: string, credential: string, timeoutMs = 15_000, tlsCompatibility?: ProviderTlsCompatibility): Preflight {
   const pending = new Map<AbortSignal | undefined, Promise<ProviderConnectionReport>>();
   let successful: ProviderConnectionReport | undefined;
   const execute = async (signal?: AbortSignal): Promise<ProviderConnectionReport> => {
@@ -30,7 +30,7 @@ export function createProviderPreflight(baseUrl: string, credential: string, tim
       const response = await providerFetch(`${baseUrl.replace(/\/$/u, "")}/models`, {
         method: "GET", headers: { Authorization: `Bearer ${credential}` }, redirect: "error",
         signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
-      });
+      }, tlsCompatibility);
       await response.body?.cancel();
       if (response.ok || response.status === 404 || response.status === 405) {
         return { httpStatus: response.status, catalog: response.ok ? "available" : "unsupported" };

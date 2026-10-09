@@ -33,7 +33,23 @@ Runtime decorators can retain this startup contract with
 `inheritProviderPreflight(originalStream, wrappedStream)`. Custom integrations can
 also explicitly await `runtime.preflight()` before dispatching their own work.
 
-## Certificate failures
+## Explicit handshake compatibility
+
+Some proxy routes cannot reliably carry the default hybrid TLS key share. After
+confirming that failure separately from authentication and certificate errors,
+set `FOLIOLOOM_TLS_COMPATIBILITY=classical` for the FolioLoom process, or pass
+`tlsCompatibility: "classical"` to `createProviderRuntime`. The default remains
+`default`; unknown values are rejected. A runtime captures its selection once.
+
+Classical mode offers X25519, P-256 and P-384 for the selected provider requests.
+It opts out of hybrid/post-quantum key exchange on those requests, but retains
+TLS version negotiation (including TLS 1.3), hostname checks and certificate
+validation. It uses the existing proxy snapshot and loopback exclusions, does not
+change global TLS defaults, and cannot change an unrelated concurrent request's
+transport. Preflight and generation use the same selected compatibility policy.
+This is an explicit compatibility option, not an automatic retry or TLS fallback.
+
+## Certificate validation failures
 
 Certificate validation remains enabled. Nested TLS failures such as
 `SELF_SIGNED_CERT_IN_CHAIN`, expired certificates, and hostname mismatches retain

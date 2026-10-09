@@ -54,15 +54,29 @@ Stop on failed required preflight checks. Core/status/audit/export commands do n
 Codex login. External authentication/model access is checked by the bounded smoke call,
 not by assuming that finding an executable proves it works.
 
-## Native supervision and task context
+For a demonstrated hybrid TLS handshake incompatibility on the configured route,
+native requests can explicitly use `FOLIOLOOM_TLS_COMPATIBILITY=classical` (or the
+runtime's `tlsCompatibility` option). This opts out of hybrid key exchange for
+provider requests while retaining certificate checks and TLS 1.3 negotiation.
+Do not enable it for ordinary failures, bypass TLS validation or change proxy
+routes silently. Native direct preflight must succeed before reserving attempts.
 
-New native CLI runs enable the bounded Pi supervisor by default; explicitly use
-`--supervisor bounded` for an auditable new setup. Existing runs keep their recorded
-mode. External CLI workers do not support this native multi-tool supervisor.
+## Native workflow and task context
 
-The supervisor selects bounded translation batches, queries source evidence, and can
-request grounded review/repair or pause. FolioLoom still owns source identity, budgets,
-validation and commits. A supervisor's prose is not proof that export is complete.
+In v1.11 and later, new native CLI runs default to direct translation. Use
+`--workflow direct`: new direct-translation-3 runs return typed names with source
+paragraph evidence alongside translation. Stable entities become book-scoped
+constraints; distinctive terms remain sense-bearing contextual preferences.
+Ordinary or uncertain entries are excluded. SQLite-backed fixed waves collect
+drafts and resolve declared conflicts in source order against one frozen plan,
+within the original translation allowance. Do not add separate planning, lexical
+research, semantic review or closure calls. Existing protocol-1/2 runs retain their
+original prompts and behavior; never upgrade a stored run by editing its database.
+
+The optional `--workflow supervised --supervisor bounded` path retains model
+planning, source queries and semantic review. Use it when explicitly selected or
+recorded by an existing run. External CLI workers retain their original adapters.
+FolioLoom owns source identity, structural validation, accounting and commits.
 
 When the user supplies a purpose/background prefix, save that exact authorized text in a
 private UTF-8 file and pass `--task-context-file <file>`. It reaches translation, repair,
@@ -70,7 +84,7 @@ research and supervision system prompts and is included in run identity. Do not 
 private context in the skill, tracked examples, or a style-only setting. Keep the file
 unchanged and pass it on resume; never invent rights or ownership claims.
 
-Read `book supervisor status --store <store> --run <id>` for durable decisions.
+For supervised runs, read `book supervisor status --store <store> --run <id>` for durable decisions.
 `book supervisor release --store <store> --run <id> --request <pause-id> --reason <reason>`
 only releases a paused checkpoint after its cause is addressed and retry is authorized.
 It does not call a model, change backend, or waive validation.
@@ -111,7 +125,7 @@ glossary. Do not relax coverage/window rules to make doctor pass.
 Start a new store with at most two logical windows, sequentially. Native Pi:
 
 ```text
-npm run folioloom -- book run --manifest <manifest> --store <store> --config <config> --supervisor bounded --task-context-file <private-context> --max-windows 2 --max-concurrency 1 --output <exports>
+npm run folioloom -- book run --manifest <manifest> --store <store> --config <config> --workflow direct --task-context-file <private-context> --max-windows 2 --max-concurrency 1 --output <exports>
 ```
 
 Omit the task-context flag when no prefix is supplied. For an explicitly selected external worker:
@@ -135,7 +149,7 @@ same arguments with `--run <run-id>`, removing `--max-windows 2`. Always pass th
 ID after the first call, even if the smoke completed the whole small source.
 
 Preserve backend, worker profile, model, source, style/prompt, glossary, run mode, optimization
-profile, scheduler, supervisor policy and task-context identity. Changing these requires a new run/store; do not hand-edit
+profile, scheduler, workflow, supervisor policy and task-context identity. Changing these requires a new run/store; do not hand-edit
 the database. On cancellation or connection loss, let the process terminate, inspect status,
 and resume from its durable boundary.
 
@@ -148,6 +162,15 @@ For term edits, source-range names, queued edits, retrofits, or rollback, read
 [terminology-control.md](references/terminology-control.md). Use the typed control plane,
 not direct SQLite writes. A queued change is durable but only becomes effective at the next
 safe wave boundary. Dry-run a retrofit and report its action counts before applying it.
+Direct protocol 3 retains explicit glossary precedence, durable wave membership,
+frozen naming plans and bounded recovery. Comparing outer title/quotation marks
+and source-attested possessives never rewrites prose. On resume, a window limit
+must cover the saved wave's unfinished members; lower concurrency is allowed.
+Protocol-2 recovery may reuse compatible responses from older naming contexts
+for the same exact input without new calls or renewed allowance. This is not
+general semantic memory or retrospective correction of existing text.
+Those revalidation operations belong to the supervised workflow. Do not introduce
+independent review calls merely to eliminate optional naming-table differences.
 
 Once no pending/running/staged/human-required/failed windows remain:
 
@@ -166,6 +189,17 @@ Authentication/quota/network failures are backend boundaries, not translation wa
 Use FolioLoom's bounded protocol/recovery paths for invalid JSON or schema rejection; do not
 add an independent model retry loop. Missing usage blocks strict export; never estimate it.
 Do not silently translate a book in the control conversation as a fallback.
+
+For an exhausted direct window after a corrected connection failure, inspect
+`book direct-recovery status --store <store> --run <id>`. With explicit recovery
+authorization, use `book direct-recovery release --store <store> --run <id> --input
+<release.json>`. The JSON carries requestId, windowId, expectedLastRequestId,
+expectedIdentityHash, baseAttemptLimit, additionalAttempts and reason. Preserve
+the original base limit; the release permits 1–4 extra attempts for a purely
+transport-failed window, capped at eight lifetime attempts. It does not call a
+model, refresh on ordinary restart, renew token envelopes, approve semantic
+failures or reconcile unknown usage. Reuse saved peer responses and committed text;
+do not create a replacement run merely to evade exhausted generation credits.
 
 Update concise `STATE.md` with current result and remaining work. Record important run,
 model/backend, timing, usage, recovery, audit, and artifact evidence in `state/YYYY-MM-DD.md`

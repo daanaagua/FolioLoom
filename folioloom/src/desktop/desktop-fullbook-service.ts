@@ -88,6 +88,7 @@ interface NormalizedProject {
 }
 
 interface FullBookMetadata {
+  workflow?: "direct" | "supervised";
   supervisorMode?: "bounded" | "off";
   taskContext?: string;
   schema: typeof FULLBOOK_SCHEMA;
@@ -112,6 +113,7 @@ interface RunOverlay {
 }
 
 interface ActiveFullBookTask {
+  workflow?: "direct" | "supervised";
   deliveryMode?: "standard" | "strict";
   supervisorMode?: "bounded" | "off";
   taskContext?: string;
@@ -251,6 +253,7 @@ function fullBookMetadata(value: unknown): FullBookMetadata | undefined {
   }
   return {
     schema: FULLBOOK_SCHEMA,
+    ...(item.workflow === "direct" || item.workflow === "supervised" ? { workflow: item.workflow } : {}),
     ...(item.supervisorMode === "bounded" || item.supervisorMode === "off" ? { supervisorMode: item.supervisorMode } : {}),
     ...(typeof item.taskContext === "string" ? { taskContext: item.taskContext } : {}),
     mode: item.mode,
@@ -524,7 +527,10 @@ export class DesktopFullBookService {
       request?.optimizationProfile,
     );
     const mode = modeForOptimizationProfile(optimizationProfile);
-    const supervisorMode = request.supervisorMode ?? "bounded";
+    const workflow = request.workflow ?? (request.supervisorMode === "bounded" ? "supervised" : "direct");
+    if (workflow !== "direct" && workflow !== "supervised") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "invalid translation workflow");
+    const supervisorMode = request.supervisorMode ?? (workflow === "direct" ? "off" : "bounded");
+    if (workflow === "direct" && supervisorMode === "bounded") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "direct workflow has no supervisor");
     const deliveryMode = request.deliveryMode ?? "standard";
     if (deliveryMode !== "standard" && deliveryMode !== "strict") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "invalid delivery mode");
     if (supervisorMode !== "bounded" && supervisorMode !== "off") throw new DesktopFullBookError("DESKTOP_FULLBOOK_INPUT_INVALID", "invalid supervisor mode");
@@ -545,6 +551,7 @@ export class DesktopFullBookService {
       "active",
     );
     task.supervisorMode = supervisorMode;
+    task.workflow = workflow;
     task.deliveryMode = deliveryMode;
     task.taskContext = request.taskContext;
     try {
@@ -565,6 +572,7 @@ export class DesktopFullBookService {
         plan.fingerprint,
       );
       metadata.desktopFullBook.supervisorMode = supervisorMode;
+      metadata.desktopFullBook.workflow = workflow;
       if (request.taskContext !== undefined) metadata.desktopFullBook.taskContext = request.taskContext;
       return this.#launch(task, plan, {
         runId,
@@ -632,6 +640,7 @@ export class DesktopFullBookService {
       storedRun.modelId,
     );
     task.supervisorMode = metadata.supervisorMode ?? "off";
+    task.workflow = metadata.workflow ?? "supervised";
     task.taskContext = metadata.taskContext;
     try {
       const plan = runtimePlan(metadata.mode, await this.#runtime.resolve());
@@ -813,6 +822,7 @@ export class DesktopFullBookService {
     let running: Promise<LosslessBookRunResult>;
     try {
       running = this.#runBook({
+        workflow: task.workflow,
         supervisorMode: task.supervisorMode ?? "off",
         deliveryMode: task.deliveryMode,
         ...(task.taskContext === undefined ? {} : { taskContext: task.taskContext }),

@@ -13,6 +13,7 @@ import { priorQualityIssues, type QualityClosure } from "../domain/quality-closu
 import type { SurfaceConsistencyEvidence } from "../knowledge/surface-consistency.js";
 import { reviewFocus } from "./review-focus.js";
 import { searchSupervisorTargets } from "../agents/supervisor-target-context.js";
+import type { SourceExecutionPlan } from "./source-execution-plan.js";
 
 export class SupervisionPausedError extends Error {
   readonly code = "SUPERVISION_PAUSED";
@@ -46,6 +47,7 @@ interface SupervisionJournal {
   appendSupervisionRecord(runId: string, record: SupervisionRecord): void;
 }
 export interface SupervisionControllerOptions {
+  sourcePlan?: SourceExecutionPlan;
   recovery?: AutomaticRecovery;
   maxConcurrency?: number;
   runId: string;
@@ -147,6 +149,33 @@ export class SupervisionController {
       }
       return this.#decide(input, conflictHash, this.#dependencyHash(terms, windows));
     });
+  }
+
+  /** Authorize the immutable source plan without asking the model for a planning judgment. */
+  planSourceFrontier(windowIds: readonly string[], terms: SupervisorInput["terms"]): void {
+    const plan = this.options.sourcePlan;
+    if (!plan || plan.sourceVersion !== this.options.sourceVersion) throw new Error("source execution plan required");
+    if (!windowIds.length || new Set(windowIds).size !== windowIds.length) throw new Error("invalid source frontier");
+    const frontier = plan.frontiers.find(f => windowIds.every(id => f.windowIds.includes(id)));
+    if (!frontier) throw new Error("source frontier outside plan");
+    for (const windowId of windowIds) {
+      this.options.signal?.throwIfAborted(); this.#checkPaused(windowId);
+      const window = this.options.windows.find(w => w.windowId === windowId);
+      const policy = plan.windows.find(w => w.windowId === windowId);
+      if (!window || !policy) throw new Error("window outside source execution plan");
+      const sources = window.blockIds.map(blockId => ({ blockId,
+        sourceText: this.options.sources.find(s => s.blockId === blockId)?.sourceText }));
+      if (supervisionHash(sources) !== policy.sourceHash) throw new Error("source execution plan hash mismatch");
+      const dependencyHash = this.#dependencyHash(terms, [window]);
+      const inputHash = supervisionHash({ planId: plan.id, windowId, dependencyHash });
+      if (this.#records().some(r => r.origin === "host_source_plan" && r.inputHash === inputHash && r.state === "completed")) continue;
+      this.#append({ id: `source-plan:${inputHash}`, key: `source-plan:${windowId}`, event: "plan", state: "completed",
+        origin: "host_source_plan", windowIds: [windowId], inputHash, dependencyHash,
+        windowDependencyHashes: { [windowId]: dependencyHash }, modelCalls: 0, totalTokens: 0, usageComplete: true,
+        decision: { action: "translate", windowIds: [windowId], reviewBlockIds: policy.reviewBlockIds,
+          guidance: [], issues: [], reason: policy.risks.length ? "Source boundary check; complete chapter review remains required."
+            : "Source-planned translation; semantic review at the complete chapter barrier." } });
+    }
   }
 
   guidanceFor(windowIds: readonly string[], terms?: SupervisorInput["terms"]): SupervisorDecision["guidance"] {

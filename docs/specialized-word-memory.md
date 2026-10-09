@@ -6,6 +6,23 @@ existing sixteen-candidate wave budget. Possessives and short adjective sequence
 are supported; ordinary words still require semantic classification and are not
 automatically promoted by repetition.
 
+English discovery also recognizes bounded compound modifiers, plural group phrases
+and contracted auxiliaries. Attested regular `-s`, `-es` and consonant-`y/-ies` pairs
+can support the repetition threshold without changing either source spelling.
+Exact-form counts, contexts and semantic identities remain separate. Related forms
+are read-only evidence for the existing lexical call, not automatically accepted
+aliases; a form absent from the current wave is not added as a current candidate.
+One of the existing four lowercase slots protects a low-frequency attested
+inflection, prioritizing explicit group evidence. Quantifier-only repetition does
+not suffice without stronger noun evidence. Ordinary people, predicates and
+adjective-only patterns stay outside this discovery channel.
+
+When the model identifies a technical sense, a singleton exact form supported by
+an attested repeated inflection can retain its own grounded soft preference. The
+independent concept threshold still uses exact-form counts. Discovery does not
+infer irregular inflections, repair spelling or enumerate every isolated unmarked
+lowercase word. Existing completed translations are not retroactively rewritten.
+
 The existing lexical call supplies a preferred target, meaning, semantic usage
 scope and optional short forms. Source quotes are attached by the host. Model
 self-ratings are neither requested nor used for admission, reuse or ranking.

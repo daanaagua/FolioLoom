@@ -6,6 +6,12 @@ same explicitly configured model. External workers remain an opt-in compatibilit
 
 ## Responsibilities
 
+With `--planning-mode source`, an immutable host plan replaces model-authored planning.
+Four-window source frontiers feed the active scheduler independently of its slot count.
+Routine window semantic checks move to mandatory complete chapter review; open source
+boundaries and surface conflicts retain local checks. Structural validation, bounded
+repair and strict export gates remain active. See [v1.10.0](releases/v1.10.0.md).
+
 Each native wave resolves lexical anchors before requesting its bounded translation
 plan. Planning and generation share that terminology view; provenance-only revision
 IDs do not create new semantic review work. Meaning, authority, identities and source

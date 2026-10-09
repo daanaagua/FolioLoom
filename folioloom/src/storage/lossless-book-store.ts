@@ -21,6 +21,7 @@ import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import { validateCandidateCheckpoint, type CandidateCheckpointRecord } from "../fullbook/candidate-checkpoint.js";
 import { validateRecoveryRecord, type RecoveryRecord } from "../fullbook/automatic-recovery.js";
 import { QualityQueue, qualityReviewId, validateQualityRecord, type QualityRecord, type QualityReworkRequest, type DeliveryMode } from "../fullbook/delivery-policy.js";
+import { validateDirectRecord, directNameKey, equivalentDirectRendering, type DirectName, type DirectRecord } from "../fullbook/direct-translation.js";
 import { assertQualityClosure, hasChangedIssueEvidence, priorQualityIssues, needsDispositionVerification, type QualityClosure } from "../domain/quality-closure.js";
 import { validateSurfaceObservation, surfaceObservationNoiseReason } from "../knowledge/surface-consistency.js";
 import { MAX_LIFETIME_REVIEWS_PER_WINDOW, SUPERVISION_POLICY, supervisionCandidateHash, supervisorIssueFailures, isProvenUnlaunchedSupervisorFailure } from "../domain/supervision.js";
@@ -6754,6 +6755,55 @@ export class LosslessBookStore {
       if (records.some(r => r.id === record.id)) return;
       new QualityQueue(runId, { qualityRecords: () => [...records, record], appendQualityRecord: () => { throw new Error("read-only validation"); } }).items();
       this.#appendEvent(runId, "quality_record", record);
+  }
+
+  directRecords(runId: string): DirectRecord[] {
+    this.#run(runId);
+    return all<{ payload_json: string }>(this.#database.prepare(
+      "SELECT payload_json FROM events WHERE run_id=? AND kind='direct_translation_record' ORDER BY sequence"), runId)
+      .map(row => { const record = JSON.parse(row.payload_json) as DirectRecord; validateDirectRecord(record); return record; });
+  }
+
+  /** Learned direct-workflow names are a replayable SQLite projection, not semantic revisions. */
+  directNames(runId: string): import("../fullbook/direct-translation.js").DirectName[] {
+    this.#run(runId);
+    const names = new Map<string, import("../fullbook/direct-translation.js").DirectName>();
+    const rows = all<{ payload_json: string }>(this.#database.prepare(
+      "SELECT payload_json FROM events WHERE run_id=? AND kind='direct_translation_record' AND json_extract(payload_json,'$.kind')='names' ORDER BY sequence"), runId);
+    for (const row of rows) {
+      const record = JSON.parse(row.payload_json) as DirectRecord;
+      validateDirectRecord(record);
+      for (const name of record.payload.names as import("../fullbook/direct-translation.js").DirectName[]) {
+        const key = directNameKey(name), prior = names.get(key);
+        if (prior && !equivalentDirectRendering(name.source, prior.target, name.target)) throw new Error("conflicting durable direct names");
+        if (!prior) names.set(key, name);
+      }
+    }
+    return [...names.values()];
+  }
+
+  appendDirectRecord(runId: string, record: DirectRecord): void {
+    validateDirectRecord(record);
+    this.#transaction(() => {
+      this.#run(runId);
+      if (!this.#window(runId, record.windowId)) throw new Error("direct record window outside run");
+      const stored = one<{ payload_json: string }>(this.#database.prepare(
+        "SELECT payload_json FROM events WHERE run_id=? AND kind='direct_translation_record' AND json_extract(payload_json,'$.id')=?"), runId, record.id);
+      const previous = stored ? JSON.parse(stored.payload_json) as DirectRecord : undefined;
+      if (previous) {
+        if (canonicalJson(previous) !== canonicalJson(record)) throw new Error("direct record identity conflict");
+        return;
+      }
+      if (record.kind === "names") {
+        const names = new Map(this.directNames(runId).map(n => [directNameKey(n), n.target]));
+        for (const name of record.payload.names as DirectName[]) {
+          const key = directNameKey(name);
+          if (names.has(key) && !equivalentDirectRendering(name.source, names.get(key)!, name.target)) throw new Error("conflicting durable direct names");
+          names.set(key, name.target);
+        }
+      }
+      this.#appendEvent(runId, "direct_translation_record", record);
+    });
   }
 
   recoveryRecords(runId: string): RecoveryRecord[] {

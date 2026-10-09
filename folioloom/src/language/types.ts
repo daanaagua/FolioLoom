@@ -54,6 +54,8 @@ export interface ProfileAnchorCandidate {
   currentWaveOccurrences: number;
   documentFrequency: number;
   morphologyDiversity: number;
+  /** Attested possible inflections are discovery evidence, never canonical aliases. */
+  relatedSourceForms?: Array<{ sourceForm: string; corpusFrequency: number; contexts: string[] }>;
   score: number;
 }
 

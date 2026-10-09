@@ -30,6 +30,31 @@ import {
 import { auditLosslessBookStore, bookArtifactFileNames } from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
+test("CLI direct recovery requires an explicit bounded release input and supports read-only status", () => {
+  const common = ["--store", "book.db", "--run", "fixture"];
+  assert.equal(parseArgs(["book", "direct-recovery", "status", ...common]).command, "book-direct-recovery-status");
+  assert.equal(parseArgs(["book", "direct-recovery", "release", ...common, "--input", "release.json"]).command, "book-direct-recovery-release");
+  assert.throws(() => parseArgs(["book", "direct-recovery", "release", ...common]), /input/u);
+  assert.throws(() => parseArgs(["book", "direct-recovery", "reset", ...common]), /direct-recovery/u);
+});
+
+test("CLI exposes direct workflow without mixing legacy review policies", () => {
+  const run = ["book", "run", "--manifest", "source_manifest.json", "--store", "book.db", "--config", "model.json"];
+  assert.equal(parseArgs([...run, "--workflow", "direct"]).workflow, "direct");
+  assert.equal(parseArgs([...run, "--workflow", "supervised"]).workflow, "supervised");
+  assert.throws(() => parseArgs([...run, "--workflow", "direct", "--supervisor", "bounded"]), /direct workflow/u);
+  assert.throws(() => parseArgs([...run, "--workflow", "other"]), /workflow/u);
+});
+
+test("CLI source planning requires native complete chapter review", () => {
+  const run = ["book", "run", "--manifest", "source_manifest.json", "--store", "book.db", "--config", "model.json"];
+  assert.equal(parseArgs([...run, "--planning-mode", "source"]).planningMode, "source");
+  assert.equal(parseArgs([...run, "--planning-mode", "source"]).chapterReviewMode, "bounded");
+  assert.throws(() => parseArgs([...run, "--planning-mode", "source", "--chapter-review", "off"]), /source planning/u);
+  assert.throws(() => parseArgs([...run, "--planning-mode", "source", "--supervisor", "off"]), /source planning/u);
+  assert.throws(() => parseArgs([...run, "--planning-mode", "unknown"]), /planning-mode/u);
+});
+
 test("CLI chapter review is explicit, bounded, and native-supervisor only", () => {
   const run = ["book", "run", "--manifest", "source_manifest.json", "--store", "book.db", "--config", "model.json"];
   assert.equal(parseArgs(run).chapterReviewMode, undefined);

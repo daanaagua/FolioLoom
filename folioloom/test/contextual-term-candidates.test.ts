@@ -92,3 +92,98 @@ test("repeated rare objects survive possessives, bounded modifiers, and inflecte
   assert.ok(candidates.length <= 16);
   assert.ok(candidates.filter(c => /^[a-z]/u.test(c.sourceForm)).length <= 4);
 });
+
+test("lowercase group nouns retain exact singular and plural candidates across compound modifiers", () => {
+  const source = blocks([
+    "a worn-out drem waited by the gate. there were a lot more drems around.",
+    "We drems didn't join the gathering.",
+    "all drems of whatever kind remained outside.",
+  ]);
+  const candidates = collectWindowAnchorCandidates(source.slice(0, 1), source, []);
+  for (const [form, count] of [["drem", 1], ["drems", 3]] as const) {
+    const candidate = candidates.find(c => c.sourceForm === form);
+    assert.ok(candidate, `missing exact source form ${form}`);
+    assert.equal(candidate.corpusFrequency, count, "related occurrences must not inflate exact-form evidence");
+    assert.equal(candidate.currentWaveOccurrences, 1);
+    assert.equal(candidate.morphologyDiversity, 2);
+    assert.equal(candidate.discoveryKind, "recurrent_noun");
+    assert.ok(candidate.contexts.every(q => new RegExp(`\\b${form}\\b`, "u").test(q)));
+  }
+  assert.ok(collectWindowAnchorCandidates(source.slice(1, 2), source, []).some(c => c.sourceForm === "drems"));
+});
+
+test("observed regular inflections support discovery without rewriting source spellings", () => {
+  for (const [singular, plural] of [["drem", "drems"], ["nex", "nexes"], ["veldy", "veldies"]]) {
+    const source = blocks([
+      `a soot-stained ${singular} remained inside.`,
+      `We ${plural} didn't enter.`,
+      `all ${plural} of this kind stayed outside.`,
+    ]);
+    const candidates = collectWindowAnchorCandidates(source.slice(0, 1), source, []);
+    const candidate = candidates.find(c => c.sourceForm === singular);
+    assert.ok(candidate, singular);
+    assert.equal(candidate.corpusFrequency, 1);
+    assert.equal(candidate.sourceForm, singular);
+    assert.ok(!candidates.some(c => c.sourceForm === plural), "a remote-only form is supporting context, not a current target");
+    const request = prepareLexicalAnchorRequest({ candidates, stableTerms: [] }, "typed_tool");
+    assert.match(request.prompt, new RegExp(`\\b${plural}\\b`, "u"), "the classifier sees the attested plural context");
+  }
+});
+
+test("established inflections still support an undecided exact form without reopening established names", () => {
+  const source = blocks(["a worn-out drem remained.", "We drems didn't leave.", "all drems of this kind remained."]);
+  const candidates = collectWindowAnchorCandidates(source, source, [], ["drems"]);
+  assert.ok(candidates.some(c => c.sourceForm === "drem"));
+  assert.ok(!candidates.some(c => c.sourceForm === "drems"));
+});
+
+test("group and quantifier cues do not turn common people, verbs or modifiers into rare terms", () => {
+  const source = blocks(Array.from({ length: 4 }, () =>
+    "We teachers didn't leave. all students of this school stayed. more people stood outside. "
+    + "we pass and we discuss. we work and we sleep. more quiet workers stood nearby. a worn-out worker remained."));
+  const candidates = collectWindowAnchorCandidates(source, source, []);
+  for (const form of ["teachers", "students", "people", "pass", "discuss", "work", "sleep", "quiet", "worn-out"]) {
+    assert.ok(!candidates.some(c => c.sourceForm === form), form);
+  }
+  assert.ok(candidates.length <= 16);
+  assert.ok(candidates.filter(c => /^[a-z]/u.test(c.sourceForm)).length <= 4);
+});
+
+test("similar spellings are not treated as inflections and repeated adjectives stay outside noun discovery", () => {
+  const source = blocks([
+    "a worn-out drem remained.", "all drams of this kind remained.", "We drams didn't leave.",
+    "the luminous wall stood. the luminous door opened. the luminous roof remained.",
+  ]);
+  const candidates = collectWindowAnchorCandidates(source, source, []);
+  assert.ok(!candidates.some(c => ["drem", "dram", "luminous"].includes(c.sourceForm)));
+});
+
+test("a low-frequency attested inflection gets bounded space beside frequent noun heads", () => {
+  const source = blocks([
+    "Mira waited. " + "the guildhall stood. the consistory stood. the observatory stood. the lyceum stood. ".repeat(4)
+      + "a worn-out drem waited. there were more drems around.",
+    "We drems didn't enter. all drems of this kind stayed outside.",
+  ]);
+  const candidates = collectWindowAnchorCandidates(source.slice(0, 1), source, []);
+  assert.ok(candidates.some(c => c.sourceForm === "drem"), "frequent heads must not crowd out every inflection-supported singleton");
+  assert.ok(candidates.some(c => c.sourceForm === "Mira"));
+  assert.equal(candidates.filter(c => /^[a-z]/u.test(c.sourceForm)).length, 4);
+});
+
+test("explicit plural group evidence is not crowded out by an incidental singleton inflection", () => {
+  const source = blocks([
+    "the guildhall stood. the consistory stood. the observatory stood. ".repeat(4)
+      + "the fists opened. more drems waited nearby.",
+    "a fist opened. his fist remained. We drems didn't enter.",
+    "a worn-out drem waited. all drems of this kind stayed outside.",
+  ]);
+  const candidates = collectWindowAnchorCandidates(source.slice(0, 1), source, []);
+  assert.ok(candidates.some(c => c.sourceForm === "drems"));
+  assert.ok(candidates.filter(c => /^[a-z]/u.test(c.sourceForm)).length <= 4);
+});
+
+test("quantifier-only boilerplate needs stronger noun evidence before spending a lexical call", () => {
+  const source = blocks(Array.from({ length: 4 }, (_, i) =>
+    `the ordinary apparatus preserves all details in source paragraph ${i}.`));
+  assert.equal(collectWindowAnchorCandidates(source, source, []).length, 0);
+});

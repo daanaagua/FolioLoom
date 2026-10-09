@@ -13,12 +13,92 @@ import { runBook } from "../src/fullbook/book-runner.js";
 import { importSource } from "../src/source/source-importer.js";
 import { bindTaskContext } from "../src/agents/task-context.js";
 import { preflightProviderStream } from "../src/providers/preflight.js";
+import net from "node:net";
+import tls from "node:tls";
 
 function certificateError() {
   return new TypeError("fetch failed", { cause: Object.assign(new Error("fixture-secret certificate failure"),
     { code: "SELF_SIGNED_CERT_IN_CHAIN" }) });
 }
 const profile = { providerId: "deepseek" as const, modelId: "deepseek-flash", reasoningEffort: "high" as const };
+
+test("explicit classical TLS compatibility scopes supported groups and preserves certificate/version defaults", async () => {
+  const originalCurve = tls.DEFAULT_ECDH_CURVE, originalMax = tls.DEFAULT_MAX_VERSION;
+  let groups: number[] | undefined;
+  let versions: number[] | undefined;
+  const server = net.createServer(socket => {
+    let data = Buffer.alloc(0);
+    socket.on("data", chunk => {
+      data = Buffer.concat([data, chunk]);
+      if (data.length < 5 || data.length < 5 + data.readUInt16BE(3)) return;
+      // Inspect only the public supported_groups extension of this local ClientHello.
+      let p = 5 + 4 + 2 + 32;
+      p += 1 + data[p]!;
+      p += 2 + data.readUInt16BE(p);
+      p += 1 + data[p]!;
+      const end = p + 2 + data.readUInt16BE(p); p += 2;
+      while (p < end) {
+        const type = data.readUInt16BE(p), size = data.readUInt16BE(p + 2); p += 4;
+        if (type === 10) groups = Array.from({ length: data.readUInt16BE(p) / 2 }, (_, i) => data.readUInt16BE(p + 2 + 2 * i));
+        if (type === 43) versions = Array.from({ length: data[p]! / 2 }, (_, i) => data.readUInt16BE(p + 1 + 2 * i));
+        p += size;
+      }
+      socket.destroy();
+    });
+    socket.on("error", () => {});
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as net.AddressInfo).port;
+    const runtime = createProviderRuntime(profile, "fixture-secret", {
+      trustedBaseUrl: `https://127.0.0.1:${port}`, tlsCompatibility: "classical",
+    });
+    await assert.rejects(runtime.preflight(AbortSignal.timeout(2_000)));
+    assert.deepEqual(groups, [29, 23, 24], "only X25519, P-256 and P-384 are offered for this runtime");
+    assert.ok(versions?.includes(0x0304), "TLS 1.3 remains offered");
+    assert.equal(tls.DEFAULT_ECDH_CURVE, originalCurve);
+    assert.equal(tls.DEFAULT_MAX_VERSION, originalMax);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test("TLS compatibility is isolated across concurrent streams and unrelated fetches", async () => {
+  const original = globalThis.fetch;
+  const routes: Array<{ selected: boolean; dispatcher: boolean }> = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    routes.push({ selected: body.messages?.at(-1)?.content === "selected", dispatcher: !!(init as any)?.dispatcher });
+    return new Response(JSON.stringify({ error: { message: "fixture", type: "rate_limit" } }), { status: 429 });
+  };
+  try {
+    await Promise.all([true, false].map(async selected => {
+      const runtime = createProviderRuntime(profile, "fixture-secret", { tlsCompatibility: selected ? "classical" : "default" });
+      const stream = await runtime.streamFn(runtime.model, { messages: [{ role: "user", content: selected ? "selected" : "default", timestamp: 0 }] });
+      await stream.result();
+    }));
+    await fetch("https://unrelated.invalid");
+    assert.deepEqual(routes.toSorted((a, b) => Number(b.selected) - Number(a.selected)), [
+      { selected: true, dispatcher: true }, { selected: false, dispatcher: false }, { selected: false, dispatcher: false },
+    ]);
+  } finally { globalThis.fetch = original; }
+});
+
+test("direct preflight rejects before opening a store or spending an attempt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "folioloom-direct-preflight-"));
+  const source = join(root, "source.txt"), storePath = join(root, "book.db");
+  writeFileSync(source, "The visitor waited by the door.", "utf8");
+  const imported = await importSource({ sourcePath: source, projectDirectory: join(root, "project"), sourceLanguage: "en" });
+  const original = globalThis.fetch; let calls = 0;
+  globalThis.fetch = async () => { calls++; throw certificateError(); };
+  try {
+    const runtime = createProviderRuntime(profile, "fixture-secret");
+    await assert.rejects(runBook({ workflow: "direct", manifestPath: imported.manifestPath, storePath,
+      runMeta: { runId: "direct-preflight", protocolVersion: "fixture", modelId: profile.modelId },
+      model: runtime.model, streamFn: runtime.streamFn }), (e: any) => e.code === "PROVIDER_TLS");
+    assert.equal(calls, 1);
+    assert.equal(existsSync(storePath), false);
+    assert.equal(existsSync(storePath + ".run.lock"), false);
+  } finally { globalThis.fetch = original; }
+});
 
 test("certificate failures are terminal and model discovery does not mask them with fallback", async () => {
   await assert.rejects(providerRegistry.discoverModels({ profile, credential: "fixture-secret",
