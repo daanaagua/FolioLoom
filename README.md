@@ -6,13 +6,13 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.12.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.12.1**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-v1.12.0 ships direct generation as the default for new native full-book tasks, with scoped connection recovery and updated build dependencies. New direct-protocol-3 runs learn typed, source-attested names alongside translation: stable entities become naming constraints, distinctive terms remain contextual preferences, and ordinary words are excluded. SQLite-backed fixed waves resolve declared conflicts against a frozen naming plan. No model planning, lexical research, semantic review or quality-closure loop runs on this path. Existing runs retain their recorded workflow and protocol. See the [release notes](docs/releases/v1.12.0.md) and [direct translation](docs/direct-translation.md).
+v1.12.1 raises the default direct-window allowance from four to eight provider attempts, retaining saved responses and request counts on resume. Direct generation ships as the default for new native full-book tasks, with scoped connection recovery and updated build dependencies. New direct-protocol-3 runs learn typed, source-attested names alongside translation: stable entities become naming constraints, distinctive terms remain contextual preferences, and ordinary words are excluded. SQLite-backed fixed waves resolve declared conflicts against a frozen naming plan. No model planning, lexical research, semantic review or quality-closure loop runs on this path. Existing runs retain their recorded workflow and protocol. See the [release notes](docs/releases/v1.12.1.md) and [direct translation](docs/direct-translation.md).
 
 - ✓ **Partial mitigation for DeepSeek's mistaken copyright refusals:** caller-supplied source and usage context can now accompany translation, research, repair and supervision through the desktop task-context field or `--task-context-file`. Clear, truthful context helps address refusals based on unsupported assumptions about the task. This is a prompt-context correction, not a change to DeepSeek's policies or a guarantee against future refusals; it does not infer rights or invent authorization.
 
-## What v1.12.0 can do
+## What v1.12.1 can do
 
 New CLI tasks use `--workflow direct` by default; the desktop offers the same path with legacy supervision disabled. Structural validation, durable responses, bounded transport recovery and export remain active. The advanced supervision, evolving knowledge and revalidation features below remain available through `--workflow supervised` and existing runs.
 

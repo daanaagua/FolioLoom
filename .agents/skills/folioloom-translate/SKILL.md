@@ -190,13 +190,20 @@ Use FolioLoom's bounded protocol/recovery paths for invalid JSON or schema rejec
 add an independent model retry loop. Missing usage blocks strict export; never estimate it.
 Do not silently translate a book in the control conversation as a fallback.
 
+Native direct windows default to eight provider attempts, including split fragments.
+When the user explicitly authorizes a larger generation allowance, resume the same
+run with `--max-attempts <1-16>`; existing requests still count, saved valid responses
+remain reusable, and an existing token envelope is not renewed. Do not reset the
+store or repeat successful work. Existing transport grants retain their recorded
+base limit when the flag is omitted; do not replace that policy through an override.
+
 For an exhausted direct window after a corrected connection failure, inspect
 `book direct-recovery status --store <store> --run <id>`. With explicit recovery
 authorization, use `book direct-recovery release --store <store> --run <id> --input
 <release.json>`. The JSON carries requestId, windowId, expectedLastRequestId,
 expectedIdentityHash, baseAttemptLimit, additionalAttempts and reason. Preserve
 the original base limit; the release permits 1–4 extra attempts for a purely
-transport-failed window, capped at eight lifetime attempts. It does not call a
+transport-failed window, capped at sixteen lifetime attempts. It does not call a
 model, refresh on ordinary restart, renew token envelopes, approve semantic
 failures or reconcile unknown usage. Reuse saved peer responses and committed text;
 do not create a replacement run merely to evade exhausted generation credits.

@@ -13,7 +13,7 @@ import { loadGlossary } from "../src/glossary/glossary-profile.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { directHash, directNameCandidates, DIRECT_SYSTEM_PROMPT, DIRECT_TRANSLATION_VERSION, DIRECT_MEMORY_VERSION, DIRECT_MEMORY_SYSTEM_PROMPT } from "../src/fullbook/direct-translation.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
-import { releaseDirectTransportRecovery, type DirectTransportRelease } from "../src/fullbook/direct-recovery.js";
+import { directRecoveryStatus, releaseDirectTransportRecovery, type DirectTransportRelease } from "../src/fullbook/direct-recovery.js";
 import { RunLease } from "../src/kernel/run-lease.js";
 
 function releaseRequest(path: string, baseAttemptLimit = 1): DirectTransportRelease {
@@ -36,13 +36,88 @@ test("explicit transport release adds only its bounded durable allowance and pre
   const request = releaseRequest(options.storePath);
   releaseDirectTransportRecovery(options.storePath, "direct", request);
   releaseDirectTransportRecovery(options.storePath, "direct", request);
-  const result = await runBook(options);
+  const result = await runBook({ ...options, maxAttempts: undefined });
   assert.equal(result.status.completedWindows, 1); assert.equal(f.faux.state.callCount, 2);
   const db = LosslessBookStore.openReadOnly(options.storePath);
   try {
     assert.equal(db.directRecords("direct").filter(r => r.kind === "transport_release").length, 1);
+    assert.equal(directRecoveryStatus(db, "direct").baseAttemptLimit, 1);
     assert.equal(db.loadTokenLedgerEvents("direct").filter(e => e.type === "settled" && !e.usageComplete).length, 1);
     assert.equal(auditLosslessBookExport(db, "direct").audit.strictExportable, false);
+  } finally { db.close(); }
+});
+
+test("eight default attempts resume nested splits without regenerating successful subgroups", async () => {
+  const root = mkdtempSync(join(tmpdir(), "folioloom-direct-splits-"));
+  const source = join(root, "source.txt");
+  writeFileSync(source, Array.from({ length: 8 }, (_, i) => `Mira waited beside gate number ${i + 1}.`).join("\n\n"), "utf8");
+  const imported = await importSource({ sourcePath: source, projectDirectory: join(root, "project"), sourceLanguage: "en" });
+  const faux = fauxProvider();
+  const requested: string[][] = [];
+  faux.setResponses(Array.from({ length: 16 }, () => (context: Context) => {
+    const p = payload(context);
+    requested.push(p.paragraphs.map(([id]: [string]) => id));
+    if (p.paragraphs.length > 2) return fauxAssistantMessage("{truncated");
+    return fauxAssistantMessage(JSON.stringify({ paragraphs: p.paragraphs.map(([id]: [string]) => [id, "米拉在门边等候。"]), names: [] }));
+  }));
+  const options = { workflow: "direct" as const, manifestPath: imported.manifestPath, storePath: join(root, "book.db"),
+    runMeta: { runId: "direct", protocolVersion: "test" }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
+    maxWindows: 1, maxConcurrency: 1, schedulerMode: "active" as const };
+  await assert.rejects(() => runBook({ ...options, maxAttempts: 4 }), /DIRECT_RECOVERY_PAUSED/u);
+  assert.deepEqual(requested.map(p => p.length), [8, 4, 2, 2]);
+  let db = LosslessBookStore.openReadOnly(options.storePath);
+  const saved = db.directRecords("direct").filter(r => r.kind === "response");
+  const oldIdentity = (db.listTranslationRuns()[0]!.metadata as any).workflow.identityHash;
+  db.close();
+  const result = await runBook(options);
+  assert.equal(result.status.completedWindows, 1);
+  assert.deepEqual(requested.map(p => p.length), [8, 4, 2, 2, 4, 2, 2]);
+  assert.equal(new Set(requested.filter(p => p.length === 2).map(p => JSON.stringify(p))).size, 4);
+  db = LosslessBookStore.openReadOnly(options.storePath);
+  try {
+    assert.equal((db.listTranslationRuns()[0]!.metadata as any).workflow.identityHash, oldIdentity);
+    assert.deepEqual(db.directRecords("direct").filter(r => saved.some(s => s.id === r.id)), saved);
+    assert.equal(db.loadTokenLedgerEvents("direct").filter(e => e.type === "settled").length, 7);
+    assert.equal(auditLosslessBookExport(db, "direct").audit.strictExportable, true);
+    assert.equal(directRecoveryStatus(db, "direct").baseAttemptLimit, 8);
+  } finally { db.close(); }
+  await runBook(options);
+  assert.equal(requested.length, 7);
+  await assert.rejects(() => runBook({ ...options, maxAttempts: 17 }), /cannot exceed 16/u);
+});
+
+test("transport recovery remains bounded at sixteen lifetime attempts", async () => {
+  const f = await fixture(false, false, false);
+  f.faux.setResponses([() => { throw new Error("Connection error."); }]);
+  await assert.rejects(() => runBook({ ...f.options, maxWindows: 1, maxAttempts: 1 }), /DIRECT_RECOVERY_PAUSED/u);
+  const request = releaseRequest(f.options.storePath, 8);
+  const seedThrough = (end: number) => {
+    const db = new LosslessBookStore(f.options.storePath);
+    try {
+      const count = db.directRecords("direct").filter(r => r.kind === "request").length;
+      for (let i = count; i < end; i++) {
+        const id = `synthetic-transport-${i}`;
+        db.appendDirectRecord("direct", { id, kind: "request", windowId: request.windowId, key: directHash(id), at: i, payload: {} });
+        db.appendDirectRecord("direct", { id: `${id}:response`, kind: "response", windowId: request.windowId, key: directHash(id), at: i,
+          payload: { requestId: id, stopReason: "error" } });
+      }
+    } finally { db.close(); }
+  };
+  for (const attempts of [8, 12]) {
+    seedThrough(attempts);
+    const current = releaseRequest(f.options.storePath, 8);
+    const grant = releaseDirectTransportRecovery(f.options.storePath, "direct", { ...current, requestId: `grant-${attempts}`, additionalAttempts: 4 });
+    assert.equal(grant.payload.attemptCeiling, attempts + 4);
+  }
+  seedThrough(16);
+  const last = releaseRequest(f.options.storePath, 8);
+  assert.throws(() => releaseDirectTransportRecovery(f.options.storePath, "direct", { ...last, requestId: "over-cap" }), /lifetime attempt cap/u);
+  const db = LosslessBookStore.openReadOnly(f.options.storePath);
+  try {
+    const status = directRecoveryStatus(db, "direct");
+    assert.equal(status.lifetimeAttemptCap, 16);
+    assert.equal(status.windows[0]!.releaseEligible, false);
+    assert.equal(status.windows[0]!.remaining, 0);
   } finally { db.close(); }
 });
 
