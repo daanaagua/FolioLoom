@@ -19,7 +19,7 @@ import type { LedgerEvent } from "./token-ledger.js";
 import { emptyRevalidationDrainReport } from "./revalidation-executor.js";
 import { DirectNameWave } from "./direct-name-wave.js";
 import { preflightProviderStream } from "../providers/preflight.js";
-import { directAttemptLimit } from "./direct-recovery.js";
+import { directAttemptLimit, directBaseAttemptLimit } from "./direct-recovery.js";
 import { DIRECT_TRANSLATION_VERSION, DIRECT_SYSTEM_PROMPT, DirectOutputError, buildDirectPrompt, directHash,
   DIRECT_MEMORY_VERSION, DIRECT_MEMORY_SYSTEM_PROMPT, DirectNamingConflict, assertDirectNamesCompatible, relevantDirectNames,
   DIRECT_TYPED_VERSION, DIRECT_TYPED_SYSTEM_PROMPT, directNameKey, equivalentDirectRendering,
@@ -45,8 +45,7 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
   if (options.supervisorMode === "bounded" || options.chapterReviewMode === "bounded" || options.planningMode === "source")
     throw new Error("direct workflow cannot enable model supervision or chapter review");
   const maxConcurrency = positive(options.maxConcurrency ?? 2, "maxConcurrency");
-  const maxAttempts = positive(options.maxAttempts ?? 4, "maxAttempts");
-  if (maxAttempts > 8) throw new Error("direct maxAttempts cannot exceed 8");
+  let maxAttempts = directBaseAttemptLimit([], options.maxAttempts);
   const limit = options.maxWindows ?? Number.MAX_SAFE_INTEGER;
   if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("maxWindows must be a nonnegative safe integer");
   const runId = options.runMeta.runId;
@@ -106,6 +105,7 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
     db.setDeliveryMode(runId, options.deliveryMode ?? db.deliveryMode(runId) ?? "strict");
     const snapshot = db.latestKnowledgeSnapshot(runId);
     const records = db.directRecords(runId);
+    maxAttempts = directBaseAttemptLimit(records, options.maxAttempts);
     const append = (record: DirectRecord) => { db.appendDirectRecord(runId, record); records.push(record); };
     const ledger = db.loadTokenLedger(runId, { mode: options.schedulerMode ?? "off", profile: options.optimizationProfile ?? "balanced",
       tokenIncreaseCap: 0.1, enforceDispatchLifecycle: true });

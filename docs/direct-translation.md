@@ -52,10 +52,14 @@ promotion remains ordered and atomic. One failed request does not erase a siblin
 saved result. The run lease prevents concurrent writers.
 
 Transient connection failures, timeouts and throttling receive bounded retries.
-Retry due times and request counts are durable. The default allowance is four
+Retry due times and request counts are durable. The default allowance is eight
 provider attempts per window, including structural fallback fragments; an explicit
-`--max-attempts` may set a value from one to eight. Restarting does not reset these
-counts. Authentication, quota, TLS and unclassified failures are not automatically
+`--max-attempts` may set a value from one to sixteen. Restarting does not reset these
+counts. An explicitly increased `--max-attempts` applies to the same run and counts
+all previous requests; successful saved subgroups are replayed without another call.
+Existing transport grants keep their recorded base when the flag is omitted.
+Increasing the attempt limit does not renew an existing token envelope.
+Authentication, quota, TLS and unclassified failures are not automatically
 retried. Cancellation interrupts waiting and prevents new dispatch.
 
 Malformed or truncated multi-paragraph output is retried as smaller paragraph
@@ -77,7 +81,7 @@ npm run folioloom -- book direct-recovery status --store project/book.db --run r
 ```
 
 After correcting a connection problem, an explicitly authorized release may add
-one to four attempts to one exhausted pending window, up to eight lifetime attempts.
+one to four attempts to one exhausted pending window, up to sixteen lifetime attempts.
 Only windows whose recorded attempts all returned transport errors are eligible;
 successful-but-invalid output, naming conflicts and missing response evidence
 cannot receive this transport allowance. The original token envelope is unchanged.
@@ -85,7 +89,8 @@ cannot receive this transport allowance. The original token envelope is unchange
 Save a release JSON containing `requestId`, `windowId`, `expectedLastRequestId`,
 `expectedIdentityHash`, `baseAttemptLimit`, `additionalAttempts` and `reason`.
 Use the identity and last request from status, and retain the run's original base
-attempt limit (default four). Apply it without starting generation:
+attempt limit (eight by default; existing releases retain their recorded base).
+Apply it without starting generation:
 
 ```sh
 npm run folioloom -- book direct-recovery release --store project/book.db --run run-id --input release.json

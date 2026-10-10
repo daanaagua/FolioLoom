@@ -3,7 +3,16 @@ import { resolve } from "node:path";
 import { RunLease } from "../kernel/run-lease.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { LosslessBookStore } from "../storage/lossless-book-store.js";
-import { directHash, type DirectRecord } from "./direct-translation.js";
+import { directHash, DEFAULT_DIRECT_ATTEMPT_LIMIT, MAX_DIRECT_ATTEMPT_LIMIT, type DirectRecord } from "./direct-translation.js";
+
+/** A saved transport grant keeps its original base policy when no override is supplied. */
+export function directBaseAttemptLimit(records: readonly DirectRecord[], requested?: number): number {
+  const grantedBase = (records.findLast(r => r.kind === "transport_release")?.payload.request as DirectTransportRelease | undefined)?.baseAttemptLimit;
+  const limit = requested ?? grantedBase ?? DEFAULT_DIRECT_ATTEMPT_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("maxAttempts must be a positive safe integer");
+  if (limit > MAX_DIRECT_ATTEMPT_LIMIT) throw new Error(`direct maxAttempts cannot exceed ${MAX_DIRECT_ATTEMPT_LIMIT}`);
+  return limit;
+}
 
 export interface DirectTransportRelease {
   requestId: string;
@@ -20,7 +29,7 @@ function validateRequest(value: unknown): DirectTransportRelease {
   if (!r || typeof r !== "object" || Array.isArray(r)
     || ![r.requestId, r.windowId, r.expectedLastRequestId, r.reason].every(s => typeof s === "string" && s.trim() && s.length <= 500)
     || typeof r.expectedIdentityHash !== "string" || !/^[a-f0-9]{64}$/u.test(r.expectedIdentityHash)
-    || !Number.isSafeInteger(r.baseAttemptLimit) || r.baseAttemptLimit < 1 || r.baseAttemptLimit > 8
+    || !Number.isSafeInteger(r.baseAttemptLimit) || r.baseAttemptLimit < 1 || r.baseAttemptLimit > MAX_DIRECT_ATTEMPT_LIMIT
     || !Number.isSafeInteger(r.additionalAttempts) || r.additionalAttempts < 1 || r.additionalAttempts > 4)
     throw new Error("invalid direct transport release request");
   return { requestId: r.requestId, windowId: r.windowId, expectedLastRequestId: r.expectedLastRequestId,
@@ -51,10 +60,10 @@ function transportOnly(records: readonly DirectRecord[], requests: readonly Dire
     && response.payload.stopReason === "error"));
 }
 
-export function directRecoveryStatus(store: LosslessBookStore, runId: string, baseAttemptLimit = 4) {
-  if (!Number.isSafeInteger(baseAttemptLimit) || baseAttemptLimit < 1 || baseAttemptLimit > 8) throw new Error("invalid attempt limit");
+export function directRecoveryStatus(store: LosslessBookStore, runId: string, requestedBaseAttemptLimit?: number) {
   const identityHash = identity(store, runId), records = store.directRecords(runId);
-  return { runId, identityHash, baseAttemptLimit, lifetimeAttemptCap: 8,
+  const baseAttemptLimit = directBaseAttemptLimit(records, requestedBaseAttemptLimit);
+  return { runId, identityHash, baseAttemptLimit, lifetimeAttemptCap: MAX_DIRECT_ATTEMPT_LIMIT,
     unknownUsage: store.loadTokenLedgerEvents(runId).filter(e => e.type === "settled" && !e.usageComplete).length,
     windows: store.allWindows(runId).flatMap(window => {
       const requests = records.filter(r => r.kind === "request" && r.windowId === window.windowId);
@@ -62,7 +71,7 @@ export function directRecoveryStatus(store: LosslessBookStore, runId: string, ba
       if (requests.length < limit && limit === baseAttemptLimit) return [];
       return [{ windowId: window.windowId, ordinal: window.ordinal, status: window.status, attempts: requests.length,
         attemptLimit: limit, remaining: Math.max(0, limit - requests.length), lastRequestId: requests.at(-1)?.id,
-        releaseEligible: window.status === "pending" && requests.length >= limit && requests.length < 8 && transportOnly(records, requests) }];
+        releaseEligible: window.status === "pending" && requests.length >= limit && requests.length < MAX_DIRECT_ATTEMPT_LIMIT && transportOnly(records, requests) }];
     }) };
 }
 
@@ -91,7 +100,7 @@ export function releaseDirectTransportRecovery(storePath: string, runId: string,
     if (requests.length < limit) throw new Error("direct recovery allowance is not exhausted");
     if (!transportOnly(records, requests)) throw new Error("direct recovery only releases failed transport attempts, not semantic or structural output");
     const attemptCeiling = requests.length + request.additionalAttempts;
-    if (attemptCeiling > 8) throw new Error("direct recovery lifetime attempt cap exceeded");
+    if (attemptCeiling > MAX_DIRECT_ATTEMPT_LIMIT) throw new Error("direct recovery lifetime attempt cap exceeded");
     const record: DirectRecord = { id, kind: "transport_release", windowId: request.windowId,
       key: directHash([identityHash, "transport_release", request]), at: Date.now(),
       payload: { request, attemptFloor: requests.length, attemptCeiling } };

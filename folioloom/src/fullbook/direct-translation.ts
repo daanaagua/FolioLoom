@@ -8,6 +8,8 @@ import { epubStructuralTranslationError, stripEpubStructuralMarkers } from "../s
 export const DIRECT_TRANSLATION_VERSION = "direct-translation-1";
 export const DIRECT_MEMORY_VERSION = "direct-translation-2";
 export const DIRECT_TYPED_VERSION = "direct-translation-3";
+export const DEFAULT_DIRECT_ATTEMPT_LIMIT = 8;
+export const MAX_DIRECT_ATTEMPT_LIMIT = 16;
 export type TranslationWorkflow = "direct" | "supervised";
 export interface DirectParagraph { id: string; blockId: string; source: string }
 export interface DirectName {
@@ -259,11 +261,11 @@ export function validateDirectRecord(record: DirectRecord): void {
     if (!request || typeof request !== "object" || request.windowId !== record.windowId
       || ![request.requestId, request.expectedLastRequestId, request.reason].every(s => typeof s === "string" && s.trim() && s.length <= 500)
       || typeof request.expectedIdentityHash !== "string" || !/^[a-f0-9]{64}$/u.test(request.expectedIdentityHash)
-      || !Number.isSafeInteger(request.baseAttemptLimit) || Number(request.baseAttemptLimit) < 1 || Number(request.baseAttemptLimit) > 8
+      || !Number.isSafeInteger(request.baseAttemptLimit) || Number(request.baseAttemptLimit) < 1 || Number(request.baseAttemptLimit) > MAX_DIRECT_ATTEMPT_LIMIT
       || !Number.isSafeInteger(request.additionalAttempts) || Number(request.additionalAttempts) < 1 || Number(request.additionalAttempts) > 4
       || !Number.isSafeInteger(attemptFloor) || Number(attemptFloor) < 1
       || !Number.isSafeInteger(attemptCeiling) || Number(attemptCeiling) !== Number(attemptFloor) + Number(request.additionalAttempts)
-      || Number(attemptCeiling) > 8) throw new Error("invalid direct transport release record");
+      || Number(attemptCeiling) > MAX_DIRECT_ATTEMPT_LIMIT) throw new Error("invalid direct transport release record");
   }
   if (["name_context", "names", "name_wave", "name_plan", "name_draft"].includes(record.kind)) {
     if (!Array.isArray(record.payload.names) || record.payload.names.some((n: any) => !n || typeof n.source !== "string"
