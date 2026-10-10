@@ -1,6 +1,6 @@
 # FolioLoom current state
 
-- Date: 2026-10-10 (Asia/Shanghai). Version v1.11.0; storage schema v5.
+- Date: 2026-10-10 (Asia/Shanghai). Version v1.12.0; storage schema v5.
 - Build dependency source-map-js is locked to 1.2.2. The high-severity audit gate
   passes; the existing moderate exceljs/uuid dependency findings remain visible.
 - New native CLI/desktop direct runs use protocol 3: typed source-attested entity
@@ -46,6 +46,7 @@
 
 ## History
 
+- [v1.12.0 distribution](state/2026-10-10.md)
 - [v1.11.0 verification scope](state/2026-10-10.md)
 - [Scoped TLS compatibility, direct recovery and typed naming](state/2026-10-09.md)
 - [Candidate-bound repair and readonly decision handoff](state/2026-10-07.md)
