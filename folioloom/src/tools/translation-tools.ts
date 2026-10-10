@@ -11,6 +11,7 @@ import type { NarrativeMemoryRecord } from "../fullbook/types.js";
 import { BudgetLedger } from "../kernel/budget.js";
 import { sourceTextForTranslation } from "../source/layout-separators.js";
 import { hasSemanticText } from "../text/semantic-text.js";
+import { boundedTextExcerpt } from "../text/bounded-excerpt.js";
 import {
   CandidateCollector,
   TRANSLATION_MEMORY_KINDS,
@@ -180,11 +181,12 @@ export class TranslationTools {
       if (!hasSemanticText(visibleQuote)) {
         continue;
       }
-      const quote = [...visibleQuote]
-        .slice(0, Math.min(900, remainingChars))
-        .join("");
+      const positions = sourceForms.map(form => visibleQuote.toLocaleLowerCase().indexOf(form.toLocaleLowerCase())).filter(i => i >= 0);
+      const focus = positions.length ? Math.min(...positions) : 0;
+      const preview = boundedTextExcerpt(visibleQuote, Math.min(900, remainingChars), Array.from(visibleQuote.slice(0, focus)).length);
+      const quote = preview.text;
       remainingChars -= [...quote].length;
-      evidence.push({ ...hit, quote });
+      evidence.push({ ...hit, quote, excerpt: preview.range });
     }
     const evidenceChars = evidence.reduce((total, hit) => total + [...hit.quote].length, 0);
     this.#budget.consumeMany({
@@ -297,7 +299,6 @@ export class TranslationTools {
             ),
             subjectForms: Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
             fact: Type.String(),
-            confidence: Type.Number({ minimum: 0, maximum: 1 }),
           }), { maxItems: 4 })),
         }),
         execute: (args, signal) => this.finalizeTranslation(
@@ -337,13 +338,6 @@ export class TranslationTools {
       .toLocaleLowerCase();
     const targetEnd = Math.max(...this.#targetBlocks.map((block) => block.globalIndex));
     for (const candidate of candidates) {
-      if (!Number.isFinite(candidate.confidence)
-        || candidate.confidence < 0 || candidate.confidence > 1) {
-        throw new TypeError("memory confidence must be between zero and one");
-      }
-      if (candidate.confidence < 0.9) {
-        continue;
-      }
       const fact = candidate.fact?.trim();
       if (typeof fact !== "string" || fact.length < 8 || fact.length > 600) {
         throw new TypeError("memory fact must contain 8 to 600 characters");
@@ -399,7 +393,6 @@ export class TranslationTools {
         kind: candidate.kind,
         subjectIds,
         verdict: fact,
-        confidence: candidate.confidence,
         channel: "narrative_before_target",
         visibleFromGlobalIndex: targetEnd + 1,
         evidenceIds,

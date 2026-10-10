@@ -37,6 +37,8 @@ export interface ProviderCapabilities {
   supportsTools: boolean;
   contextWindow: number;
   maxTokens: number;
+  /** Separate bounded review envelope; ordinary generation keeps maxTokens. */
+  reviewLimits?: Readonly<{ contextWindow: number; maxTokens: number }>;
   outputTokenField: ProviderOutputTokenField;
 }
 
@@ -68,9 +70,12 @@ export interface ResolvedProviderProfile {
   baseUrl: string;
 }
 
+export type ProviderModel = Model<Api> & Pick<ProviderCapabilities, "reviewLimits">;
+
 export interface ProviderRuntime {
-  model: Model<Api>;
+  model: ProviderModel;
   streamFn: StreamFn;
+  preflight(signal?: AbortSignal): Promise<import("./preflight.js").ProviderConnectionReport>;
 }
 
 export type ProbeStatus = "ready" | "limited" | "failed";
@@ -96,6 +101,9 @@ export type ProviderProbeErrorCode =
   | "REQUEST_TIMEOUT"
   | "PROVIDER_PROTOCOL_INVALID"
   | "PROVIDER_UNREACHABLE"
+  | "PROVIDER_TLS"
+  | "PROVIDER_PROXY_CONFIGURATION"
+  | "PROVIDER_PREFLIGHT_FAILED"
   | "PROVIDER_REQUEST_REJECTED";
 
 export interface CapabilityCheck {

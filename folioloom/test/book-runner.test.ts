@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { auditLosslessBookExport } from "../src/report.js";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +33,7 @@ import { BookStore } from "../src/storage/book-store.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 import { RuntimeProfileStore } from "../src/storage/runtime-profile-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
+import { stableTermsFromKnowledge } from "../src/knowledge/stable-terms-from-knowledge.js";
 import {
   conceptFromAnchor,
   reviseConcept,
@@ -636,7 +638,7 @@ test("a missing framed submission is retried as smaller lossless block fragments
   assert.ok(fixture.faux.state.callCount <= 6);
 });
 
-test("a tx8-shaped single block runs typed paragraph fragments before any framed fallback", async () => {
+test("a tx8-shaped single block runs typed paragraph fragments within peak in-flight capacity", async () => {
   const sourceParagraphs = Array.from(
     { length: 23 },
     (_, index) =>
@@ -695,6 +697,8 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
     maxConcurrency: 1,
     maxWindowsPerRequest: 1,
     maxRequestTokens: 4_000,
+    schedulerMode: "active",
+    maxInFlightTokens: 20_000,
     windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
     runtimeSet: {
       mode: "quality",
@@ -705,13 +709,9 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
 
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
-  assert.equal(observedUnits.length, 3);
-  assert.equal(new Set(observedUnits).size, 3);
-  assert.deepEqual(observedProtocols, [
-    "typed_tool",
-    "typed_tool",
-    "typed_tool",
-  ]);
+  assert.equal(observedUnits.length, 1);
+  assert.equal(new Set(observedUnits).size, 1);
+  assert.deepEqual(observedProtocols, ["typed_tool"]);
   const store = new LosslessBookStore(fixture.options.storePath);
   try {
     const translation = store.activeTranslations("run-lossless")[0]?.text ?? "";
@@ -723,6 +723,9 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
       .filter((event) =>
         event.type === "reserved" && event.purpose === "translate");
     assert.equal(translationReservations.length, 1);
+    assert.ok(translationReservations[0]!.type === "reserved"
+      && translationReservations[0]!.predictedTokens > 0 && translationReservations[0]!.predictedTokens <= 20_000,
+    JSON.stringify(translationReservations));
   } finally {
     store.close();
   }
@@ -937,7 +940,7 @@ test("a high-risk block inside a multi-block window is fragmented without losing
   assert.equal(result.windows[0]?.blockIds.length, 2);
   assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify(result.windows));
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
-  assert.equal(paragraphCalls, 2);
+  assert.equal(paragraphCalls, 1, "short paragraphs keep exact-cover typed output without eight-paragraph microbatches");
   assert.equal(ordinaryCalls, 1);
   const store = new LosslessBookStore(fixture.options.storePath);
   try {
@@ -1148,6 +1151,8 @@ test("failed paragraph units refine by local bisection without replaying valid s
   } as never);
 
   assert.deepEqual(requestedParagraphOrdinals, [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
     [0, 1, 2, 3, 4, 5, 6],
     [0, 1, 2, 3, 4, 5, 6],
     [0, 1, 2],
@@ -1157,7 +1162,7 @@ test("failed paragraph units refine by local bisection without replaying valid s
     [3, 4, 5, 6],
     [7, 8, 9, 10, 11, 12, 13],
   ]);
-  assert.equal(fixture.faux.state.callCount, 8);
+  assert.equal(fixture.faux.state.callCount, 10);
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
   const store = new LosslessBookStore(fixture.options.storePath);
@@ -1165,7 +1170,7 @@ test("failed paragraph units refine by local bisection without replaying valid s
     const ledgerEvents = store.loadTokenLedgerEvents("run-lossless");
     assert.equal(ledgerEvents.filter((event) =>
       event.type === "reserved"
-      && event.purpose === "paragraph_fragment").length, 2);
+      && event.purpose === "paragraph_fragment").length, 3);
     const translationBaseline = ledgerEvents
       .reduce((total, event) =>
         event.type === "baseline_added"
@@ -1275,7 +1280,7 @@ test("an already-fragmented structural failure never falls back to whole-block f
     },
   } as never);
 
-  assert.equal(protocols.length, 4);
+  assert.equal(protocols.length, 3);
   assert.ok(protocols.every((protocol) => protocol === "typed_tool"));
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
@@ -1509,7 +1514,7 @@ test("legacy paragraph replay without candidate checkpoints allocates a fresh le
 test("paragraph fragments retain bounded repair credits across independent units", async () => {
   const sourceParagraphs = [
     ...Array.from(
-      { length: 12 },
+      { length: 24 },
       (_, index) =>
         `the mechanism preserves every ordinary detail in source paragraph ${index + 1}.`,
     ),
@@ -2009,7 +2014,6 @@ function lexicalAnchorResponse(
     entityLinks: entityLink === undefined ? [] : [{
       ...entityLink,
       evidenceKind: "explicit_naming",
-      confidence: 0.98,
     }],
   }), { stopReason: "toolUse" });
 }
@@ -2185,7 +2189,7 @@ test("completed waves persist a contextual role as one closed lexical concept", 
   }
 });
 
-test("a stable anchor below the projection threshold is reconsidered in the next wave", async () => {
+test("legacy low-score anchors retain observations without another call for identical evidence", async () => {
   const source = "Smoky met Edgewood. Smoky left Edgewood.";
   const fixture = losslessFixture(`${source}[[]]${source}`);
   const anchorWaves: string[][] = [];
@@ -2227,9 +2231,135 @@ test("a stable anchor below the projection threshold is reconsidered in the next
   const result = await runBook(runOptions as never);
 
   assert.equal(result.status.completedWindows, 2);
-  assert.equal(anchorWaves.length, 2, JSON.stringify(anchorWaves));
-  assert.ok(anchorWaves[0]?.every((form) => anchorWaves[1]?.includes(form)));
+  assert.equal(anchorWaves.length, 1, JSON.stringify(anchorWaves));
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const observations = store.latestKnowledgeSnapshot("run-lossless").revisions.filter(r => r.kind === "lexical_surface_observation");
+    assert.equal(observations.length, 8);
+    assert.ok(observations.every(r => r.status === "provisional"));
+    assert.ok(observations.every(r => !("confidence" in (r.payload as object))));
+  } finally { store.close(); }
 });
+
+test("a low-confidence institutional term is observed and reused across a cold resume without a hard concept", async () => {
+  const fixture = losslessFixture("the lyceum has a classroom. the lyceum is closed at dusk.[[]]the lyceum is open at dawn. the lyceum has many students.");
+  let anchors = 0, reused = false;
+  const reply = (context: Context) => {
+    const prompt = userText(context);
+    const answer = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
+    if (context.tools?.some(t => t.name === "submit_supervisor_decision")) {
+      const data = JSON.parse(prompt);
+      return answer("submit_supervisor_decision", { action: data.event === "plan" ? "translate" : "accept",
+        windowIds: data.windows.map((w: any) => w.windowId), reviewBlockIds: [], guidance: [], issues: [], reason: "Checked." });
+    }
+    if (context.tools?.some(t => t.name === "submit_lexical_anchors")) {
+      anchors++;
+      return answer("submit_lexical_anchors", { anchors: [{ sourceForm: "lyceum", target: "学馆",
+        semanticClass: "technical_term", mode: "contextual", confidence: 0.65,
+        meaning: "an educational institution", usageScope: "this institution and its school activities" }], entityLinks: [] });
+    }
+    const windows = JSON.parse(/WINDOWS\n\n([^\n]+)\n\nSTABLE TERMS/u.exec(prompt)![1]!);
+    const mentions = JSON.parse(/SURFACE MENTIONS\n\n([^\n]+)/u.exec(prompt)?.[1] ?? "[]");
+    assert.ok(mentions.some((m: any) => m.sourceForm === "lyceum"), `anchor calls=${anchors}`);
+    if (windows.some((w: any) => w.blocks.some((b: any) => b.sourceText.includes("dawn")))) {
+      assert.ok(mentions.every((m: any) => m.preferredTarget === "学馆"));
+      const terms = JSON.parse(/STABLE TERMS\n\n([^\n]+)/u.exec(prompt)![1]!);
+      assert.ok(terms.some((t: any) => t.sourceForm === "lyceum" && t.locked === false
+        && t.note.includes("educational institution")));
+      reused = true;
+    }
+    return answer("finalize_translation_batch", { windows: windows.map((w: any) => ({ windowId: w.windowId, notes: [],
+      surfaceUsages: mentions.filter((m: any) => w.blocks.some((b: any) => b.blockId === m.blockId))
+        .map((m: any) => ({ occurrenceId: m.occurrenceId, targetSurface: "学馆" })),
+      translations: w.blocks.map((b: any) => ({ blockId: b.blockId, text: b.sourceText.includes("dawn")
+        ? "学馆在清晨已经打开大门。许多学生在学馆里读书。" : "学馆里面有一间教室。学馆在日落时关闭大门。" })) })) });
+  };
+  fixture.faux.setResponses(Array.from({ length: 12 }, () => reply));
+  const options = { ...fixture.options, supervisorMode: "bounded" as const, maxConcurrency: 1,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1000 }, maxRequestTokens: 1000, maxWindowsPerRequest: 1 };
+  await runBook({ ...options, maxWindows: 1 });
+  await runBook(options);
+  assert.equal(anchors, 1);
+  assert.ok(reused);
+  const store = LosslessBookStore.openReadOnly(options.storePath);
+  try {
+    const revisions = store.latestKnowledgeSnapshot("run-lossless").revisions;
+    assert.ok(revisions.some(r => r.kind === "lexical_surface_observation" && (r.payload as { semanticClass?: string }).semanticClass === "technical_term"));
+    const terms = stableTermsFromKnowledge(revisions);
+    assert.equal(terms.length, 1);
+    assert.equal(terms[0]?.preference?.meaning, "an educational institution");
+    assert.equal(terms[0]?.locked, false);
+    assert.ok(revisions.some(r => r.kind.startsWith("lexical_preference:") && r.status === "active"));
+    const audit = auditLosslessBookExport(store, "run-lossless").audit;
+    assert.equal(audit.strictExportable, true);
+    assert.equal(audit.lexicalPreferences?.length, 4);
+    assert.ok(audit.lexicalPreferences?.every(check => check.status === "preferred_surface_present"));
+  } finally { store.close(); }
+});
+
+for (const packed of [false, true]) {
+ test(`unregistered weak nicknames are checked across ${packed ? "packed sibling" : "resumed"} windows`, async () => {
+  const fixture = losslessFixture("They called her Copper. Copper waited for Nara at the gate. Nara arrived before sunset.[[]]Copper returned to the gate with Nara after the rain. Nara opened the door for her.");
+  let surfaceReviews = 0;
+  let anchorCalls = 0;
+  const reply = (context: Context) => {
+    const prompt = userText(context);
+    const answer = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
+    if (context.tools?.some(t => t.name === "submit_supervisor_decision")) {
+      const data = JSON.parse(prompt);
+      if (data.surfaceEvidence?.length) {
+        surfaceReviews++;
+        assert.ok(data.surfaceEvidence.some((e: any) => e.sourceForm === "Copper" && e.previous.some((p: any) => p.target === "铜铃")));
+      }
+      const bad = data.event === "review" && (data.surfaceEvidence?.length > 0 || data.priorIssues?.length > 0)
+        && data.candidate.some((b: any) => b.evidence.some((r: any) => r.text.includes("小铜")));
+      return answer("submit_supervisor_decision", { action: data.event === "plan" ? "translate" : bad ? "revise" : "accept",
+        windowIds: data.windows.map((w: any) => w.windowId), reviewBlockIds: [], guidance: [], reason: "核对同一称呼。",
+        issues: bad ? [{ blockId: data.candidate[0].blockId, sourceRef: data.source[0].evidence[0].id,
+          targetRef: data.candidate[0].evidence[0].id, problem: "同一昵称无语境理由改译，应保持铜铃。" }] : [],
+        ...(data.priorIssues ? { dispositions: data.priorIssues.map((p: any) => ({ issueId: p.issueId, status: bad ? "unresolved" : "fixed",
+          sourceRef: data.source[0].evidence[0].id, targetRef: data.candidate[0].evidence[0].id, note: bad ? "昵称仍不一致" : "已统一昵称译法" })) } : {}) });
+    }
+    if (context.tools?.some(t => t.name === "submit_lexical_anchors")) {
+      anchorCalls++;
+      const raw = JSON.parse(/SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE\n\n(\[[\s\S]*?\])\n\nESTABLISHED TERMS/u.exec(prompt)![1]!);
+      return answer("submit_lexical_anchors", { anchors: raw.map((c: any) => ({ sourceForm: c.sourceForm,
+        target: c.sourceForm === "Copper" ? "铜铃" : "娜拉", semanticClass: c.sourceForm === "Copper" ? "form_of_address" : "proper_name",
+        mode: c.sourceForm === "Copper" ? "contextual" : "stable" })), entityLinks: [] });
+    }
+    if (context.tools?.some(t => t.name === "submit_repaired_translation")) {
+      const candidate = JSON.parse(/FAILED CANDIDATE\n\n([^\n]+)/u.exec(prompt)![1]!);
+      return answer("submit_repaired_translation", { translations: candidate.map((t: any) => ({ ...t, text: t.text.replaceAll("小铜", "铜铃") })), notes: [] });
+    }
+    const windows = JSON.parse(/WINDOWS\n\n([^\n]+)\n\nSTABLE TERMS/u.exec(prompt)![1]!);
+    const surfaceMentions = JSON.parse(/SURFACE MENTIONS\n\n([^\n]+)/u.exec(prompt)?.[1] ?? "[]");
+    return answer("finalize_translation_batch", { windows: windows.map((w: any) => ({ windowId: w.windowId, notes: [],
+      surfaceUsages: surfaceMentions.filter((m: any) => w.blocks.some((b: any) => b.blockId === m.blockId)).map((m: any) => ({ occurrenceId: m.occurrenceId,
+        targetSurface: m.sourceForm === "Copper" ? (w.blocks.some((b: any) => b.sourceText.includes("returned")) ? "小铜" : "铜铃") : "娜拉" })),
+      translations: w.blocks.map((b: any) => ({ blockId: b.blockId, text: b.sourceText.includes("returned")
+        ? "雨后小铜和娜拉回到了门口。娜拉为她打开了大门。" : "人们叫她铜铃。铜铃在门口等待娜拉。日落前，娜拉终于来了。" })) })) });
+  };
+  fixture.faux.setResponses(Array.from({ length: 25 }, () => reply));
+  const options = { ...fixture.options, supervisorMode: "bounded" as const, maxConcurrency: 1,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1000 }, maxRequestTokens: 1000,
+    maxWindowsPerRequest: packed ? 2 : 1, tinyWindowTokens: 1000 };
+  if (!packed) await runBook({ ...options, maxWindows: 1 });
+  await runBook(options);
+  assert.ok(surfaceReviews > 0);
+  assert.equal(anchorCalls, 1);
+  const store = new LosslessBookStore(options.storePath);
+  try {
+    assert.equal(store.activeTranslations("run-lossless").length, 2);
+    assert.ok(store.activeTranslations("run-lossless").every(t => !t.text.includes("小铜")));
+    assert.ok(store.latestKnowledgeSnapshot("run-lossless").revisions.some(r => r.kind === "lexical_surface_observation"));
+    if (packed) assert.equal(store.qualityRecords("run-lossless").at(-1)?.state, "resolved");
+    assert.equal(auditLosslessBookExport(store, "run-lossless").audit.strictExportable, true);
+  } finally { store.close(); }
+  const calls = fixture.faux.state.callCount;
+  await runBook(options);
+  assert.equal(fixture.faux.state.callCount, calls);
+ });
+}
 
 test("adjacent physical requests cannot commit the same ungrounded long translation", async () => {
   const fixture = losslessFixture([
@@ -2458,11 +2588,11 @@ test("failed wave promotes no anchor knowledge and resume reuses its cached anch
     }),
     fauxAssistantMessage([], {
       stopReason: "error",
-      errorMessage: "503: fixture provider unavailable",
+      errorMessage: "401: fixture provider unauthorized",
     }),
   ]);
 
-  await assert.rejects(runBook(fixture.options as never), /provider unavailable/i);
+  await assert.rejects(runBook(fixture.options as never), /provider unauthorized/i);
   const failedStore = new LosslessBookStore(fixture.options.storePath);
   assert.deepEqual(failedStore.knowledgeRevisions("run-lossless"), []);
   failedStore.close();
@@ -2752,7 +2882,7 @@ test("low-risk windows use lean context while high-risk windows keep rich eviden
   });
 });
 
-test("active quality runs can select a lower legal effort variant", async () => {
+test("active quality runs retain the selected effort even when cheaper variants are supplied", async () => {
   const fixture = losslessFixture("a quiet room.");
   const low = fauxProvider();
   const high = fauxProvider();
@@ -2796,8 +2926,8 @@ test("active quality runs can select a lower legal effort variant", async () => 
   });
 
   assert.equal(result.status.completedWindows, 1);
-  assert.equal(low.state.callCount, 1);
-  assert.equal(high.state.callCount, 0);
+  assert.equal(low.state.callCount, 0);
+  assert.equal(high.state.callCount, 1);
 });
 
 test("evidence at least twenty-four blocks away forces rich context", async () => {
@@ -3217,18 +3347,47 @@ test("one malformed typed window preserves its valid sibling while framed fallba
 
 test("lossless provider errors stay retryable and never become human incidents", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
-  fixture.faux.setResponses([fauxAssistantMessage([], {
+  fixture.faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage([], {
     stopReason: "error",
     errorMessage: "503: fixture provider unavailable",
-  })]);
+  })));
 
   await assert.rejects(runBook(fixture.options as never), /provider unavailable/i);
-  assert.equal(fixture.faux.state.callCount, 1);
+  assert.equal(fixture.faux.state.callCount, 3);
   const store = new LosslessBookStore(fixture.options.storePath);
   const status = store.statusSummary("run-lossless");
   store.close();
   assert.equal(status.humanRequiredWindows, 0);
   assert.equal(status.pendingWindows, 2);
+  await assert.rejects(runBook(fixture.options as never), /AUTOMATIC_RECOVERY_PAUSED/u);
+  assert.equal(fixture.faux.state.callCount, 3, "restarting cannot renew exhausted recovery credits");
+});
+
+test("transient translation failure recovers automatically with exact ledger usage", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 unavailable" }), losslessBatchResponse]);
+  const result = await runBook({ ...fixture.options, maxAttempts: 1 } as never);
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(fixture.faux.state.callCount, 2);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    assert.equal(store.recoveryRecords("run-lossless").filter(r => r.state === "claimed").length, 2);
+    const audit = auditLosslessBookExport(store, "run-lossless");
+    assert.equal(audit.scheduler?.tokenUsageComplete, true);
+    assert.equal(audit.audit.strictExportable, true);
+    assert.equal(store.statusSummary("run-lossless").modelCalls, 2);
+    const raw = new DatabaseSync(fixture.options.storePath, { readOnly: true });
+    try {
+      const evidence = raw.prepare("SELECT payload_json FROM events WHERE run_id=? AND kind='provider_response_evidence'").all("run-lossless") as Array<{ payload_json: string }>;
+      const actual = evidence.reduce((n, r) => n + JSON.parse(r.payload_json).usage.totalTokens, 0);
+      const settlements = store.loadTokenLedgerEvents("run-lossless").filter(e => e.type === "settled");
+      assert.ok(actual > 0);
+      assert.ok(settlements.every(e => e.usageComplete));
+      assert.equal(settlements.reduce((n, e) => n + e.actualTokens, 0), actual);
+    } finally { raw.close(); }
+  } finally { store.close(); }
+  await runBook(fixture.options as never);
+  assert.equal(fixture.faux.state.callCount, 2);
 });
 
 test("fast mode retries an invalid physical request with only the escalation runtime", async () => {
@@ -4277,7 +4436,6 @@ test("lossless runner hydrates full knowledge history when resuming from a revis
           kind: "term_sense",
           subjectForms: ["Alpha"],
           fact: target,
-          confidence: 0.9,
         }],
       })),
     }), { stopReason: "toolUse" });

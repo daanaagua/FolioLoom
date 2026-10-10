@@ -22,6 +22,7 @@ import { BudgetLedger, type BudgetCounter } from "../kernel/budget.js";
 import { CapabilityRegistry } from "../kernel/capabilities.js";
 import { MemoryEventLog } from "../kernel/event-log.js";
 import { createProviderRuntime } from "../providers/runtime.js";
+import { preflightProviderStream } from "../providers/preflight.js";
 import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import { asKernelTools, type TypedToolSpec } from "../tools/tool-spec.js";
 import { effectiveSystemPrompt } from "./task-context.js";
@@ -50,6 +51,7 @@ const SEQUENTIAL_TOOLS = new Set([
   "finalize_translation",
   "finalize_translation_batch",
   "submit_repaired_translation",
+  "submit_epub_text_patch",
   "submit_lexical_anchors",
   "choose_recovery_strategy",
   "submit_recovery_result",
@@ -68,6 +70,8 @@ export interface PiSessionSpec {
   maxTurns?: number;
   /** Stop a non-progressing tool-error loop without renewing the turn budget. */
   maxRepeatedToolErrors?: number;
+  /** One host reminder for a text-only stop; consumes an existing session turn. */
+  missingTerminalToolPrompt?: string;
   eventLog?: MemoryEventLog;
   thinkingLevel?: ThinkingLevel;
   onAssistantResponse?: (
@@ -88,6 +92,7 @@ export interface PiToolError {
 }
 
 export type ModelProviderErrorKind =
+  | "tls"
   | "auth"
   | "quota"
   | "throttled"
@@ -129,6 +134,7 @@ function retryableProviderErrorKind(kind: ModelProviderErrorKind): boolean {
 
 export function classifyProviderErrorMessage(message: string): ModelProviderErrorKind {
   const normalized = message.normalize("NFKC").toLocaleLowerCase();
+  if (/(?:provider_tls|self_signed_cert_in_chain|depth_zero_self_signed_cert|cert_has_expired|cert_not_yet_valid|unable_to_verify_leaf_signature|unable_to_get_issuer_cert|err_tls_cert_altname_invalid|certificate validation failed)/u.test(normalized)) return "tls";
   if (/(?:insufficient[_ -]?quota|quota exceeded|billing|out of budget|usage limit|credit balance)/u
     .test(normalized)) {
     return "quota";
@@ -171,12 +177,25 @@ export interface PiRunResult {
   durationMs: number;
   stopReason: StopReason;
   messages: AgentMessage[];
+  /** Actual responses only; excludes host-generated turn-limit sentinels. */
+  providerResponses?: AssistantMessage[];
   deadlineExceeded: boolean;
   turnLimitReached: boolean;
 }
 
 function assistant(message: AgentMessage): message is AssistantMessage {
   return "role" in message && message.role === "assistant";
+}
+
+export function piRunUsageComplete(run: PiRunResult): boolean {
+  const responses = run.providerResponses ?? run.messages.filter(assistant);
+  if (!Number.isSafeInteger(run.modelCalls) || run.modelCalls < 0 || responses.length !== run.modelCalls) return false;
+  const fields = ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const;
+  if (responses.some(m => fields.some(k => !Number.isFinite(m.usage[k]) || m.usage[k] < 0)
+    || !(m.usage.totalTokens > 0) || (m.usage.reasoning !== undefined
+      && (!Number.isFinite(m.usage.reasoning) || m.usage.reasoning < 0 || m.usage.reasoning > m.usage.output)))) return false;
+  return fields.every(k => Number.isFinite(run.usage[k]) && run.usage[k] >= 0
+    && run.usage[k] === responses.reduce((sum, m) => sum + m.usage[k], 0));
 }
 
 function addUsage(total: Usage, value: Usage): void {
@@ -248,13 +267,19 @@ export class PiRuntime {
     if (spec.maxRepeatedToolErrors !== undefined && (!Number.isInteger(spec.maxRepeatedToolErrors) || spec.maxRepeatedToolErrors <= 0)) {
       throw new TypeError("maxRepeatedToolErrors must be a positive integer");
     }
+    if (spec.missingTerminalToolPrompt !== undefined && (typeof spec.missingTerminalToolPrompt !== "string"
+      || !spec.missingTerminalToolPrompt.trim() || spec.missingTerminalToolPrompt.length > 400)) {
+      throw new TypeError("missingTerminalToolPrompt must contain 1..400 characters");
+    }
 
+    await preflightProviderStream(streamFn, spec.signal);
     const registry = new CapabilityRegistry(asKernelTools(spec.tools));
     const specsByName = new Map(spec.tools.map((tool) => [tool.name, tool]));
     const terminateTools = new Set(spec.terminateTools ?? [
       "finish_research",
       "finalize_translation",
       "submit_repaired_translation",
+      "submit_epub_text_patch",
     ]);
     const eventLog = spec.eventLog ?? new MemoryEventLog();
     const startedAt = performance.now();
@@ -266,6 +291,9 @@ export class PiRuntime {
     let turnStarts = 0;
     let deadlineExceeded = false;
     let turnLimitReached = false;
+    let terminalToolSubmitted = false;
+    let terminalToolReminderSent = false;
+    const localStops = new WeakSet<AssistantMessage>();
     const assistantResponses: Array<{
       readonly modelCallOrdinal: number;
       readonly message: AssistantMessage;
@@ -298,6 +326,7 @@ export class PiRuntime {
         timestamp: Date.now(),
       };
       queueMicrotask(() => {
+        localStops.add(message);
         stream.push({ type: "done", reason: "stop", message });
         stream.end(message);
       });
@@ -344,6 +373,7 @@ export class PiRuntime {
           }
         }
         if (terminateTools.has(toolCall.name) && !isError) {
+          terminalToolSubmitted = true;
           return { terminate: true };
         }
         if (spec.maxTurns !== undefined && modelCalls >= spec.maxTurns) {
@@ -370,7 +400,7 @@ export class PiRuntime {
           eventLog.append("model", { phase: spec.phase, modelCalls });
           break;
         case "turn_end":
-          if (assistant(event.message)) {
+          if (assistant(event.message) && !localStops.has(event.message)) {
             addUsage(usage, event.message.usage);
             assistantResponses.push({
               // Agent event delivery can start the next turn before publishing
@@ -380,6 +410,19 @@ export class PiRuntime {
               modelCallOrdinal: assistantResponses.length + 1,
               message: event.message,
             });
+            if (spec.missingTerminalToolPrompt && !terminalToolReminderSent && !terminalToolSubmitted
+              && !deadlineExceeded && !turnLimitReached && !spec.signal?.aborted
+              && event.message.stopReason === "stop"
+              && event.message.content.some(c => c.type === "text")
+              && !event.message.content.some(c => c.type === "toolCall")
+              && spec.budget.remaining("modelCalls") > 0 && spec.budget.remaining(turnCounter(spec.phase)) > 0
+              && (spec.maxTurns === undefined || modelCalls < spec.maxTurns)) {
+              terminalToolReminderSent = true;
+              // Keep the real assistant message and all evidence in the same
+              // session. Never reinterpret text as a successful tool call.
+              agent.followUp({ role: "user", content: [{ type: "text", text: spec.missingTerminalToolPrompt }], timestamp: Date.now() });
+              eventLog.append("model", { phase: spec.phase, missingTerminalToolReminder: true });
+            }
           }
           break;
         case "tool_execution_start":
@@ -438,6 +481,7 @@ export class PiRuntime {
         ? "aborted"
         : (lastAssistant?.stopReason ?? "stop"),
       messages,
+      providerResponses: assistantResponses.map(response => response.message),
       deadlineExceeded,
       turnLimitReached,
     };

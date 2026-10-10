@@ -1070,7 +1070,7 @@ function startFullBookRequest(value: unknown): DesktopStartFullBookRequest {
   const input = exactRecord(
     value,
     "start-fullbook payload",
-    ["optimizationProfile", "supervisorMode", "taskContext"],
+    ["optimizationProfile", "supervisorMode", "taskContext", "deliveryMode", "workflow"],
   );
   const optimizationProfile = requiredText(
     input.optimizationProfile,
@@ -1083,9 +1083,13 @@ function startFullBookRequest(value: unknown): DesktopStartFullBookRequest {
       "optimizationProfile must be economy, balanced, or speed",
     );
   }
+  if (input.workflow !== undefined && input.workflow !== "direct" && input.workflow !== "supervised") return inputError("workflow must be direct or supervised");
   if (input.supervisorMode !== undefined && input.supervisorMode !== "bounded" && input.supervisorMode !== "off") return inputError("supervisorMode must be bounded or off");
+  if (input.deliveryMode !== undefined && input.deliveryMode !== "standard" && input.deliveryMode !== "strict") return inputError("deliveryMode must be standard or strict");
   const taskContext = input.taskContext === undefined ? undefined : boundedText(input.taskContext, "taskContext", 16000);
-  return { optimizationProfile, ...(input.supervisorMode === undefined ? {} : { supervisorMode: input.supervisorMode }),
+  return { optimizationProfile, ...(input.workflow === undefined ? {} : { workflow: input.workflow }),
+    ...(input.supervisorMode === undefined ? {} : { supervisorMode: input.supervisorMode }),
+    ...(input.deliveryMode === undefined ? {} : { deliveryMode: input.deliveryMode }),
     ...(taskContext === undefined ? {} : { taskContext }) };
 }
 

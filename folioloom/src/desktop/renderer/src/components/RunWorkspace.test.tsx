@@ -71,7 +71,7 @@ describe("RunWorkspace", () => {
 
     await user.click(screen.getByRole("button", { name: "经济" }));
     await user.click(screen.getByRole("button", { name: "开始整本翻译" }));
-    expect(onStart).toHaveBeenCalledWith("economy", { supervisorMode: "bounded" });
+    expect(onStart).toHaveBeenCalledWith("economy", { workflow: "direct", supervisorMode: "off", deliveryMode: "standard" });
   });
 
   it("sends the selected supervisor mode and private task context with a new run", async () => {
@@ -79,11 +79,12 @@ describe("RunWorkspace", () => {
     const onStart = vi.fn();
     render(<RunWorkspace title="示例小说" modelReady snapshot={snapshot()} busy={false}
       onStart={onStart} onPause={vi.fn()} onResume={vi.fn()} onExportDiagnostics={vi.fn()} />);
-    expect((screen.getByRole("checkbox", { name: "启用 Pi 主 agent 监督" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "启用旧式监督审校" }) as HTMLInputElement).checked).toBe(false);
     await user.type(screen.getByLabelText("任务背景前缀"), "材料仅供个人阅读。");
-    await user.click(screen.getByRole("checkbox", { name: "启用 Pi 主 agent 监督" }));
+    await user.click(screen.getByRole("checkbox", { name: "启用旧式监督审校" }));
+    await user.selectOptions(screen.getByLabelText("交付模式"), "strict");
     await user.click(screen.getByRole("button", { name: "开始整本翻译" }));
-    expect(onStart).toHaveBeenCalledWith("balanced", { supervisorMode: "off", taskContext: "材料仅供个人阅读。" });
+    expect(onStart).toHaveBeenCalledWith("balanced", { workflow: "supervised", supervisorMode: "bounded", deliveryMode: "strict", taskContext: "材料仅供个人阅读。" });
   });
 
   it("shows durable progress and only the action allowed by the current phase", async () => {
@@ -111,12 +112,12 @@ describe("RunWorkspace", () => {
       />,
     );
 
-    expect(screen.getByText("32 / 100 个文本块")).toBeTruthy();
+    expect(screen.getByText("30 / 100 个文本块")).toBeTruthy();
     expect(screen.getByText("2 分钟")).toBeTruthy();
     expect(screen.getByText("1,000–1,200")).toBeTruthy();
     expect(screen.getByText("耗时 +5.0% · Token -2.5%")).toBeTruthy();
     expect(screen.getByText("正在因限流调整并发")).toBeTruthy();
-    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("32");
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("30");
     expect(screen.queryByRole("button", { name: "开始整本翻译" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "暂停" }));
     expect(onPause).toHaveBeenCalledTimes(1);
@@ -203,7 +204,7 @@ describe("RunWorkspace", () => {
       />,
     );
     expect(screen.getByText(/3 个文本块需要人工处理/u)).toBeTruthy();
-    expect(screen.getByText("32 / 100 个文本块")).toBeTruthy();
+    expect(screen.getByText("30 / 100 个文本块")).toBeTruthy();
     expect(screen.getByText("检查网络后继续。")).toBeTruthy();
     expect(screen.getByText("socket timeout")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "需要处理的文本块" })).toBeTruthy();

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { semanticParagraphSpans } from "../text/paragraph-spans.js";
 
 export type EvidenceSide = "source" | "target";
 export interface EvidenceReference {
@@ -44,6 +45,19 @@ export function evidenceReferences(side: EvidenceSide, blockId: string, text: st
     start = end;
   }
   return references;
+}
+
+/** Model-facing review evidence never crosses or truncates a semantic paragraph. */
+export function paragraphEvidenceReferences(side: EvidenceSide, blockId: string, text: string): EvidenceReference[] {
+  const hash = createHash("sha256").update(JSON.stringify([side, blockId, text])).digest("hex");
+  return semanticParagraphSpans(text).map(p => ({ id: `${side[0]}:${hash}:${p.scalarStart}:${p.scalarEnd}`,
+    side, blockId, start: p.scalarStart, end: p.scalarEnd, text: p.sourceText }));
+}
+
+/** Existing journals keep their original ranges; new paragraphs add compatible ranges. */
+export function allEvidenceReferences(side: EvidenceSide, blockId: string, text: string): EvidenceReference[] {
+  return [...new Map([...evidenceReferences(side, blockId, text), ...paragraphEvidenceReferences(side, blockId, text)]
+    .map(r => [r.id, r])).values()];
 }
 
 export function resolveEvidenceReference(

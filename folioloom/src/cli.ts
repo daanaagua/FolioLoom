@@ -62,11 +62,14 @@ import {
 import type { IncidentCode } from "./recovery/types.js";
 import {
   auditLosslessBookStore,
+  auditLosslessBookExport,
   type BookArtifactPaths,
   losslessBookArtifactPaths,
   writeLosslessBookArtifacts,
 } from "./report.js";
 import { verifyExport } from "./export/export-verifier.js";
+import { AutomaticRecovery } from "./fullbook/automatic-recovery.js";
+import { QualityQueue, type QualityReworkRequest } from "./fullbook/delivery-policy.js";
 import { importLegacyV1 } from "./migration/v1-importer.js";
 import { auditSourceCoverage } from "./source/auditor.js";
 import {
@@ -79,6 +82,7 @@ import { importSource } from "./source/source-importer.js";
 import { annotateStructure } from "./source/structure-annotator.js";
 import { LosslessBookStore } from "./storage/lossless-book-store.js";
 import { RuntimeProfileStore } from "./storage/runtime-profile-store.js";
+import { directRecoveryStatus, releaseDirectTransportRecovery } from "./fullbook/direct-recovery.js";
 import { validateCommitKnowledgeCommandsRequest } from "./knowledge/knowledge-commands.js";
 import { TerminologyControlService } from "./knowledge/terminology-control-service.js";
 import {
@@ -87,8 +91,12 @@ import {
 } from "./style/style-profile.js";
 
 export type CliCommand =
+  | "book-direct-recovery-status"
+  | "book-direct-recovery-release"
   | "book-supervisor-status"
   | "book-supervisor-release"
+  | "book-quality-status"
+  | "book-quality-rework"
   | "preview"
   | "book-import"
   | "book-preflight"
@@ -110,7 +118,11 @@ export type CliCommand =
   | "book-retrofit-rollback";
 
 export interface CliOptions {
+  workflow?: "direct" | "supervised";
+  planningMode?: "supervised" | "source";
   supervisorMode?: SupervisionMode;
+  chapterReviewMode?: "off" | "bounded";
+  deliveryMode?: "standard" | "strict";
   taskContextFile?: string;
   supervisorReason?: string;
   command: CliCommand;
@@ -802,6 +814,15 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       maxSourceTokens: positiveFlag(values, "--max-source-tokens"),
     };
   }
+  if (action === "direct-recovery") {
+    const operation = argv[2];
+    if (operation !== "status" && operation !== "release") throw new Error("book direct-recovery requires status or release");
+    const { values } = parseFlags(argv.slice(3), `book direct-recovery ${operation}`,
+      operation === "status" ? ["--store", "--run", "--max-attempts"] : ["--store", "--run", "--input"]);
+    return { command: operation === "status" ? "book-direct-recovery-status" : "book-direct-recovery-release",
+      store: pathValue(values, "--store"), runId: identifierValue(values, "--run", true),
+      ...(operation === "release" ? { input: pathValue(values, "--input") } : { maxAttempts: positiveFlag(values, "--max-attempts") }) };
+  }
   if (action === "doctor") {
     const { values } = parseFlags(
       argv.slice(2),
@@ -824,10 +845,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     const { values } = parseFlags(
       argv.slice(2),
       "book audit",
-      ["--store", "--run"],
+      ["--store", "--run", "--delivery-mode"],
     );
     return {
       command: "book-audit",
+      ...(values.has("--delivery-mode") ? { deliveryMode: deliveryModeFlag(values) } : {}),
       store: pathValue(values, "--store"),
       runId: identifierValue(values, "--run", true),
     };
@@ -879,11 +901,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     const { values } = parseFlags(
       argv.slice(2),
       "book verify-export",
-      ["--store", "--run", "--output", "--epub"],
+      ["--store", "--run", "--output", "--epub", "--delivery-mode"],
     );
     const epub = pathValue(values, "--epub", false);
     return {
       command: "book-verify-export",
+      ...(values.has("--delivery-mode") ? { deliveryMode: deliveryModeFlag(values) } : {}),
       store: pathValue(values, "--store"),
       runId: identifierValue(values, "--run", true),
       output: pathValue(values, "--output"),
@@ -911,6 +934,14 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       store: pathValue(values, "--store"), runId: identifierValue(values, "--run"),
       requestId: identifierValue(values, "--request"), supervisorReason: identifierValue(values, "--reason") };
   }
+  if (action === "quality") {
+    const sub = argv[2];
+    if (sub !== "status" && sub !== "rework") throw new Error("book quality requires status or rework");
+    const { values } = parseFlags(argv.slice(3), `book quality ${sub}`, sub === "status" ? ["--store", "--run"] : ["--store", "--run", "--input"]);
+    return { command: sub === "status" ? "book-quality-status" : "book-quality-rework",
+      store: pathValue(values, "--store"), runId: identifierValue(values, "--run"),
+      ...(sub === "rework" ? { input: pathValue(values, "--input") } : {}) };
+  }
   if (action === "run") {
     const { values } = parseFlags(
       argv.slice(2),
@@ -925,7 +956,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--runtime-profile-store",
         "--worker", "--codex-model", "--codex-context-window",
         "--codex-max-output-tokens", "--codex-executable", "--worker-profile",
-        "--supervisor", "--task-context-file",
+        "--supervisor", "--task-context-file", "--delivery-mode", "--chapter-review", "--planning-mode", "--workflow",
       ],
     );
     const explicitProfile = optimizationProfileFlag(
@@ -951,9 +982,21 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       throw new Error("--worker must be codex or external");
     }
     const worker = rawWorker as "codex" | "external" | undefined;
+    const workflow = identifierValue(values, "--workflow");
+    if (workflow !== undefined && workflow !== "direct" && workflow !== "supervised") throw new Error("--workflow must be direct or supervised");
+    const planningMode = identifierValue(values, "--planning-mode");
+    if (planningMode !== undefined && planningMode !== "source" && planningMode !== "supervised") throw new Error("--planning-mode must be source or supervised");
     const supervisorMode = identifierValue(values, "--supervisor");
     if (supervisorMode !== undefined && supervisorMode !== "bounded" && supervisorMode !== "off") throw new Error("--supervisor must be bounded or off");
     if (worker !== undefined && supervisorMode === "bounded") throw new Error("bounded supervisor requires native Pi; do not combine it with --worker");
+    const chapterReviewMode = identifierValue(values, "--chapter-review") ?? (planningMode === "source" ? "bounded" : undefined);
+    if (planningMode === "source" && (worker !== undefined || supervisorMode === "off" || chapterReviewMode !== "bounded")) {
+      throw new Error("source planning requires native bounded supervision and chapter review");
+    }
+    if (chapterReviewMode !== undefined && chapterReviewMode !== "off" && chapterReviewMode !== "bounded") throw new Error("--chapter-review must be bounded or off");
+    if (chapterReviewMode === "bounded" && (worker !== undefined || supervisorMode === "off")) throw new Error("chapter review requires the native bounded supervisor");
+    if (workflow === "direct" && (worker !== undefined || supervisorMode === "bounded" || chapterReviewMode === "bounded" || planningMode !== undefined))
+      throw new Error("direct workflow requires native generation without legacy planning or review options");
     const workerProfile = pathValue(values, "--worker-profile", false);
     if (worker === "external" && workerProfile === undefined) throw new Error("--worker-profile is required with --worker external");
     if (worker !== "external" && workerProfile !== undefined) throw new Error("--worker-profile requires --worker external");
@@ -994,7 +1037,11 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     }
     return {
       command: "book-run",
+      ...(workflow === undefined ? {} : { workflow }),
+      ...(planningMode === undefined ? {} : { planningMode }),
+      deliveryMode: deliveryModeFlag(values),
       ...(supervisorMode === undefined ? {} : { supervisorMode }),
+      ...(chapterReviewMode === undefined ? {} : { chapterReviewMode }),
       taskContextFile: pathValue(values, "--task-context-file", false),
       manifest: pathValue(values, "--manifest"),
       legacyV4Db: pathValue(values, "--v4-db", false),
@@ -1045,11 +1092,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     const { values, booleans } = parseFlags(
       argv.slice(2),
       "book export",
-      ["--store", "--output", "--run"],
+      ["--store", "--output", "--run", "--delivery-mode"],
       ["--allow-incomplete"],
     );
     return {
       command: "book-export",
+      deliveryMode: deliveryModeFlag(values),
       store: pathValue(values, "--store"),
       output: pathValue(values, "--output"),
       runId: identifierValue(values, "--run"),
@@ -1057,6 +1105,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     };
   }
   throw new Error(`unknown book action: ${action}`);
+}
+
+function deliveryModeFlag(values: ReadonlyMap<string, string>): "standard" | "strict" | undefined {
+  const mode = values.get("--delivery-mode");
+  if (mode !== undefined && mode !== "standard" && mode !== "strict") throw new Error("--delivery-mode must be standard or strict");
+  return mode;
 }
 
 function requireOption(options: CliOptions, name: keyof CliOptions): string {
@@ -1107,7 +1161,7 @@ export function buildTranslationRuntimeSet(
     );
   }
   const variantsByEffort = new Map(
-    supportedEfforts.map((effort) => [
+    (mode === "quality" ? [qualityConfig.reasoningEffort as ProviderEffort] : supportedEfforts).map((effort) => [
       effort,
       makeRuntime(withReasoningEffort(qualityConfig, effort)),
     ]),
@@ -1160,6 +1214,19 @@ export async function main(
   dependencyOverrides: Partial<CliRuntimeDependencies> = {},
 ): Promise<void> {
   const options = parseArgs(argv);
+  if (options.command === "book-quality-status" || options.command === "book-quality-rework") {
+    const store = options.command === "book-quality-status"
+      ? LosslessBookStore.openReadOnly(requireOption(options, "store")) : new LosslessBookStore(requireOption(options, "store"));
+    try {
+      const runId = requireOption(options, "runId");
+      if (options.command === "book-quality-rework") {
+        const request = JSON.parse(readFileSync(requireOption(options, "input"), "utf8")) as QualityReworkRequest;
+        store.requestQualityRework(runId, request);
+      }
+      console.log(JSON.stringify({ schema: "folioloom-quality-status-1", runId, items: new QualityQueue(runId, store).items() }, null, 2));
+    } finally { store.close(); }
+    return;
+  }
   if (options.command === "book-supervisor-status" || options.command === "book-supervisor-release") {
     const store = new LosslessBookStore(requireOption(options, "store"));
     try {
@@ -1280,12 +1347,12 @@ export async function main(
   if (options.command === "book-audit") {
     const store = new LosslessBookStore(requireOption(options, "store"));
     try {
-      const report = auditLosslessBookStore(
+      const report = auditLosslessBookExport(
         store,
         requireOption(options, "runId"),
-      );
+      ).audit;
       console.log(JSON.stringify(report, null, 2));
-      if (report.incidentCodes.length > 0) {
+      if (report.incidentCodes.length > 0 && !((options.deliveryMode ?? report.deliveryMode) === "standard" && report.deliveryReady)) {
         throw new CliCommandError(
           "BOOK_AUDIT_FAILED",
           `integrity incidents: ${report.incidentCodes.join(",")}`,
@@ -1308,15 +1375,19 @@ export async function main(
     const store = new LosslessBookStore(requireOption(options, "store"));
     try {
       const runId = requireOption(options, "runId");
-      const audit = auditLosslessBookStore(store, runId);
+      const audit = auditLosslessBookExport(store, runId).audit;
+      const deliveryMode = options.deliveryMode ?? audit.deliveryMode;
       const paths = losslessBookArtifactPaths(
         requireOption(options, "output"),
-        audit.complete,
+        deliveryMode === "standard" ? audit.deliveryReady : audit.complete,
+        undefined,
+        deliveryMode,
       );
       const result = verifyExport(
         options.epub === undefined ? paths : { ...paths, epub: options.epub },
         store,
         runId,
+        deliveryMode,
       );
       console.log(JSON.stringify(result, null, 2));
       if (!result.ok) {
@@ -1328,6 +1399,17 @@ export async function main(
     } finally {
       store.close();
     }
+    return;
+  }
+  if (options.command === "book-direct-recovery-release") {
+    const request = JSON.parse(readFileSync(requireOption(options, "input"), "utf8").replace(/^\uFEFF/u, ""));
+    console.log(JSON.stringify(releaseDirectTransportRecovery(requireOption(options, "store"), requireOption(options, "runId"), request), null, 2));
+    return;
+  }
+  if (options.command === "book-direct-recovery-status") {
+    const store = LosslessBookStore.openReadOnly(requireOption(options, "store"));
+    try { console.log(JSON.stringify(directRecoveryStatus(store, requireOption(options, "runId"), options.maxAttempts), null, 2)); }
+    finally { store.close(); }
     return;
   }
   if (options.command === "book-recover") {
@@ -1400,6 +1482,9 @@ export async function main(
         sourceVersion: state.sourceVersion,
         protocolVersion: state.protocolVersion,
         modelId: state.modelId,
+        deliveryMode: store.deliveryMode(runId) ?? "strict",
+        quality: new QualityQueue(runId, store).items(),
+        automaticRecovery: store.recoveryRecords(runId),
         runMetadata: state.runMetadata,
         status: store.statusSummary(runId),
         supervision: summarizeSupervision((state.runMetadata as { supervision?: { mode?: string } } | undefined)?.supervision?.mode === "bounded" ? "bounded" : "off", store.supervisionRecords(runId), store.allWindows(runId), store.activeTranslations(runId)),
@@ -1414,12 +1499,13 @@ export async function main(
     const store = new LosslessBookStore(requireOption(options, "store"));
     try {
       const runId = resolveRunSelection(store, options.runId, "read") as string;
-      console.log(JSON.stringify(writeLosslessBookArtifacts(
+      const recovery = new AutomaticRecovery({ runId, store });
+      console.log(JSON.stringify(await recovery.exportStep(`export:${resolve(requireOption(options, "output"))}:text`, () => writeLosslessBookArtifacts(
         store,
         runId,
         requireOption(options, "output"),
-        { allowIncomplete: options.allowIncomplete },
-      ), null, 2));
+        { allowIncomplete: options.allowIncomplete, deliveryMode: options.deliveryMode },
+      )), null, 2));
     } finally {
       store.close();
     }
@@ -1443,9 +1529,16 @@ export async function main(
     }
     const taskContext = options.taskContextFile === undefined ? undefined
       : new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(options.taskContextFile));
+    const workflow = options.workflow ?? (selectedRun
+      ? (selectedRun.metadata as { workflow?: { name?: string } } | undefined)?.workflow?.name === "direct" ? "direct" : "supervised"
+      : options.worker || options.planningMode || options.supervisorMode === "bounded" || options.chapterReviewMode === "bounded" ? "supervised" : "direct");
     const supervisorMode = options.supervisorMode ?? (selectedRun === undefined
-      ? options.worker === undefined ? "bounded" : "off"
+      ? workflow === "direct" || options.worker !== undefined ? "off" : "bounded"
       : (selectedRun.metadata as { supervision?: { mode?: string } } | undefined)?.supervision?.mode === "bounded" ? "bounded" : "off");
+    const planningMode = options.planningMode ?? ((selectedRun?.metadata as { sourceExecutionPlan?: unknown } | undefined)?.sourceExecutionPlan
+      ? "source" : "supervised");
+    const chapterReviewMode = options.chapterReviewMode
+      ?? (planningMode === "source" || (selectedRun?.metadata as { chapterReview?: { mode?: string } } | undefined)?.chapterReview?.mode === "bounded" ? "bounded" : "off");
     const style = loadStyleProfile({
       ...(options.styleProfile === undefined ? {} : { profilePath: options.styleProfile }),
       ...(options.prompt === undefined ? {} : { cliPrompt: options.prompt }),
@@ -1524,7 +1617,11 @@ export async function main(
     let result: LosslessBookRunResult;
     try {
       result = await bookRunner({
+        workflow,
+        planningMode,
         supervisorMode,
+        chapterReviewMode,
+        deliveryMode: options.deliveryMode,
         ...(taskContext === undefined ? {} : { taskContext }),
         manifestPath: requireOption(options, "manifest"),
         ...(options.legacyV4Db === undefined ? {} : { legacyV4DbPath: options.legacyV4Db }),

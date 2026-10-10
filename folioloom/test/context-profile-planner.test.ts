@@ -8,6 +8,7 @@ import {
   type ContextPlanningInput,
 } from "../src/fullbook/context-profile-planner.js";
 import type { RiskDimension } from "../src/fullbook/task-risk.js";
+import { variedContextPlanningInput, VARIED_CONTEXT_PROFILES } from "../src/benchmark/context-planning-fixture.js";
 
 function bundle(
   bundleId: string,
@@ -62,6 +63,42 @@ test("context planning covers every required risk within the exact budget", () =
     "entity_identity",
     "control",
   ]);
+});
+
+test("wire byte budgets retain smaller alternatives on the planning frontier", () => {
+  const profiles = planContextProfiles(planningInput([
+    bundle("large", 10, 10, [], [], { byteCost: 91 }),
+    bundle("small", 10, 9, [], [], { byteCost: 40 }),
+    bundle("needed", 20, 12, ["control"], [], { byteCost: 60 }),
+  ], {
+    budgets: { lean: 30, balanced: 30, rich: 30 },
+    maxBytes: 100,
+    requiredCoverage: ["control"],
+  }));
+  for (const profile of Object.values(profiles)) {
+    assert.deepEqual(profile?.bundleIds, ["needed", "small"]);
+    assert.equal(profile?.byteCost, 100);
+  }
+});
+
+test("byte limits preserve mandatory dependency closure and reject infeasible profiles", () => {
+  const bundles = [
+    bundle("anchor", 10, 1, [], [], { byteCost: 60 }),
+    bundle("required", 10, 1, ["control"], ["anchor"], {
+      mandatory: true, byteCost: 41,
+    }),
+  ];
+  const input = planningInput(bundles, { maxBytes: 100 });
+  assert.deepEqual(planContextProfiles(input), {
+    lean: undefined, balanced: undefined, rich: undefined,
+  });
+  const feasible = planContextProfiles({ ...input, maxBytes: 101 });
+  assert.deepEqual(feasible.rich?.bundleIds, ["anchor", "required"]);
+  assert.equal(feasible.rich?.byteCost, 101);
+  assert.throws(() => planContextProfiles({ ...input, maxBytes: -1 }), /byte/iu);
+  assert.throws(() => planContextProfiles(planningInput([
+    bundle("invalid", 1, 1, [], [], { byteCost: NaN }),
+  ])), /byte/iu);
 });
 
 test("selecting an atomic relation closes all of its evidence dependencies", () => {
@@ -250,4 +287,50 @@ test("five hundred bundles plan below fifty milliseconds after warmup", () => {
 
   assert.ok(profiles.rich);
   assert.ok(elapsedMs < 50, `context planning took ${elapsedMs.toFixed(2)} ms`);
+});
+
+test("heterogeneous entry and byte frontiers preserve the pairwise reference profiles", () => {
+  const started = performance.now();
+  assert.deepEqual(planContextProfiles(variedContextPlanningInput()), VARIED_CONTEXT_PROFILES);
+  const elapsedMs = performance.now() - started;
+  assert.ok(elapsedMs < 5_000, `heterogeneous context planning took ${elapsedMs.toFixed(2)} ms`);
+});
+
+test("cross-bucket dominance retains costly alternatives with smaller wire footprints", () => {
+  const evidence = [
+    bundle("mandatory", 1, 1, [], [], { mandatory: true, byteCost: 1 }),
+    bundle("dominated", 45, 4, [], [], { entryCost: 2, byteCost: 40 }),
+    bundle("cheaper", 9, 4, [], [], { byteCost: 40 }),
+    bundle("smaller", 50, 3, [], [], { byteCost: 3 }),
+    bundle("needed", 60, 8, ["control"], [], { byteCost: 20 }),
+  ];
+  const input = planningInput(evidence, {
+    budgets: { lean: 10, balanced: 70, rich: 111 }, maxEntries: 3, maxBytes: 61,
+  });
+  const plans = planContextProfiles(input);
+  assert.deepEqual(plans.lean?.bundleIds, ["cheaper", "mandatory"]);
+  assert.deepEqual(plans.balanced?.bundleIds, ["cheaper", "mandatory", "needed"]);
+  assert.deepEqual(plans.rich, { ...plans.balanced, name: "rich" });
+  const smaller = planContextProfiles({ ...input, maxBytes: 24 });
+  assert.deepEqual(smaller.lean?.bundleIds, ["mandatory"]);
+  assert.deepEqual(smaller.balanced?.bundleIds, ["mandatory", "needed"]);
+  assert.deepEqual(smaller.rich?.bundleIds, ["mandatory", "needed", "smaller"]);
+  assert.deepEqual(planContextProfiles({ ...input, requiredCoverage: ["control"] }).lean, undefined);
+});
+
+test("overflow-sized utilities and collating-equal identities retain legacy choices", () => {
+  const overflow = planContextProfiles(planningInput([
+    bundle("a", 32, Number.MAX_VALUE), bundle("b", 64, Number.MAX_VALUE),
+  ], { budgets: { lean: 32, balanced: 96, rich: 100 } }));
+  assert.deepEqual(overflow.lean?.bundleIds, ["a"]);
+  assert.deepEqual(overflow.rich?.bundleIds, ["a", "b"]);
+  assert.equal(overflow.rich?.utility, Infinity);
+
+  for (const ids of [["é", "e\u0301"], ["e\u0301", "é"]]) {
+    assert.equal(ids[0]!.localeCompare(ids[1]!, "en"), 0);
+    const profiles = planContextProfiles(planningInput(ids.map((id) => bundle(id, 32, 5)), {
+      budgets: { lean: 32, balanced: 32, rich: 32 },
+    }));
+    assert.deepEqual(profiles.rich?.bundleIds, [ids[0]]);
+  }
 });

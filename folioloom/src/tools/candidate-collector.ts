@@ -25,7 +25,8 @@ export type QuestionKind = typeof ALLOWED_QUESTION_KINDS[number];
 export interface ResolutionCandidate {
   questionId: string;
   verdict: string;
-  confidence: number;
+  /** @deprecated Read compatibility only; model submissions do not require a score. */
+  confidence?: number;
   evidenceIds: string[];
   unresolved: string;
 }
@@ -56,7 +57,8 @@ export interface TranslationMemoryCandidate {
   kind: TranslationMemoryKind;
   subjectForms: string[];
   fact: string;
-  confidence: number;
+  /** @deprecated Read compatibility only; ignored by admission. */
+  confidence?: number;
 }
 
 export interface SanitizedTranslationMemoryCandidates {
@@ -98,18 +100,10 @@ export function sanitizeTranslationMemoryCandidates(
       reject(index, "fact");
       continue;
     }
-    if (typeof candidate.confidence !== "number"
-      || !Number.isFinite(candidate.confidence)
-      || candidate.confidence < 0
-      || candidate.confidence > 1) {
-      reject(index, "confidence", candidate.confidence);
-      continue;
-    }
     candidates.push({
       kind: candidate.kind,
       subjectForms: [...candidate.subjectForms],
       fact: candidate.fact,
-      confidence: candidate.confidence,
     });
   }
   return { candidates, warnings };
@@ -123,8 +117,9 @@ export interface TranslationCandidate {
 }
 
 function copyResolution(candidate: ResolutionCandidate): ResolutionCandidate {
+  const { confidence: _legacyScore, ...resolution } = candidate;
   return {
-    ...candidate,
+    ...resolution,
     evidenceIds: [...candidate.evidenceIds],
   };
 }

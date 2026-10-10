@@ -1,4 +1,5 @@
 import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { groundSurfaceUsages } from "../knowledge/surface-consistency.js";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { V4Block } from "../domain/types.js";
@@ -41,6 +42,9 @@ import {
 } from "./translation-request.js";
 import { TranslationValidator } from "../validators/translation-validator.js";
 import { parseFramedTranslationResponse } from "./framed-translation-protocol.js";
+import { hasOnlyNovelSemanticIssues, MAX_SEMANTIC_REPAIR_PASSES, repairIssueKeys } from "../fullbook/semantic-repair-policy.js";
+import { supervisionCandidateHash } from "../domain/supervision.js";
+import { onlySemanticIssues } from "../fullbook/delivery-policy.js";
 
 export { translationBatchSystemPrompt } from "./translation-request.js";
 export type {
@@ -63,11 +67,12 @@ export interface TranslationBatchInput extends TranslationRequestInput {
   additionalValidationFailures?: (
     window: TranslationBatchWindowResult,
   ) => readonly ValidationFailure[];
-  /** A window recovery epoch owns one shared credit; false forbids a model repair. */
+  /** False forbids a model repair; ordinary structural recovery remains single-pass. */
   repairEnabled?: boolean;
+  semanticRepairPasses?: 1 | 2;
   /** Host-owned durable lifecycle hooks; never exposed as model tools. */
   onCandidate?: (window: TranslationBatchWindowResult, phase: "generated" | "repaired") => void | Promise<void>;
-  beforeRepair?: (windows: readonly TranslationBatchWindowResult[]) => void | Promise<void>;
+  beforeRepair?: (windows: readonly TranslationBatchWindowResult[], failures: readonly ValidationFailure[]) => void | boolean | Promise<void | boolean>;
   onRepairRun?: (run: PiRunResult) => void;
   onProviderResponse?: (
     evidence: TranslationProviderResponseEvidence,
@@ -83,6 +88,7 @@ export interface TranslationProviderResponseEvidence
 }
 
 export interface TranslationBatchWindowResult {
+  surfaceUsages?: import("../knowledge/surface-consistency.js").SurfaceUsage[];
   windowId: string;
   ordinal: number;
   status: "completed" | "completed_with_warnings" | "failed";
@@ -92,6 +98,8 @@ export interface TranslationBatchWindowResult {
   notes: string[];
   memoryCandidates: TranslationMemoryCandidate[];
   styleObservation?: StyleObservationSubmission;
+  /** Host-owned, grounded unresolved review findings. Never accepted from model output. */
+  qualityIssues?: readonly ValidationFailure[];
   error?: string;
 }
 
@@ -213,6 +221,7 @@ function validateSubmission(
       status: notes.length > 0 ? "completed_with_warnings" : "completed",
       translations,
       termUsages: copyTermUsages(candidate.termUsages),
+      surfaceUsages: groundSurfaceUsages(input.surfaceMentions ?? [], candidate.surfaceUsages ?? [], translations, input.paragraphFragment),
       notes,
       memoryCandidates: memories.candidates,
       ...(paragraphTranslations === undefined
@@ -439,6 +448,7 @@ function framedSubmission(
 async function validateAndRepair(
   input: TranslationBatchInput,
   initial: Pick<TranslationBatchResult, "windows" | "responseErrors">,
+  recovery: { pass: number; knownReviews?: ReadonlyMap<string, readonly ValidationFailure[]> } = { pass: 0 },
 ): Promise<Pick<TranslationBatchResult, "windows" | "responseErrors" | "repairRuns">> {
   const validator = new TranslationValidator();
   const validationBlocks = validationSourceBlocks(input);
@@ -506,7 +516,7 @@ async function validateAndRepair(
       ...termFailuresForWindow(window, expectedOccurrences),
       ...(input.additionalValidationFailures?.(window) ?? []),
       ...(validation.valid && input.paragraphFragment === undefined
-        ? await input.reviewCandidate?.(window) ?? [] : []),
+        ? recovery.knownReviews?.get(window.windowId) ?? await input.reviewCandidate?.(window) ?? [] : []),
     ]);
   }
   const successfulWindows = initial.windows.filter((window) => window.status !== "failed");
@@ -586,7 +596,12 @@ async function validateAndRepair(
   const failedTranslations = invalid.flatMap((item) => item.window.translations)
     .filter((translation) => repairBlockIds.has(translation.blockId));
   const failures = invalid.flatMap((item) => item.failures);
-  await input.beforeRepair?.(invalid.map(item => item.window));
+  if (invalid.some(item => input.canReviewRepairedCandidate?.(item.window.windowId) === false)) {
+    return failWithoutRepair("validation failed without reserved post-repair review credit");
+  }
+  if (await input.beforeRepair?.(invalid.map(item => item.window), failures) === false) {
+    return failWithoutRepair("validation failed after bounded repair credit");
+  }
   let repair: Awaited<ReturnType<Repairer["repairBatch"]>>;
   try {
     const repairRuntime = input.repairRuntime ?? {
@@ -602,6 +617,7 @@ async function validateAndRepair(
         repaired: false,
       },
       failures,
+      stableTerms: input.stableTerms.filter(term => !term.applicableBlockIds || term.applicableBlockIds.some(id => repairBlockIds.has(id))),
       budget: input.budget,
       model: repairRuntime.model,
       streamFn: repairRuntime.streamFn,
@@ -643,6 +659,14 @@ async function validateAndRepair(
         : window),
     };
   }
+  if (repair.noChange) {
+    if (!onlySemanticIssues(failures) || repair.noChange.candidateHash !== supervisionCandidateHash(failedTranslations)) {
+      throw new Error("no-change repair proposal does not match the grounded semantic candidate");
+    }
+    // Preserve the finding for the existing grounded quality-closure path. Replaying
+    // an identical ordinary review would only reuse its original disputed decision.
+    return { ...failWithoutRepair("validation failed after no-change semantic repair proposal"), repairRuns: [repair.run] };
+  }
   const patchById = new Map(repair.candidate?.translations.map((item) => [
     item.blockId,
     item,
@@ -672,6 +696,7 @@ async function validateAndRepair(
       ),
     ];
     delete repairedWindow.styleObservation;
+    repairedWindow.surfaceUsages = groundSurfaceUsages(input.surfaceMentions ?? [], window.surfaceUsages ?? [], repairedWindow.translations, input.paragraphFragment);
     return repairedWindow;
   });
   const windows = normalizeWindowTypography(
@@ -680,13 +705,14 @@ async function validateAndRepair(
     new Map(validationBlocks.map((block) => [block.id, block.sourceText])),
   );
   const validatedWindows: TranslationBatchWindowResult[] = [];
+  const postRepairFailuresByWindow = new Map<string, readonly ValidationFailure[]>();
+  const postRepairReviews = new Map<string, readonly ValidationFailure[]>();
   for (const window of windows) {
     const item = invalidById.get(window.windowId);
     if (item === undefined || window.status === "failed") {
       validatedWindows.push(window);
       continue;
     }
-    await input.onCandidate?.(window, "repaired");
     const validation = validator.validate(
       item.blocks,
       candidateFor(window),
@@ -695,8 +721,13 @@ async function validateAndRepair(
     const termFailures = termFailuresForWindow(window, expectedOccurrences);
     const additionalFailures =
       input.additionalValidationFailures?.(window) ?? [];
-    const reviewFailures = validation.valid && input.paragraphFragment === undefined
+    const deterministicValid = validation.valid && termFailures.length === 0 && additionalFailures.length === 0;
+    // A rejected patch must not replace the last recoverable candidate.
+    if (deterministicValid) await input.onCandidate?.(window, "repaired");
+    const reviewFailures = deterministicValid && input.paragraphFragment === undefined
       ? await input.reviewCandidate?.(window) ?? [] : [];
+    postRepairReviews.set(window.windowId, reviewFailures);
+    postRepairFailuresByWindow.set(window.windowId, [...validation.failures, ...termFailures, ...additionalFailures, ...reviewFailures]);
     if (validation.valid
       && termFailures.length === 0
       && additionalFailures.length === 0 && reviewFailures.length === 0) {
@@ -709,7 +740,7 @@ async function validateAndRepair(
       translations: [],
       termUsages: [],
       memoryCandidates: [],
-      error: `validation failed after one targeted repair: ${
+      error: `validation failed after ${recovery.pass + 1} targeted repair pass(es): ${
         failureMessage([
           ...validation.failures,
           ...termFailures,
@@ -749,6 +780,21 @@ async function validateAndRepair(
       error: `cross-block validation failed after one targeted repair: ${failureMessage(failures)}`,
     };
   });
+  const rejected = finalWindows.filter(window => window.status === "failed");
+  const limit = Math.min(input.semanticRepairPasses ?? 1, MAX_SEMANTIC_REPAIR_PASSES);
+  if (recovery.pass + 1 < limit && postRepairCrossValidation.valid && rejected.length > 0
+    && rejected.every(window => {
+      const previous = invalidById.get(window.windowId);
+      const current = windows.find(w => w.windowId === window.windowId)!;
+      return previous !== undefined
+        && supervisionCandidateHash(previous.window.translations) !== supervisionCandidateHash(current.translations)
+        && hasOnlyNovelSemanticIssues(repairIssueKeys(previous.failures), postRepairFailuresByWindow.get(window.windowId) ?? []);
+    })) {
+    // Keep complete candidate text and reuse its already-recorded review, not a
+    // new translation or an additional review of the identical candidate.
+    const next = await validateAndRepair(input, { ...initial, windows }, { pass: recovery.pass + 1, knownReviews: postRepairReviews });
+    return { ...next, repairRuns: [repair.run, ...next.repairRuns] };
+  }
   return {
     windows: finalWindows,
     responseErrors: initial.responseErrors,
@@ -773,7 +819,43 @@ export async function reviewAndRepairTranslationBatchCandidate(
   input: TranslationBatchInput,
   initial: Pick<TranslationBatchResult, "windows" | "responseErrors">,
 ): Promise<Pick<TranslationBatchResult, "windows" | "responseErrors" | "repairRuns">> {
-  return validateAndRepair(input, initial);
+  if (input.deliveryMode !== "standard") return validateAndRepair(input, initial);
+  const latest = new Map(initial.windows.map(window => [window.windowId, window]));
+  const reviewed = new Map<string, { candidate: TranslationBatchWindowResult; issues: readonly ValidationFailure[] }>();
+  const checked = await validateAndRepair({ ...input,
+    onCandidate: async (window, phase) => {
+      latest.set(window.windowId, structuredClone(window));
+      await input.onCandidate?.(window, phase);
+    },
+    reviewCandidate: async window => {
+      const issues = await input.reviewCandidate?.(window) ?? [];
+      const candidate = latest.get(window.windowId);
+      if (candidate && supervisionCandidateHash(candidate.translations) === supervisionCandidateHash(window.translations)) {
+        reviewed.set(window.windowId, { candidate: structuredClone(candidate), issues });
+      }
+      return issues;
+    },
+  }, initial);
+  const eligible = checked.windows.filter(window => {
+    const review = reviewed.get(window.windowId);
+    return window.status === "failed" && /^validation failed/u.test(window.error ?? "")
+      && review
+      && onlySemanticIssues(review.issues);
+  });
+  if (eligible.length === 0) return checked;
+  const ids = new Set(eligible.map(window => window.windowId));
+  // Re-run all deterministic gates, including cross-window alignment, on the
+  // actual candidate to deliver. Semantic uncertainty cannot waive these gates.
+  const validated = await validateTranslationBatchCandidate({ ...input, deliveryMode: "strict", reviewCandidate: undefined }, {
+    ...checked, windows: checked.windows.map(window => ids.has(window.windowId) ? reviewed.get(window.windowId)!.candidate : window),
+  });
+  return { ...checked, windows: validated.windows.map(window => {
+    if (!ids.has(window.windowId) || window.status === "failed") return window;
+    const { styleObservation: _style, ...candidate } = window;
+    return { ...candidate, status: "completed_with_warnings", memoryCandidates: [],
+      qualityIssues: structuredClone(reviewed.get(window.windowId)!.issues),
+      notes: [...window.notes, "Semantic review findings retained in the quality report."] };
+  }) };
 }
 
 export async function runTranslationBatch(

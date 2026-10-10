@@ -1,51 +1,56 @@
 # FolioLoom current state
 
-- Date: 2026-09-29 (Asia/Shanghai).
-- Native Pi bounded supervision now plans batches, queries source evidence,
-  requests grounded review/repair, and persists pause/release decisions. Task
-  context is shared across model phases and checked on resume. CLI and desktop
-  new native runs enable supervision by default; legacy runs retain their mode.
-- Supervisor verification: 1040 core tests passed with one environment skip;
-  74 renderer tests, both type checks, desktop build, and launch-form browser
-  checks passed. [Architecture and controls](docs/bounded-supervisor.md).
-- EPUB validation now ignores whitespace-only paragraph spans at lossless block
-  boundaries; content and structural-slot checks remain strict. 53 focused tests
-  and type checking passed. [Details](state/2026-09-29.md).
-- Version: v1.8.0. Release notes: [v1.8.0](docs/releases/v1.8.0.md).
-- Native live gates: 549-word translation/export and 96-word requested semantic
-  review/export completed with fully accounted usage. Review schemas now explicitly
-  exclude plan-only fields. Build dependency high/critical audit gate passes.
-- Development branch: `feat/framework-neutral-worker-20260911` adds a host-neutral
-  translation skill and a versioned external-framework/model worker protocol.
-  Codex remains a separate compatible backend. OpenCode and Claude Code have
-  bundled bridges; other CLIs/SDKs can implement the same contract.
-- Worker verification: 1018 core tests passed, one environment-dependent skip;
-  nine skill/bridge tests and both type checks passed. A 117-word OpenCode run
-  passed audit, strict export, verification, and no-call resume in 17.27 seconds.
-  See [external worker evidence](state/2026-09-11.md).
-- Desktop model discovery now scans live endpoints, labels fallback and empty
-  results, and preserves the selected model. New configurations use
-  `deepseek-flash`; existing run identities remain unchanged.
-- Native Pi wire data omits local revision hashes; full audit data stays local.
-  DeepSeek planning deduplicates seven effort aliases into four strategies.
-- Verification: 84 focused Node regressions, 73 renderer tests, type checks,
-  desktop build, live discovery, and a canonical-ID 549-word run (59.6 seconds,
-  strict export passed). See the [discovery report](docs/reports/2026-09-11-live-model-discovery.md).
-- Storage remains schema v5. Existing local edits are replay-audited; ambiguous
-  or corrupt edits block strict export rather than being silently rewritten.
-- Still planned: visual source-range selection, per-edit diffs, live panel
-  refresh, gradual store/runner extraction, and automated packaged-release gates.
-- Fresh English/German 100K and full-book literary quality benchmarks remain
-  deferred; historical README timings are not new v1.7.1 measurements.
+- Date: 2026-10-10 (Asia/Shanghai). Version v1.11.0; storage schema v5.
+- Build dependency source-map-js is locked to 1.2.2. The high-severity audit gate
+  passes; the existing moderate exceljs/uuid dependency findings remain visible.
+- New native CLI/desktop direct runs use protocol 3: typed source-attested entity
+  names, contextual term preferences, exact evidence validation and SQLite memory.
+  Ordinary/uncertain entries are excluded; explicit glossary precedence is retained.
+- Durable fixed waves collect drafts and merge names in source order. All declared
+  hard conflicts use one frozen repair plan within the original attempt allowance.
+  Outer decoration and source-attested possessive comparison never rewrite prose.
+- Existing protocols 1/2 keep their prompts and identities. Protocol-2 recovery
+  checks all same-input saved responses against current names across context changes,
+  preserving attempt counts, original response provenance and actual token accounting.
+- Direct preflight precedes store creation and token reservation. Explicit scoped
+  TLS compatibility offers classical groups while retaining TLS 1.3 and certificate
+  checks; unrelated requests and global TLS defaults remain unchanged.
+- Explicit direct transport releases reference the original identity and last
+  request, add bounded durable credit to one exhausted transport-only window, and
+  retain an eight-attempt lifetime cap. Ordinary restart and duplicate releases
+  cannot renew credit. Old usage, response evidence and token envelopes are retained.
+- Validation: 1,414 core tests passed, one Windows environment skip; 78 focused
+  CLI/direct/network tests, core/desktop type checks, production build and artifact
+  check passed. Repository and installed translation skills validated.
+- A 49,980-word native trial completed all 19 windows and verified standard text
+  and EPUB exports. After transport correction, 16 responses completed without new
+  connection failures or missing usage. Historical unknown usage still blocks strict
+  accounting; standard delivery does not imply exhaustive semantic verification.
+- Native protocol-3 smoke: four windows across restart and concurrent execution,
+  four responses, 5,188 actual tokens, no retries or missing usage; strict export
+  verification passed. This is not a full-book protocol-3 throughput measurement.
+- Source planning, bounded supervision, inflection discovery, scoped terminology
+  controls and audited retrofit remain available in their compatible workflows.
+
+## Remaining scope
+
+- Declared naming evidence is not exhaustive semantic verification. Omitted names,
+  incorrect model classification, sentence-level omissions and distant references
+  require separate quality assessment; existing committed text is not rewritten.
+- Optional names without required evidence are discarded; later attested entries
+  can establish a different spelling without retrospectively correcting early text.
+- Provider-wide cross-phase circuit coordination remains specified separately in
+  [the recovery design](docs/specs/2026-10-09-provider-recovery.md).
+- Product backlog: visual source-range selection, per-edit diffs, live panel refresh,
+  and gradual store/runner extraction.
 
 ## History
 
-- [EPUB block-edge validation](state/2026-09-29.md)
+- [v1.11.0 verification scope](state/2026-10-10.md)
+- [Scoped TLS compatibility, direct recovery and typed naming](state/2026-10-09.md)
+- [Candidate-bound repair and readonly decision handoff](state/2026-10-07.md)
+- [Review evidence and bounded retrieval](state/2026-10-06.md)
+- [Revalidation review lifecycle](state/2026-10-05.md)
+- [Quality closure and surface consistency](state/2026-10-04.md)
+- [Provider networking](docs/provider-network.md)
 - [External framework workers](state/2026-09-11.md)
-- [Live discovery and Pi planning](docs/reports/2026-09-11-live-model-discovery.md)
-- [Pi wire measurement](docs/reports/2026-09-11-pi-request-wire-measurement.md)
-- [Pi request efficiency plan](docs/specs/2026-09-11-pi-request-wire-efficiency.md)
-- [2026-09-05 reliability patch](state/2026-09-05.md)
-- [v1.7.1 patch notes](docs/releases/v1.7.1.md)
-- [v1.7.0 release](docs/releases/v1.7.0.md)
-- [July execution/scheduler history](state/2026-07-30-legacy.md)

@@ -15,6 +15,7 @@ import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { WeightedTokenEstimator } from "../src/source/token-estimator.js";
 import type { LosslessBlock } from "../src/source/types.js";
+import type { StableTerm } from "../src/domain/types.js";
 
 function block(id: string, index: number, sourceText: string): LosslessBlock {
   return {
@@ -74,6 +75,28 @@ function fixture() {
     } as never,
   };
 }
+
+test("wire terms omit unrelated global vocabulary while preserving locks, legacy terms and entity aliases", () => {
+  const input = fixture();
+  const term = (id: string, sourceForm: string, extra: Partial<StableTerm> = {}): StableTerm => ({
+    conceptId: id, lexemeId: id, sourceForm, canonicalSource: sourceForm, target: `译名${id}`, locked: false,
+    semanticClass: "proper_name", revisionId: `revision-${id}`, renderFingerprint: "a".repeat(64),
+    policy: "preferred", allowedTargets: [`译名${id}`], ...extra,
+  });
+  const stableTerms = [
+    term("opening", "Opening", { entityId: "entity-opening" }),
+    term("alias", "The Quiet One", { entityId: "entity-opening" }),
+    term("locked", "Unseen Locked", { locked: true, policy: "locked" }),
+    term("tail", "Remembered", {}),
+    { ...input.stableTerms[0]!, locked: false },
+    ...Array.from({ length: 100 }, (_, index) => term(`unrelated-${index}`, `DistantUnrelated${index}`)),
+  ];
+  const prepared = prepareTranslationRequest({ ...input, stableTerms, previousActiveTail: "Remembered" });
+  const visibleTerms = JSON.parse(/STABLE TERMS\n\n([^\n]+)/u.exec(prepared.prompt)![1]!) as StableTerm[];
+  assert.deepEqual(visibleTerms.map(t => t.conceptId), ["opening", "alias", "locked", "tail", "archon"]);
+  assert.equal(stableTerms.length, 105, "local terminology and audit dependencies must remain intact");
+  assert.ok(prepared.prompt.length < JSON.stringify(stableTerms).length);
+});
 
 test("one request builder serializes all translator-visible projections and one tool schema", () => {
   const prepared = prepareTranslationRequest(fixture());

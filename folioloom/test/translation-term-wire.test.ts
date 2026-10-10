@@ -78,7 +78,7 @@ test("budget assessment uses compact wire terms rather than the full audit recor
   assert.ok(!JSON.stringify(terms).includes(input.stableTerms[0]!.revisionId!));
 });
 
-test("terminology-rich wire shrinks without pruning any term or rendering field", (t) => {
+test("terminology-rich wire projects relevance without pruning local records or retained rendering fields", (t) => {
   const input = fixture();
   const terms: StableTerm[] = [...input.stableTerms];
   for (let index = 0; index < 199; index++) {
@@ -92,18 +92,21 @@ test("terminology-rich wire shrinks without pruning any term or rendering field"
       renderFingerprint: concept.renderFingerprint});
   }
   input.stableTerms = terms;
+  const before = JSON.stringify(input);
   const prepared = prepareTranslationRequest(input);
   const section = prepared.sections.find((item) => item.kind === "terms")!;
-  const legacyText = ["STABLE TERMS", JSON.stringify(terms), "UNRESOLVED ENTITY LINKS",
-    "[]", "TERM OCCURRENCES", JSON.stringify(prepared.expectedTermOccurrences)].join("\n\n");
+  const legacyText = ["STABLE TERMS", JSON.stringify(terms.map(withoutAudit)), "UNRESOLVED ENTITY LINKS",
+    "[]", "TERM OCCURRENCES", JSON.stringify(prepared.expectedTermOccurrences.map(withoutAudit))].join("\n\n");
   const oldBytes = Buffer.byteLength(legacyText, "utf8");
   const newBytes = Buffer.byteLength(section.text, "utf8");
   const legacyPrompt = prepared.sections.map((item) => item.kind === "terms" ? legacyText : item.text).join("\n\n");
   assert.ok(newBytes < oldBytes * 0.8);
   const payload = section.jsonPayload as {stableTerms: StableTerm[]};
-  assert.deepEqual(payload.stableTerms, terms.map(withoutAudit));
-  assert.equal(payload.stableTerms.length, 200);
-  t.diagnostic(JSON.stringify({terms: 200, oldTermsBytes: oldBytes, compactTermsBytes: newBytes,
+  assert.deepEqual(payload.stableTerms, [withoutAudit(terms[0]!)]);
+  assert.equal(payload.stableTerms.length, 1);
+  assert.equal(JSON.stringify(input), before);
+  assert.deepEqual(prepared.expectedTermOccurrences, expectedTermOccurrencesForTranslationInput(input));
+  t.diagnostic(JSON.stringify({localTerms: 200, wireTerms: 1, oldTermsBytes: oldBytes, compactTermsBytes: newBytes,
     reductionPercent: Math.round((1 - newBytes / oldBytes) * 1000) / 10,
     oldPromptBytes: Buffer.byteLength(legacyPrompt, "utf8"),
     compactPromptBytes: Buffer.byteLength(prepared.prompt, "utf8")}));

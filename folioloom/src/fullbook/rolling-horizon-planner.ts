@@ -16,6 +16,8 @@ export interface TaskExecutionVariant {
   readonly protocol: "typed_tool" | "framed_text" | "local";
   readonly validators: readonly string[];
   readonly predicted: RuntimePrediction;
+  /** Peak simultaneous reservation; totalTokens includes sequential calls. */
+  readonly inFlightTokens?: number;
 }
 
 export interface RunningTaskReservation {
@@ -23,6 +25,7 @@ export interface RunningTaskReservation {
   readonly variantId: string;
   readonly remainingP90DurationMs: number;
   readonly reservedTokens: number;
+  readonly inFlightTokens?: number;
 }
 
 export interface RollingPlannerInput {
@@ -50,6 +53,7 @@ export interface RollingPlannerAction {
   readonly startOffsetMs: number;
   readonly p90DurationMs: number;
   readonly totalTokens: number;
+  readonly inFlightTokens?: number;
   readonly expectedReworkMs: number;
   readonly dispatch: readonly PlannedTaskDispatch[];
 }
@@ -89,6 +93,7 @@ interface Batch {
   readonly taskMask: number;
   readonly p90DurationMs: number;
   readonly totalTokens: number;
+  readonly inFlightTokens: number;
   readonly expectedReworkMs: number;
   readonly dispatch: readonly PlannedTaskDispatch[];
 }
@@ -307,6 +312,10 @@ function validatedVariant(
       raw.predicted,
       `variant ${variantId} prediction`,
     ),
+    inFlightTokens: nonnegativeInteger(
+      raw.inFlightTokens ?? raw.predicted.totalTokens,
+      `variant ${variantId} inFlightTokens`,
+    ),
   });
 }
 
@@ -368,6 +377,10 @@ function validateInput(input: RollingPlannerInput): ValidatedInput {
         raw.reservedTokens,
         `running[${index}].reservedTokens`,
       ),
+      inFlightTokens: nonnegativeInteger(
+        raw.inFlightTokens ?? raw.reservedTokens,
+        `running[${index}].inFlightTokens`,
+      ),
     });
   }).sort((left, right) =>
     left.remainingP90DurationMs - right.remainingP90DurationMs
@@ -396,7 +409,7 @@ function validateInput(input: RollingPlannerInput): ValidatedInput {
       "runningReservedTokens must equal reservation token total",
     );
   }
-  if (runningReservedTokens > maxInFlightTokens) {
+  if (running.reduce((sum, item) => sum + item.inFlightTokens, 0) > maxInFlightTokens) {
     throw new TypeError("running reservations exceed maxInFlightTokens");
   }
   if (!Array.isArray(input.variants)) {
@@ -463,12 +476,16 @@ function predictionDominates(
   const noWorse = left.predicted.p90DurationMs
       <= right.predicted.p90DurationMs
     && left.predicted.totalTokens <= right.predicted.totalTokens
+    && (left.inFlightTokens ?? left.predicted.totalTokens)
+      <= (right.inFlightTokens ?? right.predicted.totalTokens)
     && left.predicted.failureProbability
       <= right.predicted.failureProbability;
   if (!noWorse) return false;
   const strictlyBetter = left.predicted.p90DurationMs
       < right.predicted.p90DurationMs
     || left.predicted.totalTokens < right.predicted.totalTokens
+    || (left.inFlightTokens ?? left.predicted.totalTokens)
+      < (right.inFlightTokens ?? right.predicted.totalTokens)
     || left.predicted.failureProbability
       < right.predicted.failureProbability;
   return strictlyBetter
@@ -681,6 +698,10 @@ function batchFromVariants(
       (total, variant) => total + variant.predicted.totalTokens,
       0,
     ),
+    inFlightTokens: selected.reduce(
+      (total, variant) => total + (variant.inFlightTokens ?? variant.predicted.totalTokens),
+      0,
+    ),
     expectedReworkMs: selected.reduce(
       (total, variant) =>
         total + variant.predicted.failureProbability
@@ -741,7 +762,7 @@ function enumerateBatches(
   for (let taskIndex = 0; taskIndex < variantsByTaskIndex.length; taskIndex += 1) {
     if ((readyTaskMask & (1 << taskIndex)) === 0) continue;
     for (const variant of variantsByTaskIndex[taskIndex] ?? []) {
-      if (variant.predicted.totalTokens > availableInFlightTokens) continue;
+      if ((variant.inFlightTokens ?? variant.predicted.totalTokens) > availableInFlightTokens) continue;
       const variants = [variant];
       const batch = batchFromVariants(variants, taskIndexById);
       level.push({
@@ -776,7 +797,7 @@ function enumerateBatches(
           continue;
         }
         for (const variant of variantsByTaskIndex[taskIndex] ?? []) {
-          if (partial.batch.totalTokens + variant.predicted.totalTokens
+          if (partial.batch.inFlightTokens + (variant.inFlightTokens ?? variant.predicted.totalTokens)
             > availableInFlightTokens) {
             continue;
           }
@@ -816,7 +837,7 @@ function feasibleBatchesForState(
   for (const batch of pool) {
     const batchSize = batch.dispatch.length;
     if (batchSize > freeSlots
-      || batch.totalTokens > availableInFlightTokens
+      || batch.inFlightTokens > availableInFlightTokens
       || (batch.taskMask & readyMask) !== batch.taskMask) {
       continue;
     }
@@ -870,6 +891,7 @@ function actionsForLabel(label: Label): readonly RollingPlannerAction[] {
       startOffsetMs: current.lastStartOffsetMs,
       p90DurationMs: batch.p90DurationMs,
       totalTokens: batch.totalTokens,
+      inFlightTokens: batch.inFlightTokens,
       expectedReworkMs: batch.expectedReworkMs,
       dispatch: batch.dispatch,
     });
@@ -901,7 +923,7 @@ function scheduleAroundReservations(
     return {
       endMs: reservation.remainingP90DurationMs,
       slots: 1,
-      tokens: reservation.reservedTokens,
+      tokens: reservation.inFlightTokens ?? reservation.reservedTokens,
     };
   });
   const scheduled: RollingPlannerAction[] = [];
@@ -943,7 +965,7 @@ function scheduleAroundReservations(
         0,
       );
       if (occupiedSlots + action.dispatch.length <= input.maxConcurrency
-        && occupiedTokens + action.totalTokens
+        && occupiedTokens + (action.inFlightTokens ?? action.totalTokens)
           <= input.maxInFlightTokens) {
         startOffsetMs = eventTime;
         break;
@@ -953,7 +975,7 @@ function scheduleAroundReservations(
     occupancies.push({
       endMs,
       slots: action.dispatch.length,
-      tokens: action.totalTokens,
+      tokens: action.inFlightTokens ?? action.totalTokens,
     });
     for (const dispatch of action.dispatch) {
       completionByTaskId.set(dispatch.taskId, endMs);
@@ -1167,7 +1189,7 @@ export function planRollingHorizon(
         const freeSlots = input.maxConcurrency - active.length;
         const availableInFlightTokens = input.maxInFlightTokens
           - active.reduce(
-            (total, reservation) => total + reservation.reservedTokens,
+            (total, reservation) => total + (reservation.inFlightTokens ?? reservation.reservedTokens),
             0,
           );
         const stateBatchKey = `${readyMask}:${freeSlots}:${availableInFlightTokens}`;

@@ -4,6 +4,8 @@ import type { TermUsageSubmission } from "../knowledge/term-usage.js";
 import type { LosslessBlock } from "../source/types.js";
 import { hasSemanticText } from "../text/semantic-text.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
+import { semanticParagraphSpans } from "../text/paragraph-spans.js";
+import { groundSurfaceUsages, type SurfaceUsage } from "../knowledge/surface-consistency.js";
 
 export const PARAGRAPH_FRAGMENT_PLAN_VERSION =
   "paragraph-fragment-plan-v1" as const;
@@ -12,6 +14,8 @@ export const PARAGRAPH_FRAGMENT_POLICY_VERSION =
 export const DEFAULT_MAX_TARGET_PARAGRAPHS_PER_FRAGMENT = 10;
 export const DEFAULT_MAX_SOURCE_TOKENS_PER_FRAGMENT = 720;
 export const PARAGRAPH_FRAGMENT_FIRST_THRESHOLD = 12;
+/** Primary generation retains typed paragraph coverage without recovery-sized calls. */
+export const PRIMARY_PARAGRAPH_FRAGMENT_LIMITS = Object.freeze({ maxTargetParagraphs: 24, maxSourceTokens: 2400 });
 const DEFAULT_TARGET_PARAGRAPHS_PER_FRAGMENT = 8;
 const DEFAULT_TARGET_SOURCE_TOKENS_PER_FRAGMENT = 640;
 
@@ -68,6 +72,7 @@ export interface ParagraphFragmentCandidate {
   snapshotId: string;
   paragraphs: Array<{ paragraphId: string; text: string }>;
   termUsages: TermUsageSubmission[];
+  surfaceUsages?: SurfaceUsage[];
   notes: string[];
   memoryCandidates: TranslationMemoryCandidate[];
 }
@@ -75,6 +80,7 @@ export interface ParagraphFragmentCandidate {
 export interface ParagraphFragmentAssembly {
   readonly translation: { blockId: string; text: string };
   readonly termUsages: TermUsageSubmission[];
+  readonly surfaceUsages: SurfaceUsage[];
   readonly notes: string[];
   readonly memoryCandidates: TranslationMemoryCandidate[];
 }
@@ -110,9 +116,6 @@ export function paragraphFragmentExecutionScope(
   };
 }
 
-const PARAGRAPH_SEPARATOR =
-  /(?:\r?\n)[\t ]*(?:\r?\n)+|\[\[\]\]/gu;
-
 function requireNonempty(value: string, label: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new TypeError(`${label} must be nonempty`);
@@ -131,64 +134,9 @@ function stableHash(parts: readonly string[]): string {
   return hash.digest("hex");
 }
 
-function trimmedSourceSpan(
-  sourceText: string,
-  start: number,
-  end: number,
-): { start: number; end: number; text: string } | undefined {
-  const raw = sourceText.slice(start, end);
-  if (!hasSemanticText(raw)) return undefined;
-  const leading = raw.match(/^\s*/u)?.[0].length ?? 0;
-  const trailing = raw.match(/\s*$/u)?.[0].length ?? 0;
-  const trimmedStart = start + leading;
-  const trimmedEnd = Math.max(trimmedStart, end - trailing);
-  const text = sourceText.slice(trimmedStart, trimmedEnd);
-  return hasSemanticText(text)
-    ? { start: trimmedStart, end: trimmedEnd, text }
-    : undefined;
-}
-
 export function sourceParagraphSpans(block: LosslessBlock): SourceParagraphSpan[] {
-  const boundaries: Array<{ start: number; end: number }> = [];
-  let start = 0;
-  for (const match of block.sourceText.matchAll(PARAGRAPH_SEPARATOR)) {
-    const separatorStart = match.index;
-    if (separatorStart === undefined) continue;
-    boundaries.push({ start, end: separatorStart });
-    start = separatorStart + match[0].length;
-  }
-  boundaries.push({ start, end: block.sourceText.length });
-
-  return boundaries.flatMap((boundary) => {
-    const span = trimmedSourceSpan(
-      block.sourceText,
-      boundary.start,
-      boundary.end,
-    );
-    if (span === undefined) return [];
-    const ordinal = boundaries
-      .slice(0, boundaries.indexOf(boundary))
-      .filter((candidate) =>
-        trimmedSourceSpan(
-          block.sourceText,
-          candidate.start,
-          candidate.end,
-        ) !== undefined)
-      .length;
-    return [{
-      paragraphId: `${block.id}:paragraph:${String(ordinal).padStart(4, "0")}`,
-      ordinal,
-      scalarStart: Array.from(
-        block.sourceText.slice(0, span.start),
-      ).length,
-      scalarEnd: Array.from(
-        block.sourceText.slice(0, span.end),
-      ).length,
-      utf16Start: span.start,
-      utf16End: span.end,
-      sourceText: span.text,
-    }];
-  });
+  return semanticParagraphSpans(block.sourceText).map(span => ({ ...span,
+    paragraphId: `${block.id}:paragraph:${String(span.ordinal).padStart(4, "0")}` }));
 }
 
 export function paragraphFragmentFirstRequired(block: LosslessBlock): boolean {
@@ -445,6 +393,7 @@ export function assembleParagraphFragmentCandidates(
 
   const translatedParagraphs: Array<{ paragraphId: string; text: string }> = [];
   const termUsages: TermUsageSubmission[] = [];
+  const surfaceUsages: SurfaceUsage[] = [];
   const notes: string[] = [];
   const memoryCandidates: TranslationMemoryCandidate[] = [];
   for (const unit of plan.units) {
@@ -487,6 +436,8 @@ export function assembleParagraphFragmentCandidates(
       translatedParagraphs.push({ ...paragraph });
     }
     termUsages.push(...candidate.termUsages.map((usage) => ({ ...usage })));
+    surfaceUsages.push(...groundSurfaceUsages(candidate.surfaceUsages ?? [], candidate.surfaceUsages ?? [],
+      [{ blockId: plan.blockId, text: candidate.paragraphs.map(p => p.text).join("\n\n") }], unit));
     notes.push(...candidate.notes);
     memoryCandidates.push(...candidate.memoryCandidates);
   }
@@ -504,6 +455,7 @@ export function assembleParagraphFragmentCandidates(
       text: translatedParagraphs.map((paragraph) => paragraph.text).join("\n\n"),
     },
     termUsages,
+    surfaceUsages,
     notes,
     memoryCandidates: uniqueByCanonicalJson(memoryCandidates),
   };

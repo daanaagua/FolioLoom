@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { boundedTextExcerpt } from "../text/bounded-excerpt.js";
 
 import { planBookWindows, type WindowPlanOptions } from "../fullbook/window-planner.js";
 import type { BookWindowPlan } from "../fullbook/types.js";
@@ -119,18 +120,19 @@ export function createStoreRecoveryIncident(
   attemptedStrategies: readonly RecoveryStrategy[] = [],
 ): RecoveryIncident {
   const state = store.auditState(runId);
-  const sourceExcerpt = state.blocks
+  const sourceText = state.blocks
     .map((block) => block.sourceText)
-    .join("")
-    .slice(0, 2_000);
+    .join("");
+  const preview = boundedTextExcerpt(sourceText, 2_000);
   return {
     incidentId: randomUUID(),
     code,
     runId,
     stage: "preflight_blocked",
-    range: { start: 0, end: Math.min(state.canonicalChars, 2_000) },
+    range: { start: 0, end: preview.range.end },
     invariant: `${code} prevents proof of lossless source or run lineage`,
-    sourceExcerpt,
+    sourceExcerpt: preview.text,
+    sourceExcerptRange: preview.range,
     structureAnnotations: [],
     attemptedStrategies: [...attemptedStrategies],
     suggestedAction: "apply only a registered shadow recovery policy",

@@ -8,6 +8,7 @@ import {
   type KnowledgeRevision,
 } from "./knowledge-store.js";
 import { createTermRenderingRule } from "./term-rendering-rule.js";
+import { combineLexicalPreferences, readLexicalPreference } from "./lexical-preference.js";
 
 function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -56,6 +57,7 @@ export function stableTermsFromKnowledge(
   revisions: readonly unknown[],
 ): StableTerm[] {
   const terms: StableTerm[] = [];
+  const preferences: StableTerm[] = [];
   for (const raw of revisions) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
       continue;
@@ -63,6 +65,11 @@ export function stableTermsFromKnowledge(
     const revision = raw as Partial<KnowledgeRevision>;
     if (revision.status !== "active") continue;
     const payload = record(revision.payload);
+    if (revision.kind?.startsWith("lexical_preference:")) {
+      const term = readLexicalPreference(payload);
+      if (term !== undefined) preferences.push({ ...term, origin: "knowledge" });
+      continue;
+    }
     if (typeof revision.kind === "string"
       && revision.kind.startsWith("term_rendering_rule:")
       && payload !== undefined
@@ -213,5 +220,5 @@ export function stableTermsFromKnowledge(
       })));
     }
   }
-  return terms;
+  return [...terms, ...combineLexicalPreferences(preferences)];
 }

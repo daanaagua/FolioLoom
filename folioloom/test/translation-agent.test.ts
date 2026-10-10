@@ -169,6 +169,21 @@ test("translator validates every locked glossary or legacy term", async () => {
   assert.equal(outcome.humanRequired, true);
 });
 
+test("on-demand excerpt retains a late literal match and declares its clipped boundaries", async () => {
+  const target = chapterBlock(0, "The scape changed.");
+  const future = chapterBlock(1, "An unrelated detail. ".repeat(100) + "The scape is a shared scene. " + "More detail. ".repeat(100));
+  const evidenceIndex = EvidenceIndex.fromBlocks([target, future]);
+  try {
+    const tools = new TranslationTools({ budget:new BudgetLedger(),targetBlocks:[target],collector:new CandidateCollector(),stableTerms:[],resolvedEvidence:[],styleState:{},evidenceIndex });
+    const result = await tools.requestTranslationEvidence({question:"What does scape mean here?",sourceForms:["scape"],channel:"translator_global"});
+    const hit = result.evidence.find(h=>h.globalIndex===future.globalIndex)!;
+    assert.ok(hit.quote.includes("scape"));
+    assert.ok(Array.from(hit.quote).length<=900);
+    assert.equal(hit.excerpt?.truncatedStart,true);
+    assert.equal(hit.excerpt?.truncatedEnd,true);
+  } finally { evidenceIndex.close(); }
+});
+
 test("on-demand evidence lookup is literal-form bounded and position safe", async () => {
   const target = chapterBlock(0, "Rakesh changed her version of the scape.");
   const future = chapterBlock(1, "The scape was a shared[[]]virtual sensory scene.");
@@ -302,7 +317,7 @@ test("final submission can attach bounded source-grounded narrative memory", asy
   }
 });
 
-test("low-confidence research claims are withheld from translation", async () => {
+test("legacy research self-scores do not suppress evidence-bound facts", async () => {
   const block = chapterBlock(0, "Typhon raised his head.");
   const island = splitIntoChapterIslands([block])[0];
   assert.ok(island);
@@ -337,8 +352,9 @@ test("low-confidence research claims are withheld from translation", async () =>
     previousActiveTail: "",
   });
 
-  assert.deepEqual(outcome.usedResolutionIds, []);
-  assert.equal(outcome.initialPrompt.includes("shared body with distinct control"), false);
+  assert.deepEqual(outcome.usedResolutionIds, ["q-typhon-piaton"]);
+  assert.equal(outcome.initialPrompt.includes("shared body with distinct control"), true);
+  assert.doesNotMatch(outcome.initialPrompt, /confidence/);
 });
 
 test("deterministic validator rejects missing blocks and leaked system JSON", () => {

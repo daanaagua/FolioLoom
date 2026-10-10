@@ -147,9 +147,8 @@ function spinePaths(opfText: string, opfPath: string): string[] {
   ];
 }
 
-function paragraphUnits(text: string): string[] {
-  return text
-    .trim()
+function paragraphUnits(text: string, preserveEdgeWhitespace = false): string[] {
+  return (preserveEdgeWhitespace ? text : text.trim())
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
     .filter((paragraph) => stripEpubStructuralMarkers(paragraph).trim().length > 0);
 }
@@ -163,7 +162,8 @@ function translatedStructuralBlocks(
   const units = [...translations]
     .sort((left, right) => left.globalIndex - right.globalIndex)
     .flatMap((translation) => {
-      const sources = paragraphUnits(translation.sourceText);
+      // A lossless block can start or end inside one XHTML paragraph, beside a space.
+      const sources = paragraphUnits(translation.sourceText, true);
       const targets = paragraphUnits(translation.text);
       if (sources.length !== targets.length) {
         throw new Error(
@@ -234,6 +234,7 @@ export async function writeTranslatedEpubTemplate(options: {
   readonly sourceManifestPath: string;
   readonly translations: readonly PilotTranslation[];
   readonly lineage: LosslessBookLineage;
+  readonly qualityReport?: string;
   readonly outputPath: string;
 }): Promise<string> {
   const ledger = SourceLedger.open(options.sourceManifestPath);
@@ -283,12 +284,13 @@ export async function writeTranslatedEpubTemplate(options: {
   const outputEntries: StoredZipInput[] = [
     { name: "mimetype", data: mimetype },
     ...entries
-      .filter((entry) => entry.name !== "mimetype" && entry.name !== lineageName)
+      .filter((entry) => entry.name !== "mimetype" && entry.name !== lineageName && entry.name !== "META-INF/folioloom-quality.json")
       .map((entry) => ({
         name: entry.name,
         data: replacements.get(entry.name) ?? entry.data,
       })),
     { name: lineageName, data: replacements.get(lineageName)! },
+    ...(options.qualityReport ? [{ name: "META-INF/folioloom-quality.json", data: options.qualityReport }] : []),
   ];
   const temporaryPath = temporaryOutputPath(options.outputPath);
   try {

@@ -7,6 +7,9 @@ import { readStoredZipEntries, type StoredZipEntry } from "./stored-zip.js";
 import {
   auditLosslessBookExport,
   losslessBookLineage,
+  deliveryLineage,
+  qualityReportJson,
+  qualityReportText,
   losslessBookTranslations,
   renderBilingual,
   renderTranslation,
@@ -25,6 +28,7 @@ export type ExportVerificationIncidentCode =
   | "TRANSLATION_CONTENT_MISMATCH"
   | "BILINGUAL_CONTENT_MISMATCH"
   | "AUDIT_CONTENT_MISMATCH"
+  | "QUALITY_REPORT_MISMATCH"
   | "EPUB_INVALID"
   | "EPUB_MIMETYPE_INVALID"
   | "EPUB_PACKAGE_INVALID"
@@ -232,11 +236,13 @@ function verifyEpub(
   let spinePaths: string[] = [];
   let xhtmlPaths: string[] = [];
   let navPath: string | undefined;
+  let usesNcx = false;
   try {
     const packageDocument = epubXmlParser.parse(packageText) as unknown;
     const packageNode = xmlObject(xmlObject(packageDocument)?.package);
     const manifestNode = xmlObject(packageNode?.manifest);
     const spineNode = xmlObject(packageNode?.spine);
+    usesNcx = attribute(packageNode, "version") === "2.0";
     const manifestItems = arrayOf(manifestNode?.item);
     for (const item of manifestItems) {
       const id = attribute(item, "id");
@@ -271,6 +277,11 @@ function verifyEpub(
       } else {
         spinePaths.push(manifestItem.path);
       }
+    }
+    if (usesNcx) {
+      const tocId = attribute(spineNode, "toc");
+      const ncx = tocId === undefined ? undefined : manifestById.get(tocId);
+      navPath = ncx?.mediaType === "application/x-dtbncx+xml" ? ncx.path : undefined;
     }
     if (manifestById.size === 0 || spinePaths.length === 0 || navPath === undefined) {
       incidents.add("EPUB_PACKAGE_INVALID");
@@ -351,6 +362,28 @@ function verifyEpub(
   }
   try {
     const navDocument = epubXmlParser.parse(navText) as unknown;
+    if (usesNcx) {
+      const ncx = xmlObject(xmlObject(navDocument)?.ncx);
+      const navMap = xmlObject(ncx?.navMap);
+      const contents = collectElements(navMap, "content");
+      const targets = new Set<string>();
+      if (attribute(ncx, "version") !== "2005-1" || contents.length === 0) {
+        incidents.add("EPUB_NAVIGATION_INVALID");
+      }
+      for (const content of contents) {
+        const src = attribute(content, "src");
+        const target = src === undefined ? undefined : resolvedEpubHref(navPath, src);
+        if (target === undefined || target === "external" || !byName.has(target.path)
+          || !xhtmlPaths.includes(target.path)
+          || (target.fragment !== undefined && !idsByPath.get(target.path)?.has(target.fragment))) {
+          incidents.add("EPUB_NAVIGATION_INVALID");
+        } else {
+          targets.add(target.path);
+        }
+      }
+      if (spinePaths.some(path => !targets.has(path))) incidents.add("EPUB_NAVIGATION_INVALID");
+      return;
+    }
     const hrefs = collectElements(navDocument, "a")
       .map((anchor) => attribute(anchor, "href"))
       .filter((item): item is string => item !== undefined);
@@ -371,15 +404,24 @@ export function verifyExport(
   paths: LosslessBookArtifactPaths,
   store: LosslessBookStore,
   runId: string,
+  deliveryMode?: import("../fullbook/delivery-policy.js").DeliveryMode,
 ): ExportVerificationResult {
   const incidents = new Set<ExportVerificationIncidentCode>();
   const exportAudit = auditLosslessBookExport(store, runId);
-  const expected = {
-    ...losslessBookLineage(store, runId),
-    complete: exportAudit.audit.complete,
-  };
+  const mode = deliveryMode ?? exportAudit.audit.deliveryMode;
+  const expected = deliveryLineage(store, runId, mode);
   const expectedJson = canonical(expected);
   const translations = losslessBookTranslations(store, runId);
+  if (mode === "standard") {
+    if (!paths.qualityReport || !readMatches(paths.qualityReport, qualityReportJson(store, runId))
+      || !paths.qualityText || !readMatches(paths.qualityText, qualityReportText(store, runId))) incidents.add("QUALITY_REPORT_MISMATCH");
+    if (paths.epub) {
+      try {
+        const entries = readStoredZipEntries(paths.epub);
+        if (entries.find(entry => entry.name === "META-INF/folioloom-quality.json")?.data.toString("utf8") !== qualityReportJson(store, runId)) incidents.add("QUALITY_REPORT_MISMATCH");
+      } catch { incidents.add("QUALITY_REPORT_MISMATCH"); }
+    }
+  }
   if (!readMatches(paths.translation, renderTranslation(translations, {
     includeChapterMetadata: false,
   }))) {

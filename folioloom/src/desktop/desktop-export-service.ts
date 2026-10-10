@@ -18,8 +18,10 @@ import {
 
 import { writeLosslessBookEpub } from "../export/epub-writer.js";
 import { verifyExport } from "../export/export-verifier.js";
+import { AutomaticRecovery } from "../fullbook/automatic-recovery.js";
 import {
   auditLosslessBookStore,
+  auditLosslessBookExport,
   writeLosslessBookArtifacts,
   type LosslessBookArtifactPaths,
 } from "../report.js";
@@ -154,10 +156,14 @@ function candidateFor(
   const summary = store.statusSummary(run.runId);
   const blockers: string[] = [];
   let auditComplete = false;
+  let deliveryMode: "standard" | "strict" = "strict";
+  let unresolvedQualityItems = 0;
   try {
     const audit = auditStore(store, run.runId);
-    auditComplete = audit.complete;
-    if (audit.incidentCodes.length > 0) {
+    deliveryMode = audit.deliveryMode ?? "strict";
+    unresolvedQualityItems = (audit.quality?.unresolved ?? 0) + (audit.quality?.pending ?? 0);
+    auditComplete = deliveryMode === "standard" ? audit.deliveryReady : audit.complete;
+    if (!auditComplete && audit.incidentCodes.length > 0) {
       blockers.push(`完整性校验未通过：${audit.incidentCodes.join("、")}`);
     }
   } catch {
@@ -169,7 +175,7 @@ function candidateFor(
   if (summary.failedWindows > 0) {
     blockers.push(`有 ${summary.failedWindows} 个文本块翻译失败`);
   }
-  const completedWindows = summary.completedWindows + summary.warningWindows;
+  const completedWindows = summary.completedWindows;
   const status: DesktopExportCandidate["status"] = blockers.length > 0
     ? "blocked"
     : auditComplete
@@ -185,6 +191,8 @@ function candidateFor(
     completedWindows,
     totalWindows: summary.totalWindows,
     blockers,
+    deliveryMode,
+    unresolvedQualityItems,
   };
 }
 
@@ -259,7 +267,7 @@ export class DesktopExportService {
     this.#writeArtifacts = options.writeArtifacts ?? writeLosslessBookArtifacts;
     this.#writeEpub = options.writeEpub ?? writeLosslessBookEpub;
     this.#verify = options.verify ?? verifyExport;
-    this.#audit = options.audit ?? auditLosslessBookStore;
+    this.#audit = options.audit ?? ((store, runId) => auditLosslessBookExport(store, runId).audit);
     if (!Number.isSafeInteger(this.#destinationTtlMs) || this.#destinationTtlMs <= 0) {
       throw new DesktopExportError(
         "DESKTOP_EXPORT_INPUT_INVALID",
@@ -346,7 +354,15 @@ export class DesktopExportService {
         );
       }
 
-      mkdirSync(destination.displayPath, { recursive: true });
+      const recovery = new AutomaticRecovery({ runId: run.runId, store: {
+        recoveryRecords: id => store.recoveryRecords(id),
+        appendRecoveryRecord: (id, record) => {
+          const journal = new LosslessBookStore(project.storePath);
+          try { journal.appendRecoveryRecord(id, record); } finally { journal.close(); }
+        },
+      } });
+      const recoveryScope = `export:${destination.displayPath}`;
+      await recovery.exportStep(`${recoveryScope}:directory`, () => mkdirSync(destination.displayPath, { recursive: true }));
       const stem = safeStem(project.title);
       const finalDirectory = nextAvailableDirectory(destination.displayPath, stem);
       const exportId = this.#createExportId();
@@ -367,15 +383,15 @@ export class DesktopExportService {
         );
       }
       mkdirSync(temporaryDirectory, { recursive: false });
-      const paths = this.#writeArtifacts(store, run.runId, temporaryDirectory, {
+      const paths = await recovery.exportStep(`${recoveryScope}:text`, () => this.#writeArtifacts(store, run.runId, temporaryDirectory, {
         fileStem: stem,
-      });
+      }));
       const epubPath = join(temporaryDirectory, `${stem}.epub`);
-      await this.#writeEpub(store, run.runId, epubPath, {
+      await recovery.exportStep(`${recoveryScope}:epub`, () => this.#writeEpub(store, run.runId, epubPath, {
         title: project.title,
         language: "zh-CN",
         sourceManifestPath: project.manifestPath,
-      });
+      }));
       const allPaths: LosslessBookArtifactPaths = { ...paths, epub: epubPath };
       const verification = this.#verify(allPaths, store, run.runId);
       if (!verification.ok) {
@@ -385,7 +401,7 @@ export class DesktopExportService {
         );
       }
       this.#removeUnselected(allPaths, new Set(formats));
-      renameSync(temporaryDirectory, finalDirectory);
+      await recovery.exportStep(`${recoveryScope}:publish`, () => renameSync(temporaryDirectory, finalDirectory));
       temporaryDirectory = "";
       this.#completed.set(exportId, finalDirectory);
       return {
@@ -404,6 +420,8 @@ export class DesktopExportService {
             : []),
           { format: "audit", fileName: basename(paths.audit) },
           { format: "metrics", fileName: basename(paths.metrics) },
+          ...(paths.qualityReport ? [{ format: "quality_report" as const, fileName: basename(paths.qualityReport) }] : []),
+          ...(paths.qualityText ? [{ format: "quality_report" as const, fileName: basename(paths.qualityText) }] : []),
         ],
       };
     } catch (error) {

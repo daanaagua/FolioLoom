@@ -1,14 +1,23 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import { bindTaskContext, taskContextMetadata, validateTaskContextIdentity } from "../agents/task-context.js";
-import { supervisionMetadata, validateSupervisionIdentity, summarizeSupervision, type SupervisionMode, type SupervisionSummary } from "../domain/supervision.js";
-import { SupervisionController, isSupervisionBoundaryError } from "./supervision-controller.js";
+import { preflightProviderStream } from "../providers/preflight.js";
+import { supervisionCandidateHash, supervisionMetadata, validateSupervisionIdentity, summarizeSupervision, type SupervisionMode, type SupervisionSummary } from "../domain/supervision.js";
+import { SupervisionController, isSupervisionBoundaryError, isDeferrableQualityReviewError } from "./supervision-controller.js";
+import { chapterReviewCoverage, chapterReviewMetadata, planChapterReviews, type ChapterReviewMode } from "./chapter-review.js";
 import { CandidateCheckpointService, CandidateRecoveryPausedError } from "./candidate-checkpoint.js";
+import { AutomaticRecovery, RecoveryPausedError } from "./automatic-recovery.js";
+import { QualityQueue, qualityReviewId, resolveDeliveryMode, type DeliveryMode } from "./delivery-policy.js";
+import { readSurfaceObservations, surfaceObservations, surfaceConsistencyEvidence, reconsiderSurfaceCandidates, surfaceMentions } from "../knowledge/surface-consistency.js";
+import { lexicalReviewHints } from "../knowledge/lexical-review-hints.js";
+import { MAX_SUPERVISOR_WINDOWS } from "../agents/supervisor.js";
+import { finalQualityScopes, runFinalizationTasks } from "./finalization-scheduler.js";
+import { planSourceExecution, sourceFrontier, type PlanningMode } from "./source-execution-plan.js";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
@@ -19,6 +28,7 @@ import {
 } from "../agents/lexical-anchorer.js";
 import {
   ModelProviderError,
+  piRunUsageComplete,
   PiRuntime,
 } from "../agents/pi-runtime.js";
 import {
@@ -45,6 +55,7 @@ import {
 } from "../knowledge/knowledge-store.js";
 import {
   collectTranslationKnowledgeCandidates,
+  translationKnowledgeContentByteBudget,
   type TranslationKnowledgeCandidate,
 } from "../knowledge/translation-knowledge-projection.js";
 import {
@@ -57,7 +68,7 @@ import {
   conceptFromAnchor,
   type LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
-import { conceptsFromStableTerms } from "../knowledge/term-usage.js";
+import { conceptsFromStableTerms, expectedTermOccurrences, inferTermUsages } from "../knowledge/term-usage.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import type { LosslessBlock } from "../source/types.js";
@@ -118,6 +129,7 @@ import {
 import { CongestionSensor } from "./congestion-sensor.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
 import { TelemetrySink } from "./telemetry-sink.js";
+import { createContextProfilePlanner } from "./context-profile-cache.js";
 import {
   planContextProfiles,
   type ContextProfile,
@@ -203,6 +215,9 @@ import {
   planBookWindows,
   type WindowPlanOptions,
 } from "./window-planner.js";
+
+import { runDirectBook } from "./direct-book-runner.js";
+import type { TranslationWorkflow } from "./direct-translation.js";
 
 export const LOSSLESS_BOOK_PROTOCOL_VERSION = "v5-book-3";
 export { drainKnowledgeRevalidationTasks };
@@ -420,8 +435,12 @@ export interface LosslessBookRunMeta {
 }
 
 export interface LosslessBookRunOptions {
+  workflow?: TranslationWorkflow;
+  planningMode?: PlanningMode;
+  deliveryMode?: DeliveryMode;
   taskContext?: string;
   supervisorMode?: SupervisionMode;
+  chapterReviewMode?: ChapterReviewMode;
   manifestPath: string;
   legacyV4DbPath?: string;
   storePath: string;
@@ -821,7 +840,6 @@ function knowledgeCandidatesFor(
       }
       const payload = {
         fact: candidate.fact,
-        confidence: candidate.confidence,
         subjectForms: [...candidate.subjectForms],
       };
       const recordId = `knowledge-${createHash("sha256")
@@ -963,14 +981,13 @@ function windowSourceText(
     .join("\n\n");
 }
 
-function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[] {
+function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[], currentSource: string, context: BookContext): string[] {
   return revisions.flatMap((raw) => {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
       return [];
     }
     const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
-    if ((revision.kind !== "lexical_anchor_decision"
-      && revision.kind !== "lexical_concept")
+    if ((revision.kind !== "lexical_concept" && revision.kind !== "lexical_anchor_decision")
       || (revision.status !== "active" && revision.status !== "contextual")
       || revision.payload === null
       || typeof revision.payload !== "object"
@@ -980,7 +997,10 @@ function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[
     const payload = revision.payload as {
       sourceForm?: unknown;
       sourceForms?: unknown;
+      semanticClass?: unknown;
     };
+    if (revision.kind === "lexical_anchor_decision" && (payload.semanticClass !== "ordinary_word"
+      || context.languageProfile.hasExplicitEntityNamingCue(currentSource))) return [];
     if (revision.kind === "lexical_concept" && Array.isArray(payload.sourceForms)) {
       return payload.sourceForms.filter((sourceForm): sourceForm is string =>
         typeof sourceForm === "string" && sourceForm.trim().length > 0);
@@ -1066,8 +1086,6 @@ function waveKnowledgeCandidates(
   const entityForms = new Set(outcome.entityLinks
     .filter((link) => link.status === "confirmed")
     .flatMap((link) => link.normalizedForms));
-  const projectedTermForms = new Set(outcome.terms.map((term) =>
-    context.languageProfile.normalizeSourceForm(term.sourceForm)));
   const termsByForm = new Map(outcome.terms.map((term) => [
     context.languageProfile.normalizeSourceForm(term.sourceForm),
     term,
@@ -1084,13 +1102,12 @@ function waveKnowledgeCandidates(
       "technical_term",
       "role",
     ].includes(semanticClass);
-    if (conceptEligible && term !== undefined) {
+    if (conceptEligible && term !== undefined && term.preference === undefined) {
       const concept = conceptFromAnchor({
         sourceForm: anchor.sourceForm,
         target: simplifyChineseTranslation(anchor.target),
         mode: anchor.mode,
         semanticClass: semanticClass as LexicalSemanticClass,
-        confidence: anchor.confidence,
         allowedRealizations: term.allowedTargets ?? [term.target],
       });
       conceptForms.add(normalizedSource);
@@ -1108,13 +1125,13 @@ function waveKnowledgeCandidates(
       });
       continue;
     }
-    if (anchor.mode !== "contextual" && !projectedTermForms.has(normalizedSource)) continue;
     const payload = {
       sourceForm: anchor.sourceForm,
+      ...(anchor.discoveryKind ? { discoveryKind: anchor.discoveryKind } : {}),
       target: simplifyChineseTranslation(anchor.target),
       mode: anchor.mode,
       semanticClass,
-      confidence: anchor.confidence,
+      proposedSemanticClass: anchor.proposedSemanticClass ?? semanticClass,
     };
     result.push({
       candidate: {
@@ -1144,7 +1161,7 @@ function waveKnowledgeCandidates(
           .digest("hex")
           .slice(0, 24)}`,
         normalizedSubject: normalizedSource,
-        kind: "lexical_anchor",
+        kind: term.preference === undefined ? "lexical_anchor" : `lexical_preference:${term.preference.senseId}`,
         payload,
       },
       sourceForms: [term.sourceForm],
@@ -1461,6 +1478,7 @@ function translationContextPlan(
   priorRepairs: number,
   sourceAnomalyReport: SourceAnomalyReport,
   blockById: ReadonlyMap<string, LosslessBlock>,
+  planProfiles: typeof planContextProfiles,
 ): TranslationContextPlan {
   const blocks = requestBlocks(request, blockById);
   const sourceTexts = blocks.map((block) => block.sourceText);
@@ -1512,11 +1530,14 @@ function translationContextPlan(
   });
   return {
     candidates,
-    profiles: planContextProfiles({
+    profiles: planProfiles({
       bundles: candidates,
       requiredCoverage: risk.requiredCoverage,
       budgets: contextBudgets(candidates),
       maxEntries: DEFAULT_TRANSLATION_KNOWLEDGE_MAX_ENTRIES,
+      maxBytes: translationKnowledgeContentByteBudget(
+        baseInput.snapshot.revisions.length,
+      ),
     }),
     risk,
   };
@@ -1621,6 +1642,7 @@ function baselineVariantForTask(
     variant: {
       variantId: `${item.request.requestId}:baseline`,
       taskId: item.request.requestId,
+      inFlightTokens: item.assessment.totalReserved,
       contextProfile: "rich",
       effort: runtimeEffort(options.runtime),
       effortRank: features.effortRank,
@@ -1636,6 +1658,7 @@ function planningRuntimes(
   executionRuntime: TranslationRuntime,
   retryRound: number,
 ): readonly TranslationRuntime[] {
+  if (runtimeSet.mode === "quality") return [executionRuntime];
   const variants = validateRuntimeVariants([
     executionRuntime,
     ...(runtimeSet.variants ?? []),
@@ -1668,6 +1691,7 @@ function dynamicRequestPlanning(
     readonly runtimeSet: TranslationRuntimeSet;
     readonly executionRuntime: TranslationRuntime;
     readonly mode: SchedulerMode;
+    readonly sourcePlanned?: boolean;
     readonly buildBaseInput: (
       request: PhysicalRequestPlan,
     ) => TranslationRequestInput;
@@ -1684,6 +1708,7 @@ function dynamicRequestPlanning(
     readonly maxInFlightTokens: number;
   },
 ): DynamicRequestPlanning {
+  const planProfiles = createContextProfilePlanner();
   const legacyByTaskId = new Map<string, PlannedTranslationExecution>();
   const executionsByVariantId = new Map<string, PlannedTranslationExecution>();
   const variants: TaskExecutionVariant[] = [];
@@ -1703,7 +1728,7 @@ function dynamicRequestPlanning(
 
   const tasks: SchedulerTask[] = requests.map((request, ordinal) => {
     const baseInput = options.buildBaseInput(request);
-    const contextPlan = options.mode === "off"
+    const contextPlan = options.mode === "off" || options.sourcePlanned
       ? undefined
       : translationContextPlan(
         request,
@@ -1711,6 +1736,7 @@ function dynamicRequestPlanning(
         options.retryRound,
         options.sourceAnomalyReport,
         options.blockById,
+        planProfiles,
       );
     const risk = contextPlan === undefined
       ? assessTaskRisk({
@@ -1722,7 +1748,8 @@ function dynamicRequestPlanning(
         lockedTermOccurrences: 0,
         needsRevalidate: false,
         priorRepairs: options.retryRound,
-        sourceAnomalies: 0,
+        sourceAnomalies: options.sourcePlanned
+          ? sourceAnomaliesForRequest(request, options.sourceAnomalyReport, options.blockById) : 0,
       })
       : contextPlan.risk;
     const legacy = legacyRequestById.get(request.requestId);
@@ -1860,6 +1887,7 @@ function dynamicRequestPlanning(
             options.retryRound,
             options.sourceAnomalyReport,
             options.blockById,
+            planProfiles,
           );
         const profile = selectedPlan.profiles[profileName];
         if (profile === undefined) {
@@ -1920,6 +1948,7 @@ function dynamicRequestPlanning(
           };
           const rawPrediction = options.costModel.predict(features);
           const variant: TaskExecutionVariant = {
+            inFlightTokens: admitted.assessment.totalReserved,
             variantId: [
               request.requestId,
               `context-${profileName}`,
@@ -2103,6 +2132,7 @@ async function runWithDynamicScheduler<T>(
               - (now - item.startedAt),
           ),
           reservedTokens: item.reservedTokens,
+          inFlightTokens: item.execution.admitted.assessment.totalReserved,
         }));
       const runningReservedTokens = reservations.reduce(
         (total, reservation) => total + reservation.reservedTokens,
@@ -2126,7 +2156,10 @@ async function runWithDynamicScheduler<T>(
                 ...predicted,
                 totalTokens: Math.max(
                   predicted.totalTokens,
-                  execution.admitted.assessment.totalReserved,
+                  execution.admitted.fragments.reduce(
+                    (sum, fragment) => sum + fragment.assessment.totalReserved,
+                    0,
+                  ),
                 ),
               },
             },
@@ -2336,7 +2369,15 @@ async function runLosslessBook(
     variants: originalRuntimeSet.variants?.map(contextualRuntime),
   };
   const supervisorMode = options.supervisorMode ?? "off";
+  const planningMode = options.planningMode ?? "supervised";
+  if (planningMode !== "supervised" && planningMode !== "source") throw new Error("invalid planning mode");
   if (supervisorMode !== "off" && supervisorMode !== "bounded") throw new Error("invalid supervisor mode");
+  const chapterReviewMode = options.chapterReviewMode ?? "off";
+  if (!["off", "bounded"].includes(chapterReviewMode)) throw new Error("invalid chapter review mode");
+  if (chapterReviewMode === "bounded" && supervisorMode !== "bounded") throw new Error("chapter review requires the bounded supervisor");
+  if (planningMode === "source" && (supervisorMode !== "bounded" || chapterReviewMode !== "bounded")) {
+    throw new Error("source planning requires bounded supervision and complete chapter review");
+  }
   if (supervisorMode === "bounded" && (runtimeSet.primary.executionPolicy !== undefined
     || runtimeSet.primary.model.provider.startsWith("external-"))) {
     throw new Error("bounded supervisor requires the native Pi/provider API backend");
@@ -2494,13 +2535,25 @@ async function runLosslessBook(
       blocks: context.losslessBlocks,
       annotations: context.annotations,
     });
+    const planned = planBookWindows(context.losslessBlocks, {
+      ...windowOptionsForRunMode(runtimeSet.mode, options.windowOptions),
+      protocolVersion,
+    });
     const initialSnapshot = createKnowledgeSnapshot(runId, []);
+    const chapterPolicy = chapterReviewMode === "bounded"
+      ? chapterReviewMetadata(planChapterReviews(context.losslessBlocks, planned, context.languageProfile)) : undefined;
+    const sourcePlan = planningMode === "source"
+      ? planSourceExecution(context.sourceLedger.sourceVersion, planned, context.losslessBlocks, chapterPolicy?.scopes) : undefined;
     const requestedMetadata = runMetadataWithLanguageProfile(
       options.runMeta.metadata,
       context,
       runtimeSet,
     );
     if (supervisorMode === "bounded") requestedMetadata.supervision = supervisionMetadata(supervisorMode);
+    if (sourcePlan) requestedMetadata.sourceExecutionPlan = sourcePlan;
+    else delete requestedMetadata.sourceExecutionPlan;
+    if (chapterPolicy) requestedMetadata.chapterReview = chapterPolicy;
+    else delete requestedMetadata.chapterReview;
     if (options.taskContext !== undefined) requestedMetadata.taskContext = taskContextMetadata(options.taskContext);
     const existingRun = store.listTranslationRuns().find((item) => item.runId === runId);
     const existingRuntimeMetadata = runtimeMetadata(existingRun?.metadata);
@@ -2508,6 +2561,12 @@ async function runLosslessBook(
       const storedMetadata = existingRun.metadata as Record<string, unknown> | undefined;
       validateTaskContextIdentity(storedMetadata?.taskContext, options.taskContext);
       validateSupervisionIdentity(storedMetadata?.supervision, supervisorMode);
+      if (canonicalJson(storedMetadata?.sourceExecutionPlan ?? null) !== canonicalJson(sourcePlan ?? null)) {
+        throw new Error("source execution planning policy mismatch; resume requires the original plan");
+      }
+      if (canonicalJson(storedMetadata?.chapterReview ?? null) !== canonicalJson(chapterPolicy ?? null)) {
+        throw new Error("chapter review policy mismatch; resume requires the original chapter review mode");
+      }
       if (existingRuntimeMetadata === undefined && runtimeSet.mode !== "quality") {
         throw new Error("legacy translation runs can only resume in quality mode");
       }
@@ -2527,12 +2586,22 @@ async function runLosslessBook(
       initialSnapshot,
       metadata: existingRun?.metadata ?? requestedMetadata,
     });
-    const planned = planBookWindows(context.losslessBlocks, {
-      ...windowOptionsForRunMode(runtimeSet.mode, options.windowOptions),
-      protocolVersion,
-    });
     store.initializeWindowPlan(runId, planned);
     store.recoverInterruptedWindows(runId);
+    const previousDeliveryMode = store.deliveryMode(runId);
+    const deliveryMode = resolveDeliveryMode(options.deliveryMode, previousDeliveryMode, existingRun !== undefined);
+    if (existingRun && previousDeliveryMode === undefined) store.setDeliveryMode(runId, "strict");
+    store.setDeliveryMode(runId, deliveryMode);
+    if (existingRun && options.deliveryMode === "standard" && (previousDeliveryMode ?? "strict") === "strict") {
+      const records = store.supervisionRecords(runId);
+      const released = new Set(records.filter(record => record.state === "released").map(record => record.key));
+      for (const record of records.filter(record => record.state === "paused" && !released.has(record.id)
+        && record.id.startsWith("candidate-recovery:") && /repair made no text progress|review still requires changes|semantic repair credit|request repair credit|SUPERVISOR_SEMANTIC_REVIEW/u.test(record.reason ?? ""))) {
+        store.releaseSupervisionPause(runId, record.id, "Delivery policy explicitly changed to standard; retained candidates remain subject to deterministic validation and bounded review.");
+      }
+    }
+    const qualityQueue = new QualityQueue(runId, store);
+    qualityQueue.recoverInterrupted();
     const estimator = options.tokenEstimator ?? new WeightedTokenEstimator();
     const schedulerSnapshot = store.latestSchedulerSnapshot(runId);
     const scheduler = new AdaptiveScheduler({
@@ -2564,6 +2633,10 @@ async function runLosslessBook(
       enforceDispatchLifecycle: true,
     };
     const tokenLedger = store.loadTokenLedger(runId, tokenLedgerInit);
+    for (const correction of store.pendingUnlaunchedSupervisorCorrections(runId)) {
+      store.appendTokenLedgerEvent(runId, correction);
+      tokenLedger.apply(correction);
+    }
     tokenLedgerForReconciliation = tokenLedger;
     const priorSchedulerMetrics = store.loadSchedulerMetrics(
       runId,
@@ -2714,9 +2787,14 @@ async function runLosslessBook(
     };
     let cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
+    const recovery = new AutomaticRecovery({ runId, store });
     const supervisor = supervisorMode === "bounded" ? new SupervisionController({
+      sourcePlan,
+      recovery,
+      maxConcurrency: Math.min(maxConcurrency, 3),
       runId, sourceVersion: context.sourceLedger.sourceVersion, windows: planned,
       sources: context.losslessBlocks.map(b => ({ blockId: b.id, globalIndex: b.globalIndex, sourceText: b.sourceText })),
+      getTargetContext: () => store.activeTranslations(runId).map(t => ({ blockId: t.blockId, text: t.text })),
       runtime: runtimeSet.primary, admission, store, signal: options.signal, deadlineMs: options.hardDeadlineMs,
       onResponse: (requestId, observation) => store.appendProviderResponseEvidence({
         runId, requestId, snapshotId: store.latestKnowledgeSnapshot(runId).id,
@@ -2863,7 +2941,7 @@ async function runLosslessBook(
           const complete = store.activeTranslations(runId).filter(t => work.window.blockIds.includes(t.blockId))
             .map(t => replacementById.get(t.blockId) ?? t);
           return supervisor.review(work.window.windowId, complete, terms);
-        } }),
+        }, canReviewRepairedCandidate: () => supervisor.canReview(work.window.windowId, undefined, terms) }),
         blocks: context.losslessBlocks,
         stableTerms: terms,
         snapshot,
@@ -2993,7 +3071,7 @@ async function runLosslessBook(
       let completed: CompletedTranslationRequest;
       try {
         completed = (await executePlannedTranslationRequest(execution, {
-          admission,
+          admission, recovery,
           candidateCheckpoints: new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
             modelId: runtime.model.id, purpose: `revalidate:${work.task.taskId}`, store }),
           nextLedgerAttemptId,
@@ -3142,6 +3220,86 @@ async function runLosslessBook(
       store.refreshTermRetrofitJobs(runId);
     };
 
+    const drainQualityAtFinalBarrier = async (): Promise<void> => {
+      if ((deliveryMode !== "standard" && chapterReviewMode !== "bounded") || !supervisor) return;
+      const pending = qualityQueue.items().filter(item => item.state === "pending");
+      const sources = context.losslessBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText }));
+      const targets = store.activeTranslations(runId);
+      await runFinalizationTasks(pending.map(item => ({
+        scopes: finalQualityScopes(store.allWindows(runId).find(w => w.windowId === item.windowId)!.blockIds, item.issues, sources, targets),
+        run: async () => {
+          throwIfAborted(options.signal);
+          if (options.shouldPause?.()) return;
+          const window = store.allWindows(runId).find(w => w.windowId === item.windowId)!;
+          const current = store.activeTranslations(runId).filter(t => t.windowId === item.windowId);
+          const snapshot = store.latestKnowledgeSnapshot(runId);
+          const terms = termsForWindows(uniqueTerms([
+            ...context.stableTerms.map(term => ({ ...term, origin: term.origin ?? "legacy" as const })),
+            ...(options.glossary?.stableTerms ?? []), ...stableTermsFromKnowledge(snapshot.revisions),
+          ], context), [window], context, options.glossary);
+          const request: PhysicalRequestPlan = { requestId: `quality-${item.itemId}`, windows: [{ ...window, status: "completed_with_warnings" }], sourceTokens: window.sourceTokens };
+          const runtime = runtimeSet.escalation;
+          const reviewId = qualityReviewId(item);
+          const buildInput = (selected: PhysicalRequestPlan): TranslationRequestInput => ({ request: selected, deliveryMode: "standard",
+            blocks: context.losslessBlocks, stableTerms: terms, snapshot, strictIdentifiers: true,
+            styleState: mergeStyleState(options.styleState, persistedStyleFromKnowledge(snapshot.revisions)),
+            sourceLanguageProfile: context.languageProfile,
+            reviewCandidate: candidate => supervisor.reviewFinal(reviewId, candidate.windowId, candidate.translations, terms, item.issues, current),
+            canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, reviewId),
+          });
+          const admitted = admitTranslationRequests([request], runtime, estimator, blockById, buildInput)[0]!;
+          const baseline = baselineVariantForTask(admitted, { runtime, maxConcurrency: 1, costModel: runtimeCostModel,
+            risk: assessTaskRisk({ sourceTokens: request.sourceTokens, entityMentions: 0, pronounMentions: 0, relationKinds: [],
+              remoteEvidenceDistance: 0, lockedTermOccurrences: 0, needsRevalidate: true, priorRepairs: 1, sourceAnomalies: 0 }) });
+          const baselineId = `quality-task:${reviewId}`;
+          admission.addBaseline({ taskIds: [baselineId], baselineTokens: baseline.variant.predicted.totalTokens
+            + admitted.targetedRepairReserveTokens + admitted.paragraphRecoveryReserveTokens + admitted.paragraphRefinementReserveTokens,
+            source: "revalidate", reason: "final_quality_review" });
+          const checkpoints = new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
+            modelId: runtime.model.id, store, purpose: baselineId });
+          checkpoints.save(buildInput(request), { windowId: window.windowId, ordinal: window.ordinal, status: "completed_with_warnings",
+            translations: current.map(t => ({ blockId: t.blockId, text: t.text })),
+            termUsages: inferTermUsages(expectedTermOccurrences(context.losslessBlocks.filter(b => window.blockIds.includes(b.id)),
+              conceptsFromStableTerms(terms), context.languageProfile), new Map(current.map(t => [t.blockId, t.text]))), notes: [], memoryCandidates: [] });
+          const attemptId = nextLedgerAttemptId(baselineId, 0);
+          const transaction = admission.begin({ requestId: attemptId, taskIds: [baselineId], purpose: "revalidate",
+            predictedTokens: baseline.variant.predicted.totalTokens, attempt: 0, conservativeHorizonFloor: 0 });
+          qualityQueue.claimFinal(item.itemId);
+          transaction.markDispatched();
+          const completed = (await executePlannedTranslationRequest({ admitted, runtime, buildInput, features: baseline.features, variant: baseline.variant }, {
+            admission, recovery, candidateCheckpoints: checkpoints, nextLedgerAttemptId, runtimeSet, estimator,
+            languageProfile: context.languageProfile, blockById, signal: options.signal, hardDeadlineMs: options.hardDeadlineMs,
+            retryRound: 0, conservativeHorizonFloor: () => 0,
+            onProviderResponse: evidence => store.appendProviderResponseEvidence({ runId, requestId: evidence.requestId, snapshotId: evidence.snapshotId,
+              phase: evidence.phase, modelCallOrdinal: evidence.modelCallOrdinal, requestHash: evidence.requestHash,
+              responseProtocol: evidence.responseProtocol, assistantMessage: evidence.assistantMessage }),
+          })).value;
+          transaction.settle({ actualTokens: completed.runtime.accountingUsage.totalTokens,
+            usageComplete: completed.runtime.accountingUsage.complete, outcome: completed.error ? "failed" : "success" });
+          if (completed.error) {
+            if (deliveryMode !== "standard" || !isDeferrableQualityReviewError(completed.error)) throw completed.error;
+            throwIfAborted(options.signal);
+            qualityQueue.finish(item.itemId, "blocked", supervisionCandidateHash(current), item.issues,
+              completed.error instanceof Error ? completed.error.message : "Final semantic review did not produce a valid decision.");
+            flushSchedulerProjection?.();
+            return;
+          }
+          const candidate = completed.result?.windows[0];
+          if (!candidate || candidate.status === "failed") throw new RevalidationOutputError(candidate?.error ?? "final quality candidate missing");
+          const replacementById = new Map(candidate.translations.map(t => [t.blockId, t]));
+          const boundary = new TranslationValidator().validateCrossBlockAlignment(context.losslessBlocks.map(losslessAsV4), {
+            translations: store.activeTranslations(runId).map(t => replacementById.get(t.blockId) ?? t), notes: [], repaired: true,
+          });
+          if (!boundary.valid) throw new RevalidationOutputError("final quality repair changed cross-block alignment");
+          store.replaceQualityWindow({ runId, itemId: item.itemId, expectedHash: supervisionCandidateHash(current), snapshotId: snapshot.id,
+            translations: candidate.translations.map(t => ({ ...t, sourceHash: blockById.get(t.blockId)!.sourceHash })),
+            bindings: { usages: candidate.termUsages, concepts: conceptsFromStableTerms(terms) }, issues: candidate.qualityIssues ?? [],
+            closure: supervisor.finalClosure(reviewId, candidate.translations) });
+          flushSchedulerProjection?.();
+        },
+      })), maxConcurrency);
+    };
+
     let paused = false;
     while (processedWindows < maxWindows) {
       if (options.shouldPause?.() === true) {
@@ -3163,9 +3321,11 @@ async function runLosslessBook(
       }
       const remaining = maxWindows - processedWindows;
       const selected: PersistedLosslessWindow[] = [];
-      const physicalRequestHorizon = maxConcurrency * waveHorizonMultiplier;
+      const sourceFrontierIds = sourcePlan ? new Set(sourceFrontier(sourcePlan, barrier.windowId)) : undefined;
+      const physicalRequestHorizon = sourceFrontierIds?.size ?? maxConcurrency * waveHorizonMultiplier;
       for (const window of allWindows.slice(barrier.ordinal)) {
         if (window.status !== "pending"
+          || sourceFrontierIds !== undefined && !sourceFrontierIds.has(window.windowId)
           || selected.length >= remaining) {
           break;
         }
@@ -3210,13 +3370,9 @@ async function runLosslessBook(
         ...(options.glossary?.stableTerms ?? []),
         ...stableTermsFromKnowledge(snapshot.revisions),
       ], context);
-      if (supervisor !== undefined) {
-        const decision = await supervisor.planFor(selected[0]!.windowId, establishedTerms);
-        const allowed = new Set(decision.windowIds);
-        const count = selected.findIndex(w => !allowed.has(w.windowId));
-        if (count === 0) throw new Error("supervisor approved no dispatchable window");
-        if (count > 0) selected.splice(count);
-      }
+      // Resolve lexical evidence before planning so both stages use one projection.
+      // The host bounds the discovery wave without spending a provisional model plan.
+      if (supervisor !== undefined) selected.splice(MAX_SUPERVISOR_WINDOWS);
       const selectedSourceBlocks = sourceBlocksForWindows(selected, blockById);
       const selectedBlocks = selectedSourceBlocks.map(losslessAsV4);
       const anchorStableTerms = termsForWindows(
@@ -3226,15 +3382,18 @@ async function runLosslessBook(
         options.glossary,
       );
       const corpusBlocks = context.losslessBlocks.map(losslessAsV4);
-      const anchorCandidates = collectWindowAnchorCandidates(
+      const surfaceMemory = readSurfaceObservations(snapshot.revisions, store.activeTranslations(runId));
+      const collectedAnchorCandidates = collectWindowAnchorCandidates(
         selectedBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
         corpusBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
         anchorStableTerms,
-        decidedAnchorFormsFromKnowledge(snapshot.revisions),
+        decidedAnchorFormsFromKnowledge(snapshot.revisions, selectedSourceBlocks.map(b => b.sourceText).join("\n"), context),
         context.languageProfile,
       );
+      const anchorCandidates = reconsiderSurfaceCandidates(collectedAnchorCandidates, surfaceMemory,
+        selectedSourceBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText })), context.languageProfile);
       const anchorBudget = new BudgetLedger();
       let waveAnchorSnapshot: WaveAnchorSnapshot | undefined;
       if (anchorCandidates.length === 1
@@ -3269,7 +3428,9 @@ async function runLosslessBook(
           }
         }
       }
-      if (anchorCandidates.length >= 2) {
+      if (anchorCandidates.length >= 2 || (anchorCandidates.length === 1
+        && (anchorCandidates[0]!.discoveryKind === "recurrent_noun"
+          || surfaceMemory.some(p => p.sourceForm === anchorCandidates[0]!.sourceForm)))) {
         const inputHash = waveAnchorInputHash(context, anchorCandidates, anchorStableTerms);
         const cached = store.waveAnchorDecision(runId, inputHash);
         if (cached !== undefined) {
@@ -3388,8 +3549,7 @@ async function runLosslessBook(
               const resolved = await operation(attemptId);
               transaction.settle({
                 actualTokens: resolved.run.usage.totalTokens,
-                usageComplete: resolved.run.modelCalls === 0
-                  || resolved.run.usage.totalTokens > 0,
+                usageComplete: piRunUsageComplete(resolved.run),
                 outcome: "success",
               });
               return resolved;
@@ -3400,8 +3560,7 @@ async function runLosslessBook(
               transaction.settle({
                 actualTokens: failedRun?.usage.totalTokens ?? 0,
                 usageComplete: failedRun !== undefined
-                  && (failedRun.modelCalls === 0
-                    || failedRun.usage.totalTokens > 0),
+                  && piRunUsageComplete(failedRun),
                 outcome: error instanceof ModelProviderError
                   && error.kind === "protocol"
                   ? "protocol"
@@ -3535,14 +3694,17 @@ async function runLosslessBook(
         runId,
         waveAnchorSnapshot,
         context,
-      );
+      ).filter(item => !snapshot.revisions.some(revision => revision.candidateIds.includes(item.candidate.recordId)));
       const entityLinkWarnings = unresolvedEntityWarnings(waveAnchorSnapshot);
-      if (supervisor !== undefined && entityLinkWarnings.length > 0) {
-        const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings);
-        const allowed = new Set(decision.windowIds);
-        const count = selected.findIndex(w => !allowed.has(w.windowId));
-        if (count === 0) throw new Error("supervisor approved no conflict-safe window");
-        if (count > 0) selected.splice(count);
+      if (supervisor !== undefined) {
+        if (sourcePlan) supervisor.planSourceFrontier(selected.map(w => w.windowId), activeTerms);
+        else {
+          const decision = await supervisor.planFor(selected[0]!.windowId, activeTerms, entityLinkWarnings, selected.length);
+          const allowed = new Set(decision.windowIds);
+          const count = selected.findIndex(w => !allowed.has(w.windowId));
+          if (count === 0) throw new Error("supervisor approved no conflict-safe window");
+          if (count > 0) selected.splice(count);
+        }
       }
       const coordinator = new CommitCoordinator(
         runId,
@@ -3598,10 +3760,20 @@ async function runLosslessBook(
           : runtimeSet.escalation;
         const buildTranslationInput = (request: PhysicalRequestPlan): TranslationRequestInput => ({
           request,
+          surfaceMentions: surfaceMentions(request.windows.flatMap(w => w.blockIds).map(blockId => ({ blockId, sourceText: blockById.get(blockId)!.sourceText })),
+            waveAnchorSnapshot?.anchors ?? [], surfaceMemory, context.languageProfile),
+          deliveryMode,
           strictIdentifiers: supervisorMode === "bounded",
           supervisorGuidance: supervisor?.guidanceFor(request.windows.map(w => w.windowId), activeTerms),
           ...(supervisor === undefined ? {} : {
-            reviewCandidate: async candidate => supervisor.review(candidate.windowId, candidate.translations, activeTerms),
+            reviewCandidate: async candidate => supervisor.review(candidate.windowId, candidate.translations, activeTerms,
+              surfaceConsistencyEvidence({ sources: candidate.translations.map(t => ({ blockId: t.blockId, sourceText: blockById.get(t.blockId)!.sourceText })),
+                translations: candidate.translations, observations: [...surfaceMemory, ...surfaceObservations({ windowId: candidate.windowId,
+                  sources: candidate.translations.map(t => ({ blockId: t.blockId, sourceText: blockById.get(t.blockId)!.sourceText })),
+                  translations: candidate.translations, candidates: collectedAnchorCandidates, anchors: waveAnchorSnapshot?.anchors ?? [],
+                  previous: surfaceMemory, profile: context.languageProfile, usages: candidate.surfaceUsages }).map(r => r.payload as import("../knowledge/surface-consistency.js").SurfaceObservation)],
+                terms: termsForWindows(activeTerms, request.windows, context, options.glossary), profile: context.languageProfile })),
+            canReviewRepairedCandidate: windowId => supervisor.canReview(windowId, undefined, activeTerms),
           }),
           blocks: context.losslessBlocks,
           stableTerms: termsForWindows(
@@ -3642,6 +3814,7 @@ async function runLosslessBook(
           runtimeSet,
           executionRuntime,
           mode: schedulerMode,
+          sourcePlanned: sourcePlan !== undefined,
           buildBaseInput: buildTranslationInput,
           estimator,
           sourceAnomalyReport,
@@ -3779,7 +3952,7 @@ async function runLosslessBook(
           }
           admission.markDispatched(ledgerAttemptId);
           return executePlannedTranslationRequest(execution, {
-            admission,
+            admission, recovery,
             candidateCheckpoints: new CandidateCheckpointService({ runId, sourceVersion: context.sourceLedger.sourceVersion,
               modelId: execution.runtime.model.id, store }),
             nextLedgerAttemptId,
@@ -4130,18 +4303,62 @@ async function runLosslessBook(
           boundaryFailuresByWindow.set(windowId, messages);
         }
 
+        // Parallel siblings become visible together at this safe boundary. Check
+        // new sibling evidence here rather than leaking completion-order state
+        // into requests that are still running.
+        const siblingMemory = [...surfaceMemory];
+        const orderedResults = completionOrder.flatMap(c => c.result?.windows ?? [])
+          .filter(w => w.status !== "failed" && !boundaryFailuresByWindow.has(w.windowId))
+          .sort((a, b) => (relativeOrdinal.get(a.windowId) ?? 0) - (relativeOrdinal.get(b.windowId) ?? 0));
+        for (const result of orderedResults) {
+          const sources = result.translations.map(t => ({ blockId: t.blockId, sourceText: blockById.get(t.blockId)!.sourceText }));
+          const terms = termsForWindows(activeTerms, selected.filter(w => w.windowId === result.windowId), context, options.glossary);
+          const evidence = surfaceConsistencyEvidence({ sources, translations: result.translations, observations: siblingMemory, terms, profile: context.languageProfile })
+            .filter(e => e.previous.some(p => currentBlockIds.has(p.blockId)));
+          if (evidence.length && supervisor !== undefined) {
+            const issues = supervisor?.canReview(result.windowId)
+              ? await supervisor.review(result.windowId, result.translations, activeTerms, evidence)
+              : evidence.map(e => ({ code: "SUPERVISOR_SEMANTIC_REVIEW", blockId: e.blockId, repairable: true,
+                issueKey: supervisionCandidateHash([{ blockId: e.blockId, text: e.sourceForm }]),
+                evidence: { sourceQuote: e.sourceQuote, targetQuote: e.currentTargetQuote, problem: `核对称呼 ${e.sourceForm} 的跨窗译法；此前实际译法：${e.previous.map(p => p.target ?? "未确定").join("、")}。` },
+                message: `称呼 ${e.sourceForm} 出现跨窗译法变化，尚未排除语境变体。` }));
+            if (issues.length) {
+              if (deliveryMode === "standard") {
+                result.qualityIssues = [...(result.qualityIssues ?? []), ...issues];
+              } else {
+                result.status = "failed";
+                result.error = "Cross-window surface consistency requires semantic review.";
+              }
+            }
+          }
+          siblingMemory.push(...surfaceObservations({ windowId: result.windowId, sources, translations: result.translations,
+            candidates: collectedAnchorCandidates, anchors: waveAnchorSnapshot?.anchors ?? [], previous: siblingMemory,
+            profile: context.languageProfile, usages: result.surfaceUsages }).map(c => c.payload as import("../knowledge/surface-consistency.js").SurfaceObservation));
+        }
+
         const successfulWindowIds = new Set(completionOrder.flatMap((completed) =>
           completed.result?.windows
             .filter((window) => window.status !== "failed"
+              && !window.qualityIssues?.length
               && !boundaryFailuresByWindow.has(window.windowId))
             .map((window) => window.windowId) ?? []));
+        const structurallyAcceptedWindowIds = new Set(completionOrder.flatMap(completed => completed.result?.windows
+          .filter(window => window.status !== "failed" && !boundaryFailuresByWindow.has(window.windowId))
+          .map(window => window.windowId) ?? []));
         const assignedWaveKnowledge = assignWaveKnowledge(
-          unpersistedWaveKnowledge,
+          unpersistedWaveKnowledge.filter(item => !item.candidate.kind.startsWith("lexical_preference:")),
           selected,
           successfulWindowIds,
           blockById,
           context,
         );
+        const assignedPreferences = assignWaveKnowledge(
+          unpersistedWaveKnowledge.filter(item => item.candidate.kind.startsWith("lexical_preference:")),
+          selected, structurallyAcceptedWindowIds, blockById, context,
+        );
+        for (const [windowId, preferences] of assignedPreferences) {
+          assignedWaveKnowledge.set(windowId, [...(assignedWaveKnowledge.get(windowId) ?? []), ...preferences]);
+        }
         const assignedRecordIds = new Set([...assignedWaveKnowledge.values()]
           .flatMap((items) => items.map((item) => item.recordId)));
         for (let index = unpersistedWaveKnowledge.length - 1; index >= 0; index -= 1) {
@@ -4161,7 +4378,7 @@ async function runLosslessBook(
             const capacityError = completedError instanceof BookRequestCapacityError;
             for (const requestWindow of completed.request.windows) {
               const window = claimed.get(requestWindow.windowId) as PersistedLosslessWindow;
-              const external = !capacityError && (completedError instanceof ModelProviderError || isSupervisionBoundaryError(completedError) || completedError instanceof CandidateRecoveryPausedError);
+              const external = !capacityError && (completedError instanceof ModelProviderError || isSupervisionBoundaryError(completedError) || completedError instanceof CandidateRecoveryPausedError || completedError instanceof RecoveryPausedError);
               if (completedError instanceof ModelProviderError && firstProviderFailure === undefined) {
                 firstProviderFailure = completedError;
               }
@@ -4200,7 +4417,7 @@ async function runLosslessBook(
                 ? completedError
                 : (firstProviderFailure ?? completedError);
             }
-            if (isSupervisionBoundaryError(completedError) || completedError instanceof CandidateRecoveryPausedError) providerFailure = completedError;
+            if (isSupervisionBoundaryError(completedError) || completedError instanceof CandidateRecoveryPausedError || completedError instanceof RecoveryPausedError) providerFailure = completedError;
             continue;
           }
 
@@ -4239,14 +4456,22 @@ async function runLosslessBook(
               });
             }
 
-            const candidates = [
+            const surfaceCandidates = surfaceObservations({ windowId: window.windowId,
+              sources: window.blockIds.map(blockId => ({ blockId, sourceText: blockById.get(blockId)!.sourceText })),
+              translations: windowResult.translations, candidates: collectedAnchorCandidates,
+              anchors: waveAnchorSnapshot?.anchors ?? [], previous: surfaceMemory, profile: context.languageProfile, usages: windowResult.surfaceUsages });
+            const waveKnowledge = assignedWaveKnowledge.get(window.windowId) ?? [];
+            // These preferences are grounded in immutable source concordance, not the
+            // translation's quality. Keep them even when that translation needs repair.
+            const preferences = waveKnowledge.filter(candidate => candidate.kind.startsWith("lexical_preference:"));
+            const candidates = [...surfaceCandidates, ...preferences, ...(windowResult.qualityIssues?.length ? [] : [
               ...knowledgeCandidatesFor(
                 runId,
                 window.windowId,
                 windowResult.memoryCandidates,
               ),
-              ...(assignedWaveKnowledge.get(window.windowId) ?? []),
-            ];
+              ...waveKnowledge.filter(candidate => !candidate.kind.startsWith("lexical_preference:")),
+            ])];
             // Validate domain reconciliation before any durable stage is written.
             coordinator.knowledge.fork().reconcileCandidates(candidates, window.windowId);
             const ordinal = relativeOrdinal.get(window.windowId) as number;
@@ -4274,7 +4499,8 @@ async function runLosslessBook(
               status,
               translations,
               knowledgeCandidates: candidates,
-              styleTail: canonicalJson(styleObservation),
+              styleTail: windowResult.qualityIssues?.length ? "" : canonicalJson(styleObservation),
+              qualityIssues: windowResult.qualityIssues,
               budget: persistedBudgetFor(
                 window,
                 completed.budget,
@@ -4356,17 +4582,59 @@ async function runLosslessBook(
       store.syncScopedKnowledge(runId);
       if (firstUncommitted(store.allWindows(runId)) === undefined) {
         await drainRevalidationAtFinalBarrier();
+        if (chapterPolicy && supervisor) {
+          let coverage = chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId))!;
+          while (coverage.pendingScopes.length) {
+            throwIfAborted(options.signal);
+            if (options.shouldPause?.()) break;
+            const terms = uniqueTerms([
+              ...context.stableTerms, ...(options.glossary?.stableTerms ?? []),
+              ...stableTermsFromKnowledge(store.latestKnowledgeSnapshot(runId).revisions),
+            ], context);
+            let chapterBlocked = false;
+            const batches = coverage.pendingScopes.flatMap(scope => Array.from({ length: Math.ceil(scope.windowIds.length / MAX_SUPERVISOR_WINDOWS) },
+              (_, i) => ({ ...scope, windowIds: scope.windowIds.slice(i * MAX_SUPERVISOR_WINDOWS, (i + 1) * MAX_SUPERVISOR_WINDOWS) })));
+            await runFinalizationTasks(batches.map(scope => ({ scopes: scope.windowIds, run: async () => {
+              throwIfAborted(options.signal);
+              if (chapterBlocked || options.shouldPause?.()) return;
+              try {
+                const hints = lexicalReviewHints({ revisions: store.latestKnowledgeSnapshot(runId).revisions,
+                  sources: context.losslessBlocks.map(b => ({ blockId: b.id, sourceText: b.sourceText })),
+                  translations: store.activeTranslations(runId),
+                  scopeBlockIds: scope.windowIds.flatMap(id => store.allWindows(runId).find(w => w.windowId === id)?.blockIds ?? []) });
+                const review = await supervisor.reviewChapter(scope.id, scope.title, scope.windowIds, terms, hints);
+                store.commitChapterReview(runId, review.decisionId);
+              } catch (error) {
+                if (deliveryMode !== "standard" || !isDeferrableQualityReviewError(error)) throw error;
+                throwIfAborted(options.signal);
+                // Coverage stays pending; queued work stops and in-flight receipts drain.
+                chapterBlocked = true;
+              }
+            } })), maxConcurrency);
+            coverage = chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId))!;
+            if (chapterBlocked) break;
+          }
+          // Partial chapter coverage must not consume the one final repair pass yet.
+          if (!coverage.pendingScopes.length) await drainQualityAtFinalBarrier();
+        } else {
+          await drainQualityAtFinalBarrier();
+        }
+        store.ensureConceptCoverageRevalidationTasks(runId, store.latestKnowledgeSnapshot(runId).id);
+        await drainRevalidationAtFinalBarrier();
       }
     }
 
     const status = store.statusSummary(runId);
+    const chapterPending = (chapterReviewCoverage(chapterPolicy, store.chapterReviewCheckpoints(runId), store.supervisionRecords(runId))?.pendingScopes.length ?? 0) > 0;
     const supervision = supervisorMode === "bounded" ? summarizeSupervision(supervisorMode, store.supervisionRecords(runId), store.allWindows(runId), store.activeTranslations(runId)) : undefined;
-    const outcome: LosslessBookRunResult["outcome"] = status.humanRequiredWindows > 0
-      || (supervision?.paused.length ?? 0) > 0 || (supervision?.pendingReviewWindowIds.length ?? 0) > 0
+    const qualityAttention = qualityQueue.items().some(item => item.state !== "resolved")
+      || chapterPending || (supervision?.paused.length ?? 0) > 0 || (supervision?.pendingReviewWindowIds.length ?? 0) > 0;
+    const outcome: LosslessBookRunResult["outcome"] = status.humanRequiredWindows > 0 || status.failedWindows > 0
+      || (deliveryMode === "strict" && qualityAttention)
       ? "human_required"
       : status.pendingWindows > 0 || status.runningWindows > 0 || status.stagedWindows > 0
         ? "partial"
-        : status.warningWindows > 0
+        : status.warningWindows > 0 || qualityAttention
           ? "completed_with_warnings"
           : "completed";
     tokenLedger.assertReconciled();
@@ -4409,9 +4677,27 @@ async function runLosslessBook(
 
 export function runBook(options: BookRunOptions): Promise<BookRunResult>;
 export function runBook(options: LosslessBookRunOptions): Promise<LosslessBookRunResult>;
-export function runBook(
+export async function runBook(
   options: BookRunOptions | LosslessBookRunOptions,
 ): Promise<BookRunResult | LosslessBookRunResult> {
+  if ("manifestPath" in options && options.workflow === "direct") return runDirectBook(options);
+  if ("manifestPath" in options && existsSync(options.storePath)) {
+    const store = LosslessBookStore.openReadOnly(options.storePath);
+    try {
+      const existing = store.listTranslationRuns().find(r => r.runId === options.runMeta.runId);
+      if ((existing?.metadata as { workflow?: { name?: string } } | undefined)?.workflow?.name === "direct") {
+        if (options.workflow === "supervised") throw new Error("translation workflow mismatch; existing run uses direct workflow");
+        return runDirectBook(options);
+      }
+    } finally { store.close(); }
+  }
+  const streams = new Set([options.streamFn]);
+  if ("manifestPath" in options && options.runtimeSet) {
+    streams.add(options.runtimeSet.primary.streamFn);
+    streams.add(options.runtimeSet.escalation.streamFn);
+    for (const variant of options.runtimeSet.variants ?? []) streams.add(variant.streamFn);
+  }
+  for (const stream of streams) await preflightProviderStream(stream, "signal" in options ? options.signal : undefined, true);
   return "manifestPath" in options
     ? runLosslessBook(options)
     : runLegacyBook(options);

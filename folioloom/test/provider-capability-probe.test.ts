@@ -260,7 +260,7 @@ test("capability probe verifies a local chat provider stream, fragmented tool ca
   assert.equal(report.checks.every((check) => check.status === "passed"), true);
   assert.equal(provider.requests.length, 2);
   assert.equal(provider.requests[0]?.body.reasoning_effort, "max");
-  assert.equal(provider.requests[0]?.body.max_completion_tokens, 512);
+  assert.equal(provider.requests[0]?.body.max_tokens, 512);
   assert.equal(provider.requests[1]?.body.messages instanceof Array, true);
   const messages = provider.requests[1]?.body.messages as Array<Record<string, unknown>>;
   const assistant = messages.find((message) => message.role === "assistant");
@@ -276,8 +276,8 @@ test("a length-truncated tool call is retried once instead of reported unsupport
 
   assert.equal(report.status, "ready");
   assert.equal(provider.requests.length, 3);
-  assert.equal(provider.requests[0]?.body.max_completion_tokens, 512);
-  assert.equal(provider.requests[1]?.body.max_completion_tokens, 2048);
+  assert.equal(provider.requests[0]?.body.max_tokens, 512);
+  assert.equal(provider.requests[1]?.body.max_tokens, 2048);
 });
 
 test("two length terminations return PROBE_OUTPUT_TRUNCATED", async (t) => {
@@ -299,9 +299,9 @@ test("a length-truncated second tool turn retries once with the bounded output b
 
   assert.equal(report.status, "ready");
   assert.equal(provider.requests.length, 3);
-  assert.equal(provider.requests[0]?.body.max_completion_tokens, 512);
-  assert.equal(provider.requests[1]?.body.max_completion_tokens, 512);
-  assert.equal(provider.requests[2]?.body.max_completion_tokens, 2048);
+  assert.equal(provider.requests[0]?.body.max_tokens, 512);
+  assert.equal(provider.requests[1]?.body.max_tokens, 512);
+  assert.equal(provider.requests[2]?.body.max_tokens, 2048);
 });
 
 test("two length-truncated second tool turns return PROBE_OUTPUT_TRUNCATED rather than tool-call unsupported", async (t) => {

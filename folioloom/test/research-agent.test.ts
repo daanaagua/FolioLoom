@@ -208,6 +208,7 @@ test("mandatory questions survive scout submission and become unresolved when un
       protocolVersion: "v5-pilot-test",
     });
     assert.equal(outcome.snapshot.unresolved.length, 1);
+    assert.equal(outcome.run.providerResponses?.length, outcome.run.modelCalls);
     assert.equal(outcome.snapshot.unresolved[0]?.mandatory, true);
     assert.equal(
       outcome.snapshot.unresolved[0]?.questionId,

@@ -8,6 +8,18 @@ import {
 } from "../src/agents/pi-runtime.js";
 import { createProviderRuntime } from "../src/providers/runtime.js";
 
+test("DeepSeek generation ceilings use the provider's documented token field", async () => {
+  const runtime = createProviderRuntime({ providerId: "deepseek", modelId: "deepseek-flash", reasoningEffort: "high" }, "fixture-secret");
+  let payload: Record<string, unknown> | undefined;
+  const stream = await runtime.streamFn(runtime.model, {
+    messages: [{ role: "user", content: "A deterministic wire fixture.", timestamp: 0 }],
+  }, { maxTokens: 8192, onPayload(value) { payload = value as Record<string, unknown>; throw new Error("stop before network"); } });
+  await stream.result();
+  assert.equal(payload?.max_tokens, 8192);
+  assert.equal(payload?.max_completion_tokens, undefined);
+  assert.equal(payload?.reasoning_effort, "high");
+});
+
 async function qwenPayload(reasoningEffort: "off" | "on"): Promise<Record<string, unknown>> {
   const runtime = createProviderRuntime({
     providerId: "bailian",
@@ -45,7 +57,7 @@ test("provider runtime maps DeepSeek raw max without serializing the credential"
   }
   const model = runtime.model as Model<"openai-completions">;
   assert.equal(model.compat?.thinkingFormat, "deepseek");
-  assert.equal(model.compat?.maxTokensField, "max_completion_tokens");
+  assert.equal(model.compat?.maxTokensField, "max_tokens");
   assert.equal(model.compat?.requiresReasoningContentOnAssistantMessages, true);
   assert.equal(JSON.stringify(runtime.model).includes(credential), false);
 });

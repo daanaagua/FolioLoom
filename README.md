@@ -6,19 +6,22 @@
 
 FolioLoom is an open-source AI translation engine for novels and other long-form fiction. It treats source integrity, narrative memory, entity aliases, terminology continuity, local style, and failure recovery as one auditable pipeline, so complex books can remain consistent and traceable after chunking, parallel execution, and long-running translation sessions.
 
-The current version is **FolioLoom v1.8.1**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
+The current version is **FolioLoom v1.11.0**. The production TypeScript core lives in [`folioloom/`](folioloom/). Python code at the repository root primarily provides TXT, Markdown, DOCX, and EPUB input adapters and preserves the V1–V4 research history.
 
-v1.8.1 strengthens native Pi supervision with host-issued evidence references, durable candidate checkpoints, restart-safe repair limits and dependency-aware review caching. Existing runs keep their recorded backend and supervision policy. See the [release notes](docs/releases/v1.8.1.md) and [reliability contracts](docs/reliability.md).
+v1.11.0 makes direct generation the default for new native full-book tasks. New direct-protocol-3 runs learn typed, source-attested names alongside translation: stable entities become naming constraints, distinctive terms remain contextual preferences, and ordinary words are excluded. SQLite-backed fixed waves resolve declared conflicts against a frozen naming plan. No model planning, lexical research, semantic review or quality-closure loop runs on this path. Existing runs retain their recorded workflow and protocol. See the [release notes](docs/releases/v1.11.0.md) and [direct translation](docs/direct-translation.md).
 
 - ✓ **Partial mitigation for DeepSeek's mistaken copyright refusals:** caller-supplied source and usage context can now accompany translation, research, repair and supervision through the desktop task-context field or `--task-context-file`. Clear, truthful context helps address refusals based on unsupported assumptions about the task. This is a prompt-context correction, not a change to DeepSeek's policies or a guarantee against future refusals; it does not infer rights or invent authorization.
 
-## What v1.8.1 can do
+## What v1.11.0 can do
+
+New CLI tasks use `--workflow direct` by default; the desktop offers the same path with legacy supervision disabled. Structural validation, durable responses, bounded transport recovery and export remain active. The advanced supervision, evolving knowledge and revalidation features below remain available through `--workflow supervised` and existing runs.
 
 - Build a lossless source ledger with hashes and positional mappings.
 - Use embedded Pi to approve bounded batches, query source evidence, review selected candidates and request grounded repairs, while the kernel retains budgets, validation and commits.
 - Translate logical windows serially or with bounded concurrency, then resume safely after interruption.
 - Record entity aliases, candidate relationships, and revalidation state with evidence.
 - Freeze terminology anchors for each parallel wave to reduce name drift between sibling windows.
+- Persist recurrent specialized words as source-grounded, sense-scoped soft preferences in SQLite. Relevant requests reuse the preferred name after restart; full-source concordance appears in audit and quality reports without automatic replacement. See [specialized-word memory](docs/specialized-word-memory.md).
 - Combine book-level style constraints, character voices, register weights, and decaying local state.
 - Apply deterministic checks and one bounded local repair for omissions, unexpected residue, and structural errors.
 - Export Chinese TXT, bilingual TXT, EPUB, and audit reports from the SQLite state store.
@@ -57,7 +60,11 @@ Both runs passed strict export and audit with no human-required or failed window
 
 ## Installation
 
-Requirements: Windows, Python 3.11+, and Node.js 24+.
+Requirements: Windows, Python 3.11+, and Node.js 24+ (24.14+ for environment proxy support).
+
+Native provider requests share process-local proxy configuration and a read-only
+connection preflight. See [provider networking](docs/provider-network.md) for proxy
+variables, certificate errors, and runtime requirements.
 
 ```powershell
 git clone https://github.com/daanaagua/FolioLoom.git
@@ -197,9 +204,9 @@ In the application:
 2. Select a model provider and enter your API key, model name, and raw effort value.
 3. Test the connection, then run a single-fragment trial translation.
 4. Choose quality or fast mode under Translation Run and start the full book. A run can be paused safely and resumed after restarting the app.
-5. Once the translation is complete and the audit passes, export Chinese TXT, bilingual TXT, EPUB, or all three.
+5. Once the translation is complete and the delivery audit passes, export Chinese TXT, bilingual TXT, EPUB, or all three, with a quality report. Choose strict delivery to require every requested semantic review to pass.
 
-API keys never enter the project, logs, UI return values, or installer. When Windows system encryption is available, keys are stored through Electron `safeStorage`; otherwise, they remain only for the current application session. Trial translation always uses one serial window. Full-book runs commit progress and translations to the manuscript's own SQLite state store without modifying the source file. Pausing or closing the app first cancels the active model request and waits for persistent state to settle; resuming preserves the run's model strategy. Export accepts only complete runs that pass strict validation and retains traceable lineage for TXT and EPUB output.
+API keys never enter the project, logs, UI return values, or installer. When Windows system encryption is available, keys are stored through Electron `safeStorage`; otherwise, they remain only for the current application session. Trial translation always uses one serial window. Full-book runs commit progress and translations to the manuscript's own SQLite state store without modifying the source file. Pausing or closing the app first cancels the active model request and waits for persistent state to settle; resuming preserves the run's model strategy. Standard delivery exports complete validated text with a separate quality report, including outstanding reviews, deferred terminology work and unknown historical usage. Strict delivery additionally requires completed reviews, knowledge convergence and reconciled usage. Both modes enforce complete coverage, provenance and intact export evidence, retaining traceable lineage for TXT and EPUB output; neither invents missing paragraphs or silently clears a finding.
 
 When a trial fails, export diagnostic JSON from the error panel or the persistent entry in the sidebar. Strict privacy mode retains only the version, run stage, status, counts, error codes, and redacted error chain. It excludes API keys, Authorization headers, source text, translations, prompts, raw model responses, and complete private paths.
 

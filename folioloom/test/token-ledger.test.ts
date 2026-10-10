@@ -20,6 +20,35 @@ function createTransactionalLedger(cap = 0.1) {
   });
 }
 
+test("append-only unlaunched correction removes only its own conservative debit and preserves other unknown usage", () => {
+  const ledger = createTransactionalLedger();
+  for (const requestId of ["local", "network"]) {
+    ledger.apply({ type: "reserved", requestId, purpose: "supervision", taskIds: [], predictedTokens: 100, attempt: 0 });
+    ledger.apply({ type: "dispatched", requestId });
+    ledger.apply({ type: "settled", requestId, actualTokens: 0, usageComplete: false, outcome: "failed" });
+  }
+  ledger.apply({ type: "unlaunched_corrected", requestId: "local", evidenceId: "local:failed", reason: "supervisor_scope_rejected" });
+  assert.equal(ledger.state().spentTokens, 100);
+  assert.equal(ledger.state().tokenUsageComplete, false);
+  assert.throws(() => ledger.apply({ type: "unlaunched_corrected", requestId: "local", evidenceId: "local:failed", reason: "supervisor_scope_rejected" }), /unknown.*settlement/u);
+  assert.equal(ledger.state().spentTokens, 100);
+  ledger.apply({ type: "unlaunched_corrected", requestId: "network", evidenceId: "network:failed", reason: "supervisor_scope_rejected" });
+  assert.equal(ledger.state().spentTokens, 0);
+  assert.equal(ledger.state().tokenUsageComplete, true);
+  assert.ok(ledger.reconcile().consistent);
+});
+
+test("a metered or non-supervisor settlement cannot be corrected as unlaunched", () => {
+  for (const purpose of ["supervision", "translate"] as const) {
+    const ledger = createTransactionalLedger();
+    ledger.apply({ type: "reserved", requestId: "r", purpose, taskIds: [], predictedTokens: 100, attempt: 0 });
+    ledger.apply({ type: "dispatched", requestId: "r" });
+    ledger.apply({ type: "settled", requestId: "r", actualTokens: purpose === "supervision" ? 12 : 0, usageComplete: false, outcome: "failed" });
+    assert.throws(() => ledger.apply({ type: "unlaunched_corrected", requestId: "r", evidenceId: "r:failed", reason: "supervisor_scope_rejected" }), /unlaunched correction/u);
+    assert.equal(ledger.state().spentTokens, 100);
+  }
+});
+
 test("empty ledger starts at zero", () => {
   const ledger = createLedger();
   const state = ledger.state();

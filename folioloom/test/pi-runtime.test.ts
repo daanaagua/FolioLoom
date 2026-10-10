@@ -19,6 +19,25 @@ function streamFrom(faux: ReturnType<typeof fauxProvider>) {
   return faux.provider.streamSimple.bind(faux.provider);
 }
 
+test("Pi's optional terminal reminder respects existing counters and parent cancellation", async () => {
+  for (const stop of ["model-budget", "phase-budget", "cancel"] as const) {
+    const faux = fauxProvider();
+    const controller = new AbortController();
+    faux.setResponses([() => {
+      if (stop === "cancel") controller.abort();
+      return fauxAssistantMessage("Only prose.");
+    }]);
+    const budget = new BudgetLedger({ modelCalls: stop === "model-budget" ? 1 : 4,
+      supervisionTurns: stop === "phase-budget" ? 1 : 4 });
+    const result = await new PiRuntime().run({ systemPrompt: "Use the finalizer.", prompt: "Review.",
+      phase: "supervision", model: faux.getModel(), tools: [], budget, maxTurns: 4,
+      missingTerminalToolPrompt: "Submit with the tool.", signal: controller.signal }, streamFrom(faux));
+    assert.equal(result.modelCalls, 1);
+    assert.equal(result.providerResponses?.length, 1);
+    assert.equal(faux.state.callCount, 1);
+  }
+});
+
 test("Pi executes an allowlisted tool and stops on terminating submit", async () => {
   const faux = fauxProvider();
   const executed: string[] = [];
@@ -109,6 +128,7 @@ test("Pi gracefully stops a nonterminal session at its local turn cap", async ()
 
   assert.equal(result.modelCalls, 1);
   assert.equal(result.turnLimitReached, true);
+  assert.equal(result.providerResponses?.length, 1);
   assert.equal(faux.state.callCount, 1);
 });
 

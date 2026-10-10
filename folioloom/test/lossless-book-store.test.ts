@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { auditLosslessBookExport } from "../src/report.js";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -19,6 +20,7 @@ import {
   reviseConcept,
 } from "../src/knowledge/lexical-concept.js";
 import { KnowledgeStore } from "../src/knowledge/knowledge-store.js";
+import { createLexicalPreference } from "../src/knowledge/lexical-preference.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   expectedTermOccurrences,
@@ -190,6 +192,35 @@ function initialize(
   store.initializeWindowPlan(runId, windows);
   return runId;
 }
+
+test("derived surface quarantine versions only certified noise, preserves history and is idempotent", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  try {
+    const domain = new KnowledgeStore();
+    const noise = { schema: "surface-observation-1", sourceForm: "E1.0.0", sourceQuote: "⟦E1.0.0⟧Alpha⟦/E1.0.0⟧",
+      proposedTarget: "", observedTarget: null, semanticClass: "unclassified" };
+    domain.reconcileCandidates([{ recordId: "noise", normalizedSubject: "e1.0.0:block", kind: "lexical_surface_observation", payload: noise },
+      { recordId: "keep", normalizedSubject: "alpha", kind: "term", payload: { target: "阿尔法" } }], "legacy");
+    const snapshot = createKnowledgeSnapshot("run-a", domain.projectableRevisions());
+    const run = initialize(store, { ...runMeta("model-a", "a"), initialSnapshot: snapshot, initialSnapshotId: snapshot.id });
+    // Seed a legacy fixture: current staging correctly rejects protocol-only observations.
+    const legacy = new DatabaseSync(path);
+    for (const r of domain.projectableRevisions()) legacy.prepare(`INSERT INTO knowledge_records
+      (run_id,record_id,revision_id,revision,normalized_subject,kind,payload_json,status,active) VALUES(?,?,?,?,?,?,?,?,1)`)
+      .run(run, sha256(`${r.normalizedSubject}\0${r.kind}`), r.revisionId, r.revision, r.normalizedSubject, r.kind, JSON.stringify(r), r.status);
+    legacy.close();
+    const state = store.knowledgeState(run);
+    assert.equal(store.quarantineDerivedSurfaces(run, state.generation, state.snapshotId).revisionIds.length, 1);
+    assert.equal(store.latestKnowledgeSnapshot(run).revisions.length, 1);
+    assert.equal(store.knowledgeRevisions(run).length, 3, "original noise remains in version history");
+    assert.ok(!auditLosslessBookExport(store, run).audit.incidentCodes.includes("KNOWLEDGE_HISTORY_INVALID"));
+    assert.throws(() => store.quarantineDerivedSurfaces(run, state.generation, state.snapshotId), /GENERATION_CONFLICT/u);
+    const next = store.knowledgeState(run);
+    assert.deepEqual(store.quarantineDerivedSurfaces(run, next.generation, next.snapshotId).revisionIds, []);
+    assert.deepEqual(store.knowledgeState(run), next);
+  } finally { store.close(); }
+});
 
 test("provider response evidence is durable, compressed, and raw-body deduplicated", () => {
   const path = fixturePath();
@@ -753,6 +784,29 @@ test("stage writes only inactive rows and promote commits the complete window at
   store.close();
 });
 
+test("quality deferral admits only source-attested soft preferences and still rejects arbitrary memory", () => {
+  const store = new LosslessBookStore(fixturePath());
+  try {
+    initialize(store);
+    store.claimWindow("run-a", "window-0");
+    const term = createLexicalPreference({ sourceForm: "Alpha", target: "阿尔法", mode: "stable", confidence: 0.65,
+      meaning: "a fixture label", usageScope: "this source", contexts: ["Alpha."] });
+    const candidate = { recordId: "preference", normalizedSubject: "alpha", kind: `lexical_preference:${term.preference!.senseId}`, payload: term };
+    const stage: WindowStageInput = { ...validStage(), styleTail: "", qualityIssues: [{ code: "SUPERVISOR_SEMANTIC_REVIEW",
+      blockId: blocks()[0]!.id, message: "A semantic issue remains.", repairable: true }] };
+    assert.throws(() => store.stageWindow(stage), /cannot publish memory or style/u);
+    assert.throws(() => store.stageWindow({ ...stage, knowledgeCandidates: [{ ...candidate,
+      payload: { ...term, locked: true, policy: "locked" } }] }), /immutable source evidence and soft policy/u);
+    const invented = createLexicalPreference({ sourceForm: "Alpha", target: "阿尔法", mode: "stable", confidence: 0.65,
+      meaning: "a fixture label", usageScope: "this source", contexts: ["Omega."] });
+    assert.throws(() => store.stageWindow({ ...stage, knowledgeCandidates: [{ ...candidate, payload: invented }] }), /immutable source evidence/u);
+    assert.equal(store.auditRows("run-a").windows[0]?.status, "running");
+    store.stageWindow({ ...stage, knowledgeCandidates: [candidate] });
+    assert.equal(store.auditRows("run-a").windows[0]?.status, "staged");
+    assert.equal(store.qualityRecords("run-a")[0]?.state, "pending");
+  } finally { store.close(); }
+});
+
 test("terminal protocol-tail repair creates an audited translation version", () => {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
@@ -832,11 +886,11 @@ test("lexical concept revisions and occurrence replacement are idempotent", () =
   assert.deepEqual(secondChanges.map((change) => ({
     revision: change.revision,
     renderChanged: change.renderChanged,
-  })), [{ revision: 2, renderChanged: false }]);
+  })), []);
   assert.deepEqual(store.upsertLexicalConcepts(runId, [confidenceOnly]), []);
   assert.equal(
     store.activeLexicalConcept(runId, concept.conceptId)?.revision,
-    2,
+    1,
   );
   assert.equal(
     store.conceptOccurrences(runId, concept.conceptId).length,

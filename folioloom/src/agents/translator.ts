@@ -39,7 +39,6 @@ import type { PiRunResult } from "./pi-runtime.js";
 import { PiRuntime } from "./pi-runtime.js";
 import { Repairer } from "./repairer.js";
 
-const MIN_TRANSLATION_FACT_CONFIDENCE = 0.9;
 
 export interface TranslationIsland {
   islandId: string;
@@ -180,11 +179,9 @@ export function splitIntoChapterIslands(
 
 function factsAsResolutions(snapshot: ProvisionalSnapshot): ResolutionCandidate[] {
   return [...snapshot.narrativeFacts, ...snapshot.translatorFacts]
-    .filter((fact) => fact.confidence >= MIN_TRANSLATION_FACT_CONFIDENCE)
     .map((fact) => ({
       questionId: fact.questionId,
       verdict: fact.verdict,
-      confidence: fact.confidence,
       evidenceIds: [...fact.evidenceIds],
       unresolved: "",
     }));
@@ -249,7 +246,7 @@ export class Translator {
         "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",
         "If and only if a concrete ambiguity can change the Chinese wording, call request_translation_evidence with one to three literal source-language forms copied from the target island.",
         "Use narrative_before_target for narrator-visible context and translator_global only for silent lexical disambiguation. Do not research themes, allusions, or general lore.",
-        "With finalize_translation, optionally submit up to four concise language-neutral memoryCandidates for explicit source-grounded facts likely to affect later wording. Use literal source-language subjectForms from this island; do not submit themes, predictions, interpretations, or low-confidence guesses.",
+        "With finalize_translation, optionally submit up to four concise language-neutral memoryCandidates for explicit source-grounded facts likely to affect later wording. Use literal source-language subjectForms from this island; do not submit themes, predictions, interpretations, or unsupported guesses.",
         "Use typed tools only. Submit every block exactly once with finalize_translation.",
       ].join("\n"),
       prompt: initialPrompt,
@@ -344,8 +341,8 @@ export class Translator {
       .map((question) => question.questionId));
     const facts = [...input.snapshot.narrativeFacts, ...input.snapshot.translatorFacts]
       .filter((fact) =>
-        highImpactIds.has(fact.questionId)
-        && fact.confidence >= MIN_TRANSLATION_FACT_CONFIDENCE);
+        highImpactIds.has(fact.questionId))
+      .map(({ confidence: _legacyScore, ...fact }) => fact);
     return [
       `ISLAND ${input.island.islandId}`,
       `CHAPTER ${input.island.chapterId} ${input.island.chapterTitle ?? ""}`,

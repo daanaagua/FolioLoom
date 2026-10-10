@@ -230,6 +230,7 @@ function mergeRuns(runs: readonly PiRunResult[]): PiRunResult {
     durationMs: runs.reduce((total, run) => total + run.durationMs, 0),
     stopReason: last?.stopReason ?? "stop",
     messages: runs.flatMap((run) => run.messages),
+    providerResponses: runs.flatMap(run => run.providerResponses ?? run.messages.filter(m => m.role === "assistant")),
     deadlineExceeded: runs.some((run) => run.deadlineExceeded),
     turnLimitReached: runs.some((run) => run.turnLimitReached),
   };

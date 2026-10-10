@@ -16,7 +16,7 @@ test("DeepSeek policy keeps its probe and runtime wire format aligned", () => {
     reasoningEffort: "high",
   }));
 
-  assert.equal(off.outputTokenField, "max_completion_tokens");
+  assert.equal(off.outputTokenField, "max_tokens");
   assert.equal(off.initialProbeTokens("off"), 128);
   assert.deepEqual(off.serializeThinking("off"), { thinking: { type: "disabled" } });
   assert.equal(off.requiresReasoningReplay("off"), false);

@@ -2,7 +2,9 @@ import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
 import {
-  losslessBookLineage,
+  deliveryLineage,
+  auditLosslessBookExport,
+  qualityReportJson,
   losslessBookTranslations,
   type PilotTranslation,
 } from "../report.js";
@@ -12,6 +14,7 @@ import { writeStoredZip, type StoredZipInput } from "./stored-zip.js";
 import { writeTranslatedEpubTemplate } from "./epub-template-writer.js";
 
 export interface LosslessEpubOptions {
+  deliveryMode?: import("../fullbook/delivery-policy.js").DeliveryMode;
   title: string;
   language: "zh-CN";
   fallbackSectionChars?: number;
@@ -109,6 +112,11 @@ export async function writeLosslessBookEpub(
   outputPath: string,
   options: LosslessEpubOptions,
 ): Promise<string> {
+  const audit = auditLosslessBookExport(store, runId).audit;
+  const mode = options.deliveryMode ?? audit.deliveryMode;
+  if (mode === "standard" && !audit.deliveryReady) throw new Error("standard EPUB export requires complete validated coverage and intact export evidence");
+  const lineage = deliveryLineage(store, runId, mode);
+  const qualityReport = mode === "standard" ? qualityReportJson(store, runId) : undefined;
   const translations = losslessBookTranslations(store, runId);
   if (translations.length === 0) {
     throw new Error("EPUB export requires at least one translated block");
@@ -121,7 +129,8 @@ export async function writeLosslessBookEpub(
       return writeTranslatedEpubTemplate({
         sourceManifestPath: options.sourceManifestPath,
         translations,
-        lineage: losslessBookLineage(store, runId),
+        lineage,
+        qualityReport,
         outputPath,
       });
     }
@@ -165,8 +174,9 @@ export async function writeLosslessBookEpub(
     },
     {
       name: "META-INF/v5-lineage.json",
-      data: `${JSON.stringify(losslessBookLineage(store, runId), null, 2)}\n`,
+      data: `${JSON.stringify(lineage, null, 2)}\n`,
     },
+    ...(qualityReport ? [{ name: "META-INF/folioloom-quality.json", data: qualityReport }] : []),
     {
       name: "EPUB/package.opf",
       data: `<?xml version="1.0" encoding="UTF-8"?>

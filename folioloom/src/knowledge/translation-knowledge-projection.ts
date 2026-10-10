@@ -5,6 +5,7 @@ import {
   type KnowledgeStatus,
 } from "./knowledge-store.js";
 import { sourceFormsFromRevision } from "./knowledge-source-forms.js";
+import { hasSemanticSurfaceEvidence, surfaceObservationNoiseReason } from "./surface-consistency.js";
 import type { ContextEvidenceBundle } from "../fullbook/context-profile-planner.js";
 import type { RiskDimension } from "../fullbook/task-risk.js";
 import type { SourceLanguageProfile } from "../language/types.js";
@@ -63,6 +64,7 @@ export interface TranslationKnowledgeCandidate {
   readonly evidenceDistance?: number;
   readonly tokenCost: number;
   readonly entryCost: number;
+  readonly byteCost: number;
   readonly utility: number;
   readonly coverage: readonly RiskDimension[];
   readonly requires: readonly string[];
@@ -286,9 +288,17 @@ function parseRevision(value: unknown): ParsedRevision | undefined {
     normalizedSubject,
     kind,
     status,
-    payload: raw.payload,
-    alternatives: raw.alternatives,
+    payload: withoutLegacySelfScores(raw.payload),
+    alternatives: raw.alternatives.map(withoutLegacySelfScores),
   };
+}
+
+/** Only a wire copy is stripped; durable payloads keep their audit hashes. */
+function withoutLegacySelfScores(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutLegacySelfScores);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "confidence")
+    .map(([key, item]) => [key, withoutLegacySelfScores(item)]));
 }
 
 function formsForRevision(revision: ParsedRevision): string[] {
@@ -440,6 +450,30 @@ function projectionWithStableByteCount(
   throw new Error("knowledge projection byte count did not converge");
 }
 
+/** Reserve an upper bound for the JSON envelope before selecting atomic entries. */
+export function translationKnowledgeContentByteBudget(
+  total: number,
+  options: TranslationKnowledgeProjectionOptions = {},
+): number {
+  nonNegativeSafeInteger(total, "total knowledge revisions");
+  const resolved = resolvedOptions(options);
+  const empty = projectionWithStableByteCount(total, [], resolved);
+  if (empty.metadata.serializedBytes > resolved.maxSerializedBytes) {
+    throw new RangeError("maxSerializedBytes cannot fit knowledge projection metadata");
+  }
+  const envelope = {
+    ...empty,
+    metadata: {
+      ...empty.metadata,
+      projected: Math.min(total, resolved.maxEntries),
+      // The actual omitted count and byte count cannot have more digits.
+      serializedBytes: resolved.maxSerializedBytes,
+    },
+  };
+  return Math.max(0, resolved.maxSerializedBytes
+    - Buffer.byteLength(canonicalJson(envelope), "utf8"));
+}
+
 function appendIfWithinBounds(
   total: number,
   selected: ProjectedKnowledgeRevision[],
@@ -489,6 +523,7 @@ function candidateGroups(
     if (revision === undefined) continue;
     validRevisionIds.add(revision.revisionId);
     if (revision.kind === "lexical_anchor_decision") continue;
+    if (revision.kind === "lexical_surface_observation" && (!hasSemanticSurfaceEvidence(revision.payload) || surfaceObservationNoiseReason(revision.payload))) continue;
     const positionMatch = positionedMemoryMatch(revision, positions);
     const matched = positionMatch.positioned
       ? positionMatch.windowIds.length > 0
@@ -627,17 +662,11 @@ function candidateUtility(candidate: Candidate): number {
   const statusUtility = candidate.revision.status === "needs_revalidate"
     ? 4
     : candidate.revision.status === "active" ? 3 : 1;
-  const payload = record(candidate.revision.payload);
-  const confidence = payload !== undefined
-    && typeof payload.confidence === "number"
-    && Number.isFinite(payload.confidence)
-    ? Math.min(1, Math.max(0, payload.confidence))
-    : 0;
   const distanceUtility = candidate.evidenceDistance === undefined
     ? 0
     : 2 * Math.exp(-candidate.evidenceDistance / 12);
   return Math.round(
-    (scopeUtility + statusUtility + confidence * 2 + distanceUtility)
+    (scopeUtility + statusUtility + distanceUtility)
       * 1_000_000,
   ) / 1_000_000;
 }
@@ -659,6 +688,8 @@ function translationKnowledgeCandidate(
       profile,
     ).tokens,
     entryCost: 1,
+    // Reserve a comma even for the first entry so sums remain conservative.
+    byteCost: Buffer.byteLength(canonicalJson(payload), "utf8") + 1,
     utility: candidateUtility(candidate),
     coverage: explicitCoverage(candidate),
     requires: [],

@@ -318,7 +318,8 @@ export class BookStore {
           anchor.sourceForm,
           anchor.target,
           anchor.mode,
-          anchor.confidence,
+          // Obsolete schema-v1 NOT NULL column; never read as semantic evidence.
+          0,
         );
       }
 
@@ -343,7 +344,7 @@ export class BookStore {
           memory.kind,
           JSON.stringify(memory.subjectIds),
           memory.verdict,
-          memory.confidence,
+          0,
           memory.channel,
           memory.visibleFromGlobalIndex,
           JSON.stringify(memory.evidenceIds),
@@ -423,7 +424,6 @@ export class BookStore {
       sourceForm: row.source_form,
       target: row.target,
       mode: row.mode,
-      confidence: row.confidence,
     }));
   }
 
@@ -446,7 +446,6 @@ export class BookStore {
       kind: row.kind,
       subjectIds: parseStringArray(row.subject_ids_json),
       verdict: row.verdict,
-      confidence: row.confidence,
       channel: row.channel,
       visibleFromGlobalIndex: row.visible_from_global_index,
       evidenceIds: parseStringArray(row.evidence_ids_json),

@@ -193,7 +193,8 @@ export function buildDesktopRuntimePlan(
   const qualityProfile = normalizedProfile(qualityRuntime);
   const quality = translationRuntime(qualityRuntime);
   const supportedEfforts = requireSupportedEfforts(qualityRuntime);
-  const candidateEfforts = distinctCandidateEfforts(qualityRuntime.profile, supportedEfforts);
+  const candidateEfforts = mode === "quality" ? [qualityRuntime.profile.reasoningEffort]
+    : distinctCandidateEfforts(qualityRuntime.profile, supportedEfforts);
   const variants = validateRuntimeVariants(candidateEfforts.map((effort) => {
     if (effort === qualityRuntime.profile.reasoningEffort) {
       return quality;

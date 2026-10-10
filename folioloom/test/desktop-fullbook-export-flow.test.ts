@@ -51,6 +51,12 @@ function userText(context: Context): string {
 
 function deterministicResponse(context: Context) {
   const prompt = userText(context);
+  if ((context.tools?.length ?? 0) === 0 && prompt.startsWith('{"task":"translate"')) {
+    const data = JSON.parse(prompt);
+    const vocabulary = "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏";
+    return fauxAssistantMessage(JSON.stringify({ names: [], paragraphs: data.paragraphs.map(([id, text]: [string, string]) =>
+      [id, "中文译文" + [...text].map((c, i) => vocabulary[(c.codePointAt(0)! + i) % vocabulary.length]).join("") + "。"]) }));
+  }
   if (context.tools?.some((tool) => tool.name === "submit_supervisor_decision")) {
     const data = JSON.parse(prompt) as {
       event: "plan" | "review";
@@ -344,11 +350,11 @@ test("desktop imports, pauses, resumes, strictly exports, and verifies a Unicode
     });
     assert.deepEqual(
       new Set(result.files.map((file) => file.format)),
-      new Set(["translation_txt", "bilingual_txt", "epub", "audit", "metrics"]),
+      new Set(["translation_txt", "bilingual_txt", "epub", "audit", "metrics", "quality_report"]),
     );
 
     const paths = {
-      ...losslessBookArtifactPaths(result.directory, true, "Unicode Story"),
+      ...losslessBookArtifactPaths(result.directory, true, "Unicode Story", "standard"),
       epub: join(result.directory, "Unicode Story.epub"),
     };
     const storePath = join(

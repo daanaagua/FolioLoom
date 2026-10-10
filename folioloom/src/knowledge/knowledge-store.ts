@@ -181,6 +181,7 @@ function sortedAlternatives(values: readonly unknown[]): unknown[] {
 }
 
 function singletonCandidateStatus(kind: string, payload: unknown): KnowledgeStatus {
+  if (kind === "lexical_surface_observation") return "provisional";
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
     return "active";
   }

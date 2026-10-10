@@ -1,10 +1,8 @@
 import type {
   FetchLike,
-  InternalThinkingLevel,
   ModelOption,
   ModelProfile,
   ProviderDefinition,
-  ProviderEffort,
   ProviderId,
   ResolvedProviderProfile,
   SecretCredential,
@@ -14,6 +12,8 @@ import {
   isCurrentDeepSeekModelId,
   isWellFormedModelId,
 } from "./presets.js";
+import { providerFetch, providerNetworkError } from "./network.js";
+export { toInternalThinking, toProviderEffort } from "./effort.js";
 
 const MAX_DISCOVERED_MODELS = 500;
 
@@ -47,33 +47,6 @@ export function validateCustomOpenAICompatibleBaseUrl(value: string): string {
     throw new TypeError("custom provider base URL must be an HTTPS URL or loopback HTTP URL");
   }
   return normalizeBaseUrl(url.toString());
-}
-
-export function toInternalThinking(effort: ProviderEffort): InternalThinkingLevel | undefined {
-  switch (effort) {
-    case "off":
-      return undefined;
-    case "on":
-      return "high";
-    case "max":
-      return "xhigh";
-    case "minimal":
-    case "low":
-    case "medium":
-    case "high":
-    case "xhigh":
-      return effort;
-  }
-}
-
-export function toProviderEffort(
-  internal: InternalThinkingLevel,
-  profile: Pick<ModelProfile, "reasoningEffort">,
-): ProviderEffort | undefined {
-  const raw = profile.reasoningEffort;
-  return raw === undefined || raw === "off" || toInternalThinking(raw) !== internal
-    ? undefined
-    : raw;
 }
 
 function uniqueSortedModelIds(value: unknown): string[] {
@@ -195,7 +168,7 @@ export class ProviderRegistry {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const signal = request.signal === undefined ? controller.signal
       : AbortSignal.any([request.signal, controller.signal]);
-    const fetcher = request.fetch ?? globalThis.fetch;
+    const fetcher = request.fetch ?? providerFetch;
     try {
       const response = await fetcher(modelsEndpoint(baseUrl), {
         method: "GET",
@@ -209,8 +182,10 @@ export class ProviderRegistry {
         .filter((id) => definition.id !== "deepseek" || isCurrentDeepSeekModelId(id))
         .filter((id) => request.credential.length === 0 || !id.includes(request.credential))
         .map((id) => ({ id, source: "live" as const }));
-    } catch {
+    } catch (error) {
       request.signal?.throwIfAborted();
+      const failure = providerNetworkError(error);
+      if (failure) throw failure;
       if (fallback.length === 0) throw new Error("MODEL_DISCOVERY_UNAVAILABLE");
       return fallback;
     } finally {

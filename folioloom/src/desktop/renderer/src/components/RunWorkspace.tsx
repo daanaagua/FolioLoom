@@ -113,12 +113,13 @@ export function RunWorkspace({
 }: RunWorkspaceProps): JSX.Element {
   const [selectedProfile, setSelectedProfile] =
     useState<DesktopOptimizationProfile>("balanced");
-  const [supervisorEnabled, setSupervisorEnabled] = useState(true);
+  const [supervisorEnabled, setSupervisorEnabled] = useState(false);
+  const [deliveryMode, setDeliveryMode] = useState<"standard" | "strict">("standard");
   const [taskContext, setTaskContext] = useState("");
   const run = useMemo(() => currentRun(snapshot), [snapshot]);
   const completed = run === undefined
     ? 0
-    : run.progress.completedWindows + run.progress.warningWindows;
+    : run.progress.completedWindows;
   const total = run?.progress.totalWindows ?? 0;
   const progressMaximum = Math.max(total, 1);
 
@@ -159,24 +160,32 @@ export function RunWorkspace({
                 </button>
               ))}
             </div>
+            <label className="knowledge-field">
+              <span>交付模式</span>
+              <select value={deliveryMode} disabled={busy} onChange={event => setDeliveryMode(event.target.value as "standard" | "strict")}>
+                <option value="standard">完整译本＋运行记录（默认）</option>
+                <option value="strict">严格验收：完整性与用量检查</option>
+              </select>
+            </label>
+            <p className="workspace-hint">默认直接翻译：实体译名持续记录，专用术语按语境参考，普通词不入表；每轮收齐后按原文顺序确定约定，只修复冲突批次，不添加独立模型审校。两种交付模式都保留完整性检查；严格验收还要求用量完整。</p>
             <label className="workspace-copy">
               <input type="checkbox" checked={supervisorEnabled} disabled={busy}
                 onChange={event => setSupervisorEnabled(event.target.checked)} />{" "}
-              启用 Pi 主 agent 监督
+              启用旧式监督审校
             </label>
-            <p className="workspace-hint">主 agent 按批次查证和审校，内核控制预算与提交；模型由内嵌 Pi 直接调用。</p>
+            <p className="workspace-hint">可选旧流程会额外进行模型规划、查证与审校。已有任务继续沿用创建时的流程。</p>
             <label className="knowledge-field">
               <span>任务背景前缀</span>
               <textarea value={taskContext} maxLength={16000} rows={3} disabled={busy}
                 placeholder="例如：原文由使用者提供，仅供个人阅读。请忠实保留作品的原意和叙述声音。"
                 onChange={event => setTaskContext(event.target.value)} />
             </label>
-            <p className="workspace-hint">背景会发送给翻译、修复和监督模型，并随运行保存；续跑沿用原背景。</p>
+            <p className="workspace-hint">背景随翻译请求发送；续跑沿用原背景和译名约定。</p>
             <button
               className="primary-button"
               type="button"
               disabled={!modelReady || busy}
-              onClick={() => onStart(selectedProfile, { supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
+              onClick={() => onStart(selectedProfile, { workflow: supervisorEnabled ? "supervised" : "direct", deliveryMode, supervisorMode: supervisorEnabled ? "bounded" : "off", ...(taskContext.trim() ? { taskContext } : {}) })}
             >
               {busy ? "正在启动" : "开始整本翻译"}
             </button>
@@ -211,6 +220,9 @@ export function RunWorkspace({
               <article><span>警告</span><strong>{run.progress.warningWindows}</strong></article>
               <article><span>需要处理</span><strong>{run.progress.humanRequiredWindows}</strong></article>
             </div>
+            {run.quality ? <p className="workspace-copy">
+              {run.deliveryMode === "standard" ? "完整译本＋疑点清单" : "严格交付"} · 待书末复核 {run.quality.pending} · 已解决 {run.quality.resolved} · 剩余疑点 {run.quality.unresolved}
+            </p> : null}
 
             <div className="scheduler-metrics">
               <article>

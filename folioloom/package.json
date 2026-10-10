@@ -1,6 +1,6 @@
 {
   "name": "folioloom",
-  "version": "1.8.1",
+  "version": "1.11.0",
   "private": true,
   "description": "A continuity-aware translation engine for long-form fiction.",
   "type": "module",
@@ -13,6 +13,7 @@
     "pilot": "tsx src/cli.ts",
     "book": "tsx src/cli.ts book",
     "benchmark:cjk": "tsx src/benchmark/cjk-benchmark.ts",
+    "benchmark:context": "tsx src/benchmark/context-planning-benchmark.ts",
     "benchmark:reliability": "tsx src/benchmark/reliability-gate.ts",
     "desktop:dev": "electron-vite dev",
     "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",
@@ -31,6 +32,7 @@
     "opencc-js": "1.4.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "undici": "7.30.0",
     "yaml": "2.9.0",
     "yauzl": "^3.4.0"
   },

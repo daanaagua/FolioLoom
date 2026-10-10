@@ -30,7 +30,7 @@ test("lexical concept preserves contextual policy with a stable render fingerpri
   );
 });
 
-test("lexical concept identity is deterministic while revision identity follows all content", () => {
+test("lexical concept identity follows semantic content, not obsolete self-scores", () => {
   const first = conceptFromAnchor({
     sourceForm: "  Archon ",
     target: "执政官",
@@ -49,7 +49,7 @@ test("lexical concept identity is deterministic while revision identity follows 
 
   assert.deepEqual(first, second);
   assert.equal(confidenceRevision.conceptId, first.conceptId);
-  assert.notEqual(confidenceRevision.revisionId, first.revisionId);
+  assert.equal(confidenceRevision.revisionId, first.revisionId);
   assert.equal(confidenceRevision.renderFingerprint, first.renderFingerprint);
 });
 
@@ -101,7 +101,7 @@ test("lexical concept rejects malformed surface policy inputs", () => {
     }),
     /target/u,
   );
-  assert.throws(
+  assert.doesNotThrow(
     () => conceptFromAnchor({
       sourceForm: "Prokurist",
       target: "主事",
@@ -109,7 +109,6 @@ test("lexical concept rejects malformed surface policy inputs", () => {
       semanticClass: "role",
       confidence: Number.NaN,
     }),
-    /confidence/u,
   );
   const concept = conceptFromAnchor({
     sourceForm: "Prokurist",

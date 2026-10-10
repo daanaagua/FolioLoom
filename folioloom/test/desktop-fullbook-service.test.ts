@@ -327,13 +327,15 @@ test("desktop full-book start launches in background with formal run metadata", 
     assert.equal(seen[0]?.runtimeSet?.mode, "quality");
     assert.equal(seen[0]?.optimizationProfile, "balanced");
     assert.equal(seen[0]?.schedulerMode, "active");
-    assert.equal(seen[0]?.supervisorMode, "bounded");
+    assert.equal(seen[0]?.supervisorMode, "off");
+    assert.equal(seen[0]?.workflow, "direct");
     assert.equal(seen[0]?.taskContext, "测试材料仅供个人阅读。");
     assert.equal(seen[0]?.runtimeProfileStore, runtimeProfileStore);
     assert.deepEqual(seen[0]?.runMeta.metadata, {
       desktopFullBook: {
         schema: "folioloom-desktop-fullbook-1",
-        supervisorMode: "bounded",
+        workflow: "direct",
+        supervisorMode: "off",
         taskContext: "测试材料仅供个人阅读。",
         mode: "quality",
         optimizationProfile: "balanced",

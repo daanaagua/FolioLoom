@@ -40,7 +40,6 @@ function visibleOutputFixture(
       semanticClass: candidate.likelyProperName === true
         ? "proper_name"
         : "technical_term",
-      confidence: 0.95,
     })));
   }
   return JSON.stringify({
@@ -51,7 +50,6 @@ function visibleOutputFixture(
       semanticClass: candidate.likelyProperName === true
         ? "proper_name"
         : "unclassified",
-      confidence: 0.95,
     })),
     entityLinks: [],
   });

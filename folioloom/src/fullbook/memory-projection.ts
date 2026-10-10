@@ -7,7 +7,6 @@ import type { SubjectRef } from "../tools/research-tools.js";
 import type { ResearchQuestion } from "../tools/candidate-collector.js";
 import type { NarrativeMemoryRecord } from "./types.js";
 
-const MIN_DURABLE_CONFIDENCE = 0.9;
 const DEFAULT_TAIL_CHARS = 1_600;
 
 export function boundedActiveTail(
@@ -36,18 +35,16 @@ export function projectNarrativeMemories(
   const targetStart = Math.min(...targetBlocks.map((block) => block.globalIndex));
   return memories
     .filter((memory) =>
-      memory.confidence >= MIN_DURABLE_CONFIDENCE
-      && memory.subjectIds.some((subjectId) => activeSubjects.has(subjectId))
+      memory.subjectIds.some((subjectId) => activeSubjects.has(subjectId))
       && (memory.channel === "translator_global"
         || memory.visibleFromGlobalIndex <= targetStart))
     .sort((left, right) =>
       left.visibleFromGlobalIndex - right.visibleFromGlobalIndex
       || left.questionId.localeCompare(right.questionId))
-    .map((memory) => ({
-      ...memory,
-      subjectIds: [...memory.subjectIds],
-      evidenceIds: [...memory.evidenceIds],
-    }));
+    .map((memory) => {
+      const { confidence: _legacyScore, ...fact } = memory;
+      return { ...fact, subjectIds: [...memory.subjectIds], evidenceIds: [...memory.evidenceIds] };
+    });
 }
 
 export function mergeProjectedMemories(
@@ -69,7 +66,6 @@ export function mergeProjectedMemories(
     questionId: memory.questionId,
     kind: memory.kind,
     verdict: memory.verdict,
-    confidence: memory.confidence,
     evidenceIds: [...memory.evidenceIds],
     channel: memory.channel,
   }));
@@ -110,7 +106,6 @@ export function memoriesFromSnapshot(
   );
   const nextGlobalIndex = Math.max(...snapshot.targetScope.globalIndexes) + 1;
   return [...snapshot.narrativeFacts, ...snapshot.translatorFacts]
-    .filter((fact) => fact.confidence >= MIN_DURABLE_CONFIDENCE)
     .flatMap((fact): NarrativeMemoryRecord[] => {
       const question = questionById.get(fact.questionId);
       if (question === undefined || question.subjectIds.length === 0) {
@@ -121,7 +116,6 @@ export function memoriesFromSnapshot(
         kind: fact.kind,
         subjectIds: [...question.subjectIds],
         verdict: fact.verdict,
-        confidence: fact.confidence,
         channel: fact.channel,
         visibleFromGlobalIndex: fact.channel === "narrative_before_target"
           ? nextGlobalIndex

@@ -16,6 +16,99 @@ function fixture() {
 }
 const plan = { action: "translate", windowIds: ["w1", "w2"], reviewBlockIds: ["b1"], guidance: [], issues: [], reason: "先译两个窗口，再检查否定含义。" };
 
+test("JSON decision transport preserves evidence tools, task context and actual messages", async () => {
+  const { faux, input } = fixture();
+  input.decisionProtocol = "json_terminal";
+  const raw = input.streamFn;
+  input.streamFn = bindTaskContext((m, c, o) => {
+    assert.ok(c.systemPrompt?.startsWith("Authorized test context."));
+    assert.ok(!c.tools?.some(t => t.name === "submit_supervisor_decision"));
+    assert.match(c.systemPrompt ?? "", /JSON 结构示例（不是本题结论）/u);
+    assert.equal(o?.maxTokens, Math.min(32768, m.maxTokens));
+    return raw(m, c, o);
+  }, "Authorized test context.");
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_source", { query: "Rose", limit: 1 }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(JSON.stringify(plan)),
+  ]);
+  const result = await runSupervisor(input);
+  assert.equal(result.decision.action, "translate");
+  assert.deepEqual(result.run.toolNames, ["search_source"]);
+  assert.equal(result.run.modelCalls, 2);
+  assert.equal(result.run.messages.at(-1)?.role, "assistant");
+});
+
+test("JSON decisions reject wrappers, unknown fields, invented references and wrong scope with usage intact", async () => {
+  for (const value of ["```json\n" + JSON.stringify(plan) + "\n```", JSON.stringify({ ...plan, extra: true }),
+    JSON.stringify({ ...plan, windowIds: ["w2"] }), JSON.stringify({ ...plan,
+      guidance: [{ blockId: "b1", sourceRef: "invented", instruction: "change" }] })]) {
+    const { faux, input } = fixture();
+    faux.setResponses([fauxAssistantMessage(value)]);
+    await assert.rejects(() => runSupervisor({ ...input, decisionProtocol: "json_terminal" }),
+      (error: any) => error.kind === "protocol" && error.run?.modelCalls === 1);
+  }
+});
+
+test("readable EPUB focus resolves to exact source bytes and survives canonical journal validation", () => {
+  const { input } = fixture();
+  const sourceParts = ["An especially careful and patient observer can ", "notice every small detail ", "without inventing any ", "additional facts in this account."];
+  const targetParts = ["细心的观察者", "能注意到每个细节，", "不会为这段记述", "编造额外的事实。"];
+  const marked = (parts: string[]) => parts.map((p, i) => `⟦E1.2.${i}⟧${p}⟦/E1.2.${i}⟧`).join("");
+  const sourceText = marked(sourceParts), targetText = marked(targetParts);
+  const review: SupervisorInput = { ...input, event: "review", windows: [input.windows[0]!],
+    sources: [{ blockId: "b1", globalIndex: 0, sourceText }], candidate: [{ blockId: "b1", text: targetText }] };
+  const prompt = JSON.parse(supervisorPrompt(review));
+  const decision = { action: "revise", windowIds: ["w1"], reviewBlockIds: [], guidance: [], reason: "Check the stated detail.", issues: [{
+    blockId: "b1", sourceRef: prompt.source[0].evidence[0].id, targetRef: prompt.candidate[0].evidence[0].id,
+    sourceFocus: sourceParts.join(""), targetFocus: targetParts.join(""), problem: "Check the stated detail." }] };
+  const result = validateSupervisorDecision(decision, review);
+  assert.ok(result.issues[0]!.sourceFocus!.length > 160);
+  assert.ok(sourceText.includes(result.issues[0]!.sourceFocus!));
+  assert.ok(targetText.includes(result.issues[0]!.targetFocus!));
+  assert.deepEqual(validateSupervisorDecision(result, review), result);
+  assert.throws(() => validateSupervisorDecision({ ...decision, issues: [{ ...decision.issues[0], sourceFocus: "invented facts" }] }, review), /focus outside/u);
+});
+
+test("final review must account for each prior issue with short grounded dispositions", () => {
+  const { input } = fixture();
+  const review: SupervisorInput = { ...input, event: "review", windows: [input.windows[0]!],
+    candidate: [{ blockId: "b1", text: "罗斯离开了。她在等待。" }],
+    priorIssues: [{ issueId: "q1", blockId: "b1", sourceQuote: "did not leave", targetQuote: "罗斯离开了", problem: "否定丢失" }] } as SupervisorInput;
+  const raw = { action: "accept", windowIds: ["w1"], reviewBlockIds: [], guidance: [], issues: [], reason: "核对完成" };
+  assert.throws(() => validateSupervisorDecision(raw, review), /dispositions/u);
+  const prompt = JSON.parse(supervisorPrompt(review));
+  const disposition = { issueId: "q1", status: "fixed", sourceRef: prompt.source[0].evidence[0].id,
+    targetRef: prompt.candidate[0].evidence[0].id, note: "恢复否定" };
+  assert.throws(() => validateSupervisorDecision({ ...raw, dispositions: [disposition] }, review), /unchanged|fixed/u);
+  assert.throws(() => validateSupervisorDecision({ ...raw, dispositions: [{ ...disposition, status: "dismissed", note: "长".repeat(161) }] }, review), /note/u);
+  assert.throws(() => validateSupervisorDecision({ ...raw, dispositions: [{ ...disposition, issueId: "other" }] }, review), /issue/u);
+  const corrected = { ...review, candidate: [{ blockId: "b1", text: "罗斯没有离开。她在等待。" }] };
+  const correctedPrompt = JSON.parse(supervisorPrompt(corrected));
+  const checked = validateSupervisorDecision({ ...raw, dispositions: [{ ...disposition, targetRef: correctedPrompt.candidate[0].evidence[0].id }] }, corrected);
+  assert.equal((checked as any).dispositions[0].status, "fixed");
+});
+
+test("fixed evidence accepts a bound negation insertion but not unrelated edits", () => {
+  const { input } = fixture();
+  const before = "⟦E0.0.0⟧罗斯⟦/E0.0.0⟧⟦E0.0.1⟧能⟦/E0.0.1⟧⟦E0.0.2⟧离开。⟦/E0.0.2⟧";
+  const base: SupervisorInput = { ...input, event: "review", windows: [input.windows[0]!],
+    priorCandidate: [{ blockId: "b1", text: before }],
+    candidate: [{ blockId: "b1", text: before.replace("⟧能⟦", "⟧不能⟦") }],
+    priorIssues: [{ issueId: "q1", blockId: "b1", sourceQuote: "did not leave",
+      targetQuote: "能⟦/E0.0.1⟧⟦E0.0.2⟧离开", problem: "否定丢失" }] };
+  const decision = (review: SupervisorInput) => {
+    const prompt = JSON.parse(supervisorPrompt(review));
+    return { action: "accept", windowIds: ["w1"], reviewBlockIds: [], guidance: [], issues: [], reason: "复核否定",
+      dispositions: [{ issueId: "q1", status: "fixed", sourceRef: prompt.source[0].evidence[0].id,
+        targetRef: prompt.candidate[0].evidence[0].id, note: "否定已补" }] };
+  };
+  assert.equal(validateSupervisorDecision(decision(base), base).dispositions?.[0]?.status, "fixed");
+  for (const text of [before, before.replace("罗斯", "罗斯女士")]) {
+    const unchanged = { ...base, candidate: [{ blockId: "b1", text }] };
+    assert.throws(() => validateSupervisorDecision(decision(unchanged), unchanged), /unchanged|fixed/u);
+  }
+});
+
 test("supervisor can search evidence then authorize a bounded batch using native Pi", async () => {
   const { faux, input } = fixture();
   const seen: string[] = [];
@@ -65,6 +158,38 @@ test("provider failures are propagated rather than repaired as literary issues",
   assert.equal(faux.state.callCount, 1);
 });
 
+test("the final supervisor turn exposes only the decision tool without increasing the turn cap", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_source", { query: "Rose", limit: 1 }), { stopReason: "toolUse" }),
+    context => {
+      assert.deepEqual(context.tools?.map(tool => tool.name), ["submit_supervisor_decision"]);
+      assert.match(context.systemPrompt ?? "", /必须.*submit_supervisor_decision/u);
+      return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runSupervisor({ ...input, maxTurns: 2 });
+  assert.equal(result.run.modelCalls, 2);
+  assert.equal(result.decision.action, "translate");
+});
+
+test("evidence tools leave one of the existing eight tool credits for a final decision", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([
+    fauxAssistantMessage(Array.from({ length: 7 }, (_, index) => ({
+      ...fauxToolCall("search_source", { query: "Rose", limit: 1 }), id: `search-${index}`,
+    })), { stopReason: "toolUse" }),
+    context => {
+      assert.deepEqual(context.tools?.map(tool => tool.name), ["submit_supervisor_decision"]);
+      return fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runSupervisor(input);
+  assert.equal(result.run.modelCalls, 2);
+  assert.equal(result.run.toolNames.length, 8);
+  assert.equal(result.decision.action, "translate");
+});
+
 test("review advertises empty plan-only fields in its native tool schema and prompt", async () => {
   const { faux, input } = fixture();
   let schema: any;
@@ -81,6 +206,20 @@ test("review advertises empty plan-only fields in its native tool schema and pro
   assert.equal(schema.properties.reviewBlockIds.maxItems, 0);
   assert.equal(schema.properties.guidance.maxItems, 0);
   assert.match(system, /reviewBlockIds.*guidance.*\[\]/u);
+});
+
+test("an extra evidence call cannot consume the reserved decision credit", async () => {
+  const { faux, input } = fixture();
+  faux.setResponses([fauxAssistantMessage(
+    Array.from({ length: 8 }, (_, index) => ({
+      ...fauxToolCall("search_source", { query: "Rose", limit: 1 }), id: `search-${index}`,
+    })),
+  { stopReason: "toolUse" }), fauxAssistantMessage(fauxToolCall("submit_supervisor_decision", plan), { stopReason: "toolUse" })]);
+  const result = await runSupervisor(input);
+  assert.equal(result.decision.action, "translate");
+  assert.equal(result.run.toolErrors.length, 1);
+  assert.match(result.run.toolErrors[0]!.message, /final tool credit/u);
+  assert.equal(result.run.modelCalls, 2);
 });
 
 test("legacy quote diagnostics identify the faulty issue without weakening exact evidence", () => {
