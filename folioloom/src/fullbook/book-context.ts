@@ -122,6 +122,7 @@ export class BookContext {
       readFileSync(ledger.manifestPath, "utf8"),
     ) as SourceManifest;
     const certifiedSource: CertifiedSourceInput = {
+      ...(ledger.scope === undefined ? {} : { scope: ledger.scope }),
       sourceVersion: ledger.sourceVersion,
       rawSha256: manifest.raw_sha256,
       canonicalSha256: manifest.canonical_sha256,

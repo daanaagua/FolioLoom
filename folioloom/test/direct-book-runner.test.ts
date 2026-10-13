@@ -11,7 +11,7 @@ import { auditLosslessBookExport } from "../src/report.js";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { loadGlossary } from "../src/glossary/glossary-profile.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
-import { directHash, directNameCandidates, DIRECT_SYSTEM_PROMPT, DIRECT_TRANSLATION_VERSION, DIRECT_MEMORY_VERSION, DIRECT_MEMORY_SYSTEM_PROMPT } from "../src/fullbook/direct-translation.js";
+import { directHash, directNameCandidates, DIRECT_SYSTEM_PROMPT, DIRECT_TRANSLATION_VERSION, DIRECT_MEMORY_VERSION, DIRECT_MEMORY_SYSTEM_PROMPT, DIRECT_TYPED_VERSION, DIRECT_TYPED_SYSTEM_PROMPT } from "../src/fullbook/direct-translation.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { directRecoveryStatus, releaseDirectTransportRecovery, type DirectTransportRelease } from "../src/fullbook/direct-recovery.js";
 import { RunLease } from "../src/kernel/run-lease.js";
@@ -47,7 +47,7 @@ test("explicit transport release adds only its bounded durable allowance and pre
   } finally { db.close(); }
 });
 
-test("eight default attempts resume nested splits without regenerating successful subgroups", async () => {
+test("protocol four retains its total-attempt cap and resumes without regenerating successful subgroups", async () => {
   const root = mkdtempSync(join(tmpdir(), "folioloom-direct-splits-"));
   const source = join(root, "source.txt");
   writeFileSync(source, Array.from({ length: 8 }, (_, i) => `Mira waited beside gate number ${i + 1}.`).join("\n\n"), "utf8");
@@ -60,7 +60,7 @@ test("eight default attempts resume nested splits without regenerating successfu
     if (p.paragraphs.length > 2) return fauxAssistantMessage("{truncated");
     return fauxAssistantMessage(JSON.stringify({ paragraphs: p.paragraphs.map(([id]: [string]) => [id, "米拉在门边等候。"]), names: [] }));
   }));
-  const options = { workflow: "direct" as const, manifestPath: imported.manifestPath, storePath: join(root, "book.db"),
+  const options = { workflow: "direct" as const, directProtocolVersion: "direct-translation-4" as const, manifestPath: imported.manifestPath, storePath: join(root, "book.db"),
     runMeta: { runId: "direct", protocolVersion: "test" }, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
     maxWindows: 1, maxConcurrency: 1, schedulerMode: "active" as const };
   await assert.rejects(() => runBook({ ...options, maxAttempts: 4 }), /DIRECT_RECOVERY_PAUSED/u);
@@ -206,6 +206,24 @@ test("typed wave interruption retains peer drafts and resumes with lower concurr
   assert.equal(result.status.completedWindows, 3); assert.equal(calls, 4);
 });
 
+test("a repair that omits unchanged entries retains accepted names for later waves", async () => {
+  const f = await fixture(false, true, false); let calls = 0;
+  f.faux.setResponses(Array.from({ length: 8 }, () => (context: Context) => {
+    const p = payload(context), n = ++calls;
+    if (n >= 4) assert.ok(p.sharedNames.some((name: any) => name.source === "Yara" && name.target === "雅拉"));
+    const target = n === 3 ? "蜜拉" : "米拉";
+    return fauxAssistantMessage(JSON.stringify({ paragraphs: p.paragraphs.map(([id]: [string]) => [id, target + "和雅拉等候着。"]),
+      names: n === 2 ? [typedName(p, "Mira", target)] : n === 3 ? [typedName(p, "Mira", target), typedName(p, "Yara", "雅拉")] : [] }));
+  }));
+  await runBook({ ...f.options, maxWindows: 3 });
+  assert.equal(calls, 4);
+  const db = LosslessBookStore.openReadOnly(f.options.storePath);
+  try { assert.ok(db.directNames("direct").some(n => n.source === "Yara" && n.target === "雅拉")); }
+  finally { db.close(); }
+  await runBook({ ...f.options, maxWindows: 1 });
+  assert.equal(calls, 5);
+});
+
 test("typed naming plan and valid peer checkpoints survive a commit crash without extra calls", async t => {
   const f = await fixture(false, false, false); let calls = 0, staged = 0;
   f.faux.setResponses(Array.from({ length: 12 }, () => (context: Context) => {
@@ -225,7 +243,7 @@ test("typed naming plan and valid peer checkpoints survive a commit crash withou
   const result = await runBook({ ...f.options, maxWindows: remaining, maxConcurrency: 1 });
   assert.equal(result.status.completedWindows, 3); assert.equal(calls, 3);
 });
-async function fixture(namedHeading = false, secondName = false, legacy = true) {
+async function fixture(namedHeading = false, secondName = false, legacy = true, initialize = true) {
   const root = mkdtempSync(join(tmpdir(), "folioloom-direct-"));
   const source = join(root, "source.txt");
   writeFileSync(source, Array.from({ length: 6 }, (_, i) => `Chapter ${i + 1}${namedHeading ? " Mira" : ""}\n\n` + `Mira${secondName ? " and Yara" : ""} waited at gate number ${i + 1}. `.repeat(60)).join("\n\n"), "utf8");
@@ -234,10 +252,10 @@ async function fixture(namedHeading = false, secondName = false, legacy = true) 
   const options = { manifestPath: imported.manifestPath, storePath: join(root, "book.db"), runMeta: { runId: "direct", protocolVersion: "test" },
     workflow: "direct" as const, model: faux.getModel(), streamFn: faux.provider.streamSimple.bind(faux.provider),
     windowOptions: { maxBlocks: 1, maxSourceTokens: 800 }, maxConcurrency: 2, hardDeadlineMs: 10000 };
-  if (legacy) {
+  if (initialize) {
     const context = BookContext.openLossless({ manifestPath: imported.manifestPath });
     const plan = planBookWindows(context.losslessBlocks, { ...options.windowOptions, targetSourceTokens: 800, protocolVersion: "test" });
-    const identity = { version: DIRECT_MEMORY_VERSION, promptHash: directHash(DIRECT_MEMORY_SYSTEM_PROMPT), source: context.sourceLedger.sourceVersion,
+    const identity = { version: legacy ? DIRECT_MEMORY_VERSION : DIRECT_TYPED_VERSION, promptHash: directHash(legacy ? DIRECT_MEMORY_SYSTEM_PROMPT : DIRECT_TYPED_SYSTEM_PROMPT), source: context.sourceLedger.sourceVersion,
       plan, candidates: directNameCandidates(context.losslessBlocks, context.languageProfile), names: [], style: null,
       model: { id: options.model.id, provider: options.model.provider, api: options.model.api, baseUrl: options.model.baseUrl,
         contextWindow: options.model.contextWindow, maxTokens: options.model.maxTokens, effort: null, thinkingLevel: "high" }, taskContext: null };
@@ -246,7 +264,7 @@ async function fixture(namedHeading = false, secondName = false, legacy = true) 
       db.registerSource(context.certifiedSource!); db.replaceDerivedPlan(context.sourceLedger.sourceVersion, { blocks: context.losslessBlocks, annotations: context.annotations });
       const initial = createKnowledgeSnapshot("direct", []);
       db.createTranslationRun({ runId: "direct", sourceVersion: context.sourceLedger.sourceVersion, protocolVersion: "test", modelId: options.model.id,
-        metadata: { workflow: { name: "direct", version: DIRECT_MEMORY_VERSION, identityHash: directHash(identity) } }, initialSnapshotId: initial.id, initialSnapshot: initial });
+        metadata: { workflow: { name: "direct", version: identity.version, identityHash: directHash(identity) } }, initialSnapshotId: initial.id, initialSnapshot: initial });
     } finally { db.close(); context.close(); }
   }
   return { faux, options };
@@ -438,7 +456,7 @@ test("concurrent naming conflicts retain the first durable decision and only reg
 });
 
 test("an explicit glossary does not disable learning, and a conflicting proposal cannot overwrite it", async () => {
-  const f = await fixture(false, true, false); let calls = 0;
+  const f = await fixture(false, true, false, false); let calls = 0;
   const path = f.options.storePath + ".glossary.json";
   writeFileSync(path, JSON.stringify({ schema: "folioloom-glossary-1", terms: [{ source: "Mira", target: "米拉", policy: "locked" }] }));
   const context = BookContext.openLossless({ manifestPath: f.options.manifestPath });
@@ -447,15 +465,20 @@ test("an explicit glossary does not disable learning, and a conflicting proposal
     const p = payload(context), n = ++calls;
     assert.ok(p.sharedNames.some((x: any) => x.source === "Mira" && x.target === "米拉"));
     const target = n === 1 ? "蜜拉" : "米拉";
-    return fauxAssistantMessage(JSON.stringify({ paragraphs: p.paragraphs.map(([id]: [string]) => [id, target + "和雅拉等候着。"]), names: [typedName(p, "Mira", target), typedName(p, "Yara", "雅拉")] }));
+    const mira = p.sharedNames.find((x: any) => x.source === "Mira");
+    return fauxAssistantMessage(JSON.stringify({ paragraphs: p.paragraphs.map(([id]: [string]) => [id, target + "和雅拉等候着。"]),
+      names: [{ ...typedName(p, "Yara", "雅拉"), id: "new1" }],
+      nameChanges: n === 1 ? [{ nameId: mira.nameId, expectedRevision: mira.revision, target, reason: "Fixture alternative", evidence: { paragraphId: p.paragraphs.find(([, s]: [string, string]) => s.includes("Mira"))[0], quote: "Mira" } }] : [],
+      nameUses: p.paragraphs.filter(([, source]: [string, string]) => source.includes("Mira")).map(([id]: [string]) =>
+        ({ nameId: mira.nameId, paragraphId: id, quote: "Mira", target, occurrence: 0 })) }));
   }));
   await runBook({ ...f.options, glossary, maxWindows: 1 });
-  assert.equal(calls, 2);
+  assert.equal(calls, 1);
   const db = LosslessBookStore.openReadOnly(f.options.storePath);
-  try { assert.deepEqual(db.directNames("direct").map(n => ({ source: n.source, target: n.target })), [{ source: "Yara", target: "雅拉" }]); }
+  try { assert.deepEqual(db.directNames("direct").map(n => ({ source: n.source, target: n.target })), [{ source: "Mira", target: "米拉" }, { source: "Yara", target: "雅拉" }]); }
   finally { db.close(); }
   await runBook({ ...f.options, glossary, maxWindows: 1 });
-  assert.equal(calls, 3);
+  assert.equal(calls, 2);
 });
 
 test("a crash after learning but before staging replays both translation and naming without new calls", async t => {
@@ -515,7 +538,7 @@ test("legacy recovery checks all saved responses against current names after con
 });
 
 test("stored version-one runs retain their original prompt, identity and frozen-name behavior", async () => {
-  const f = await fixture(false, false, false);
+  const f = await fixture(false, false, false, false);
   const context = BookContext.openLossless({ manifestPath: f.options.manifestPath });
   const windows = planBookWindows(context.losslessBlocks, { ...f.options.windowOptions, targetSourceTokens: 800, protocolVersion: "test" });
   const identity = { version: DIRECT_TRANSLATION_VERSION, promptHash: directHash(DIRECT_SYSTEM_PROMPT), source: context.sourceLedger.sourceVersion,

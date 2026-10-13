@@ -8,6 +8,7 @@ import { epubStructuralTranslationError, stripEpubStructuralMarkers } from "../s
 export const DIRECT_TRANSLATION_VERSION = "direct-translation-1";
 export const DIRECT_MEMORY_VERSION = "direct-translation-2";
 export const DIRECT_TYPED_VERSION = "direct-translation-3";
+export const DIRECT_REVISION_VERSION = "direct-translation-4";
 export const DEFAULT_DIRECT_ATTEMPT_LIMIT = 8;
 export const MAX_DIRECT_ATTEMPT_LIMIT = 16;
 export type TranslationWorkflow = "direct" | "supervised";
@@ -17,6 +18,7 @@ export interface DirectName {
   kind?: "person" | "place" | "organization" | "work" | "term";
   policy?: "locked" | "preferred"; scope?: "book" | "context"; sense?: string;
   evidence?: { paragraphId: string; quote: string };
+  nameId?: string; revision?: number; authority?: "model" | "user";
 }
 export interface DirectNameCandidate { id: string; source: string; examples: string[]; occurrences: number }
 export interface DirectTranslation { paragraphs: Array<[string, string]>; translations: Array<{ blockId: string; text: string }>; names: DirectName[] }
@@ -88,10 +90,11 @@ export const DIRECT_TYPED_SYSTEM_PROMPT = [
 ].join("\n");
 
 export function buildDirectPrompt(input: { paragraphs: readonly DirectParagraph[]; candidates: readonly DirectNameCandidate[];
-  names: readonly DirectName[]; neighbors: readonly string[]; seed: boolean; style?: unknown; typed?: boolean }): string {
+  names: readonly DirectName[]; neighbors: readonly string[]; seed: boolean; style?: unknown; typed?: boolean; revisioned?: boolean }): string {
   return JSON.stringify({ task: "translate", targetLanguage: "zh-CN", sharedNames: input.names
     .filter(n => !n.applicableBlockIds || input.paragraphs.some(p => n.applicableBlockIds!.includes(p.blockId)))
-    .map(n => ({ source: n.source, target: n.target, ...(input.typed ? { policy: n.policy ?? "locked", ...(n.kind ? { kind: n.kind } : {}), ...(n.sense ? { sense: n.sense } : {}) } : {}) })),
+    .map(n => ({ source: n.source, target: n.target, ...(input.typed ? { policy: n.policy ?? "locked", ...(n.kind ? { kind: n.kind } : {}), ...(n.sense ? { sense: n.sense } : {}) } : {}),
+      ...(input.revisioned ? { nameId: n.nameId, revision: n.revision, authority: n.authority } : {}) })),
     ...(input.style ? { style: input.style } : {}), readOnlyContext: input.neighbors,
     ...(input.seed ? { namingCandidates: input.candidates } : {}),
     paragraphs: input.paragraphs.map(p => [p.id, p.source]) });
@@ -160,7 +163,7 @@ export function parseDirectResponse(text: string, paragraphs: readonly DirectPar
   return { paragraphs: rows, translations: [...translations].map(([blockId, parts]) => ({ blockId, text: parts.join("\n\n") })), names };
 }
 
-function parseTypedName(row: any, paragraphs: readonly DirectParagraph[], translations: Array<[string, string]>): DirectName | undefined {
+export function parseTypedName(row: any, paragraphs: readonly DirectParagraph[], translations: Array<[string, string]>): DirectName | undefined {
   if (!row || Array.isArray(row) || typeof row.source !== "string" || typeof row.target !== "string") return;
   const source = row.source.trim(), target = row.target.trim();
   if (!source || source.length > 120 || !target || target.length > 64 || /[\r\n\[\]{}⟦⟧]/u.test(source + target)
@@ -198,6 +201,7 @@ export function equivalentDirectRendering(source: string, a: string, b: string):
 }
 
 export function directNameKey(name: DirectName): string {
+  if (name.nameId) return name.nameId;
   return name.policy === "preferred" ? JSON.stringify([name.source, "context", name.sense ?? ""]) : name.source;
 }
 
@@ -241,9 +245,11 @@ export function assertDirectNamesCompatible(proposed: readonly DirectName[], est
   if (conflicts.length) throw new DirectNamingConflict(conflicts[0]!.source, conflicts[0]!.expected, conflicts[0]!.proposed, conflicts);
 }
 
+export const MAX_DIRECT_TOKEN_BUDGET_EXTENSION = 1_000_000;
+
 export interface DirectRecord {
   readonly id: string;
-  readonly kind: "request" | "response" | "retry" | "split" | "checkpoint" | "name_context" | "names" | "name_conflict" | "name_wave" | "name_plan" | "name_draft" | "replay" | "transport_release";
+  readonly kind: "request" | "response" | "retry" | "split" | "checkpoint" | "name_context" | "names" | "name_conflict" | "name_wave" | "name_plan" | "name_draft" | "replay" | "transport_release" | "name_revision_draft" | "name_revision_plan" | "name_revision_commit" | "fragment_plan" | "fragment_result" | "generation_budget" | "token_budget_extension";
   readonly windowId: string;
   readonly key: string;
   readonly at: number;
@@ -252,9 +258,29 @@ export interface DirectRecord {
 
 export function validateDirectRecord(record: DirectRecord): void {
   if (!record || !record.id || !record.windowId || !/^[a-f0-9]{64}$/u.test(record.key)
-    || !["request", "response", "retry", "split", "checkpoint", "name_context", "names", "name_conflict", "name_wave", "name_plan", "name_draft", "replay", "transport_release"].includes(record.kind)
+    || !["request", "response", "retry", "split", "checkpoint", "name_context", "names", "name_conflict", "name_wave", "name_plan", "name_draft", "replay", "transport_release", "name_revision_draft", "name_revision_plan", "name_revision_commit", "fragment_plan", "fragment_result", "generation_budget", "token_budget_extension"].includes(record.kind)
     || !Number.isSafeInteger(record.at) || record.at < 0 || !record.payload || typeof record.payload !== "object" || Array.isArray(record.payload))
     throw new Error("invalid direct translation record");
+  if (record.kind === "generation_budget" && ["tokenLimit", "failureLimit", "maxCalls"].some(k =>
+    !Number.isSafeInteger(record.payload[k]) || Number(record.payload[k]) < 1)) throw new Error("invalid generation budget");
+  if (record.kind === "token_budget_extension") {
+    const { request: raw, tokenLimit } = record.payload;
+    const request = raw as Record<string, unknown> | undefined;
+    if (!request || typeof request !== "object" || Array.isArray(request) || request.windowId !== record.windowId
+      || ![request.requestId, request.expectedLastRequestId, request.reason].every(s => typeof s === "string" && s.trim() && s.length <= 500)
+      || typeof request.expectedIdentityHash !== "string" || !/^[a-f0-9]{64}$/u.test(request.expectedIdentityHash)
+      || !Number.isSafeInteger(request.expectedTokenLimit) || Number(request.expectedTokenLimit) < 1
+      || !Number.isSafeInteger(request.additionalTokens) || Number(request.additionalTokens) < 1
+      || Number(request.additionalTokens) > MAX_DIRECT_TOKEN_BUDGET_EXTENSION
+      || !Number.isSafeInteger(tokenLimit) || tokenLimit !== Number(request.expectedTokenLimit) + Number(request.additionalTokens)
+      || record.id !== `token-budget-extension:${request.requestId}`
+      || record.key !== directHash([request.expectedIdentityHash, "token_budget_extension", request]))
+      throw new Error("invalid direct token budget extension record");
+  }
+  if (record.kind === "fragment_result" && (typeof record.payload.requestId !== "string" || record.payload.accepted !== true))
+    throw new Error("invalid fragment acceptance");
+  if (record.kind === "fragment_plan" && (!Array.isArray(record.payload.fragments) || !Array.isArray(record.payload.paragraphIds)))
+    throw new Error("invalid fragment plan");
   if (record.kind === "transport_release") {
     const { request: raw, attemptFloor, attemptCeiling } = record.payload;
     const request = raw as Record<string, unknown> | undefined;
@@ -267,12 +293,14 @@ export function validateDirectRecord(record: DirectRecord): void {
       || !Number.isSafeInteger(attemptCeiling) || Number(attemptCeiling) !== Number(attemptFloor) + Number(request.additionalAttempts)
       || Number(attemptCeiling) > MAX_DIRECT_ATTEMPT_LIMIT) throw new Error("invalid direct transport release record");
   }
-  if (["name_context", "names", "name_wave", "name_plan", "name_draft"].includes(record.kind)) {
+  if (["name_context", "names", "name_wave", "name_plan", "name_draft", "name_revision_commit"].includes(record.kind)) {
     if (!Array.isArray(record.payload.names) || record.payload.names.some((n: any) => !n || typeof n.source !== "string"
       || !n.source || typeof n.target !== "string" || !n.target || n.source.length > 240 || n.target.length > 240
       || (n.applicableBlockIds !== undefined && (!Array.isArray(n.applicableBlockIds) || n.applicableBlockIds.some((id: unknown) => typeof id !== "string")))))
       throw new Error("invalid direct naming record");
     for (const n of record.payload.names as DirectName[]) {
+      if (n.nameId !== undefined && (!/^name:[a-f0-9]{24}$/u.test(n.nameId) || !Number.isSafeInteger(n.revision)
+        || n.revision! < 1 || !["model", "user"].includes(n.authority ?? ""))) throw new Error("invalid versioned direct name");
       if (n.kind !== undefined && (!["person", "place", "organization", "work", "term"].includes(n.kind)
         || !["locked", "preferred"].includes(n.policy ?? "") || !["book", "context"].includes(n.scope ?? "")
         || !n.evidence || typeof n.evidence.paragraphId !== "string" || typeof n.evidence.quote !== "string"
@@ -281,6 +309,12 @@ export function validateDirectRecord(record: DirectRecord): void {
         || (n.kind !== "term" && (n.policy !== "locked" || n.scope !== "book")))) throw new Error("invalid typed direct name");
     }
   }
+  if (record.kind === "name_revision_draft" && (!Array.isArray(record.payload.source) || !record.payload.result
+    || !Array.isArray((record.payload.result as any).paragraphs))) throw new Error("invalid naming revision draft");
+  if (record.kind === "name_revision_plan" && (!record.payload.plan || !Array.isArray((record.payload.plan as any).windows)
+    || typeof record.payload.baseCatalogHash !== "string")) throw new Error("invalid naming revision plan");
+  if (record.kind === "name_revision_commit" && (typeof record.payload.planKey !== "string" || !Array.isArray(record.payload.windows)
+    || !Array.isArray(record.payload.pending) || !Array.isArray(record.payload.decisions))) throw new Error("invalid naming revision commit");
   if (record.kind === "name_wave" && (!Array.isArray(record.payload.windowIds) || !record.payload.windowIds.length
     || record.payload.windowIds.some((id: unknown) => typeof id !== "string" || !id)
     || new Set(record.payload.windowIds).size !== record.payload.windowIds.length)) throw new Error("invalid naming wave members");

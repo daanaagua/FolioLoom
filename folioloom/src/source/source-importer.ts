@@ -25,6 +25,7 @@ import {
   stripEpubStructuralMarkers,
 } from "./epub-structure.js";
 import { SourceLedger } from "./source-ledger.js";
+import { certifySourceScope, createScopePlan, SourceScopeError, type SourceScopeEvidence, type SourceScopePlan } from "./source-scope.js";
 import { scalarLength, type CanonicalSegment, type ExcludedRawRange } from "./types.js";
 
 const MAX_ARCHIVE_ENTRY_BYTES = 64 * 1024 * 1024;
@@ -87,6 +88,8 @@ export interface SourceImportRequest {
   projectDirectory: string;
   sourceLanguage: string;
   explicitEncoding?: string;
+  originalManifestPath?: string;
+  scopePlan?: SourceScopePlan;
 }
 
 export interface SourceImportResult {
@@ -755,6 +758,10 @@ export class SourceImporter {
   }
 
   async importSource(request: SourceImportRequest): Promise<SourceImportResult> {
+    if ((request.originalManifestPath === undefined) !== (request.scopePlan === undefined))
+      throw new SourceScopeError("SOURCE_SCOPE_INVALID: original manifest and scope plan must be supplied together");
+    const original = request.originalManifestPath === undefined ? undefined : SourceLedger.open(request.originalManifestPath);
+    if (original?.scope?.basis === "original-reference") throw new SourceScopeError("SOURCE_SCOPE_INVALID: nested subset origins are unsupported; reference the original input");
     const sourcePath = await requireRegularSource(request.sourcePath);
     const projectDirectory = requireProjectDirectory(request.projectDirectory);
     const format = sourceFormat(sourcePath);
@@ -786,7 +793,7 @@ export class SourceImporter {
       await mkdir(join(temporaryDirectory, "source"), { recursive: true });
       await writeFile(join(temporaryDirectory, rawMember), raw);
       await writeFile(join(temporaryDirectory, canonicalMember), extracted.sourceText, "utf8");
-      const manifest = {
+      const manifest: Record<string, unknown> = {
         schema_version: "v5-source-ledger-1",
         coordinate_unit: "unicode_scalar",
         raw_path: rawMember,
@@ -817,6 +824,33 @@ export class SourceImporter {
           policy: range.policy,
         })),
       };
+      await writeFile(join(temporaryDirectory, "source_manifest.json"), JSON.stringify(manifest), "utf8");
+      const initial = SourceLedger.open(join(temporaryDirectory, "source_manifest.json"));
+      const evidence: SourceScopeEvidence = certifySourceScope(original ?? initial,
+        request.scopePlan ?? createScopePlan(initial), extracted.sourceText, original ? "original-reference" : "provided-input");
+      if (original) {
+        const originDirectory = join(temporaryDirectory, "scope-origin");
+        await mkdir(join(originDirectory, "source"), { recursive: true });
+        const originalManifest = JSON.parse(await readFile(original.manifestPath, "utf8"));
+        const originalRawMember = `source/original${extname(original.rawPath)}`;
+        const originalRaw = await readFile(original.rawPath), originalCanonical = await readFile(original.canonicalPath);
+        if (sha256(originalRaw) !== evidence.original.rawSha256 || sha256(originalCanonical) !== evidence.original.canonicalSha256)
+          throw new SourceScopeError("SOURCE_SCOPE_INVALID: original changed during import");
+        await writeFile(join(originDirectory, originalRawMember), originalRaw);
+        await writeFile(join(originDirectory, "source.txt"), originalCanonical);
+        if (originalManifest.source_scope !== undefined) {
+          const scopeBytes = await readFile(resolve(dirname(original.manifestPath), originalManifest.source_scope.path));
+          if (sha256(scopeBytes) !== originalManifest.source_scope.sha256) throw new SourceScopeError("SOURCE_SCOPE_INVALID: original scope changed during import");
+          await writeFile(join(originDirectory, "source_scope.json"), scopeBytes);
+          originalManifest.source_scope.path = "source_scope.json";
+        }
+        originalManifest.raw_path = originalRawMember; originalManifest.canonical_path = "source.txt";
+        await writeFile(join(originDirectory, "source_manifest.json"), JSON.stringify(originalManifest), "utf8");
+        evidence.originManifest = "scope-origin/source_manifest.json";
+      }
+      const scopeBytes = JSON.stringify(evidence);
+      await writeFile(join(temporaryDirectory, "source_scope.json"), scopeBytes, "utf8");
+      manifest.source_scope = { path: "source_scope.json", sha256: sha256(scopeBytes) };
       await writeFile(join(temporaryDirectory, "source_manifest.json"), JSON.stringify(manifest), "utf8");
       SourceLedger.open(join(temporaryDirectory, "source_manifest.json"));
       const verifiedRaw = await this.#readSource(sourcePath);

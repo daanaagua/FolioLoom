@@ -64,14 +64,29 @@ routes silently. Native direct preflight must succeed before reserving attempts.
 ## Native workflow and task context
 
 In v1.11 and later, new native CLI runs default to direct translation. Use
-`--workflow direct`: new direct-translation-3 runs return typed names with source
+`--workflow direct`: new direct-translation-5 runs return typed names with source
 paragraph evidence alongside translation. Stable entities become book-scoped
 constraints; distinctive terms remain sense-bearing contextual preferences.
 Ordinary or uncertain entries are excluded. SQLite-backed fixed waves collect
-drafts and resolve declared conflicts in source order against one frozen plan,
-within the original translation allowance. Do not add separate planning, lexical
-research, semantic review or closure calls. Existing protocol-1/2 runs retain their
+drafts against one frozen catalog. The same translation response can include
+versioned `nameChanges` and precise `nameUses` receipts. The coordinator settles
+proposals at the wave boundary, protects user-owned entries, and applies only
+validated local edits to peer or historical translation versions. Competing
+proposals and unanchored changes remain inspectable through `book direct-naming
+status --store <store> --run <id>`; do not add review calls to settle them.
+All generation stays within the original translation allowance. Do not add separate planning, lexical
+research, semantic review or closure calls. Existing protocol-1/2/3/4 runs retain their
 original prompts and behavior; never upgrade a stored run by editing its database.
+
+For continuation references, use `--naming-reference <private-json>` with
+`{"schema":"folioloom-naming-reference-1","names":[...]}`. Entries use source,
+target and optional kind/scope/sense/policy. Terms require context scope and a
+sense. References remain model suggestions; the host filters them by the current
+paragraph group and requires new local evidence before learning them. Keep the
+reference file unchanged on resume. Do not embed a complete prior naming catalog
+in style or task-context text, or promote all learned entries to a user glossary.
+Protocol 5 plans smaller physical requests using paragraph count and estimated
+translation/marker/naming output; logical window commits retain their identities.
 
 The optional `--workflow supervised --supervisor bounded` path retains model
 planning, source queries and semantic review. Use it when explicitly selected or
@@ -93,6 +108,16 @@ If the selected checkout lacks these flags, use a known compatible checkout with
 explicit `--root`, or report the version boundary. Do not substitute an external CLI.
 
 ## Establish and check the project
+
+For a complete book, import the original file directly and retain every extracted
+EPUB member; never use a chapter-heading pattern to discard epilogues, framing
+narrative or supplementary text. For a deliberately cropped input, use the public
+`book scope --manifest <original-manifest> --output <plan.json>` inventory and
+`book import --original-manifest <original-manifest> --scope-plan <plan.json>`.
+Every original range must be translated, explicitly excluded with a reason, or
+marked for regeneration with a reason. A regeneration declaration is not proof
+that a replacement artifact exists. Scope-relative completion is not whole-book
+completion. Legacy inputs without scope evidence retain their original identity.
 
 Run all `npm` commands in `<folio-cli>`, with UTF-8 and argument arrays where supported.
 Resolve paths from the returned checkout; never build shell code from source prose.
@@ -158,6 +183,16 @@ updates. Do not invent a detached daemon or automatic monitoring schedule.
 
 ## Terminology and completion
 
+When the user explicitly requests an omission review, `book review scan --store
+<store> --run <id> --output <plan.json>` creates a free risk/sample plan. The
+separate `book review run` requires explicit `--max-calls`, `--max-tokens` and
+`--max-output-tokens` budgets, a native `--config` and a review output directory.
+It compares grounded source/target quotes without editing the book database.
+`book review status --output <directory>` reads its durable accounting. Review
+limits survive restart; unknown usage retains its reservation. Do not add these
+calls automatically to direct translation or treat a heuristic flag as a proven
+omission. Review completion covers its selected samples, not every sentence.
+
 For term edits, source-range names, queued edits, retrofits, or rollback, read
 [terminology-control.md](references/terminology-control.md). Use the typed control plane,
 not direct SQLite writes. A queued change is durable but only becomes effective at the next
@@ -190,9 +225,13 @@ Use FolioLoom's bounded protocol/recovery paths for invalid JSON or schema rejec
 add an independent model retry loop. Missing usage blocks strict export; never estimate it.
 Do not silently translate a book in the control conversation as a fallback.
 
-Native direct windows default to eight provider attempts, including split fragments.
+Protocols 1–4 default to eight total provider attempts, including split fragments.
+Protocol 5 defaults to eight failed attempts; validated successful fragments do not
+spend failure credits. Every call still consumes a fixed durable per-window token
+budget and call guard. Restart and increased failure credits never renew those
+limits. Missing usage retains its conservative charge and blocks strict export.
 When the user explicitly authorizes a larger generation allowance, resume the same
-run with `--max-attempts <1-16>`; existing requests still count, saved valid responses
+run with `--max-attempts <1-16>`; prior usage and the applicable attempt counts remain, saved valid responses
 remain reusable, and an existing token envelope is not renewed. Do not reset the
 store or repeat successful work. Existing transport grants retain their recorded
 base limit when the flag is omitted; do not replace that policy through an override.
@@ -207,6 +246,17 @@ transport-failed window, capped at sixteen lifetime attempts. It does not call a
 model, refresh on ordinary restart, renew token envelopes, approve semantic
 failures or reconcile unknown usage. Reuse saved peer responses and committed text;
 do not create a replacement run merely to evade exhausted generation credits.
+
+For protocol 5, a separately authorized token-budget increase uses
+`book direct-recovery extend-budget --store <store> --run <id> --input <grant.json>`.
+Read current recovery status first. The JSON contains requestId, windowId,
+expectedLastRequestId, expectedIdentityHash, expectedTokenLimit, additionalTokens
+and reason. Each grant adds 1–1,000,000 tokens to one pending window; use only the
+explicitly authorized amount. It preserves the immutable base budget, failure
+credits, call guard and all usage records. Identical submissions are idempotent;
+stale boundaries and active writer leases are rejected. Ordinary resume and
+attempt-limit changes do not add token grants. Historical unknown usage remains
+unknown and continues to block strict export after a grant.
 
 Update concise `STATE.md` with current result and remaining work. Record important run,
 model/backend, timing, usage, recovery, audit, and artifact evidence in `state/YYYY-MM-DD.md`
