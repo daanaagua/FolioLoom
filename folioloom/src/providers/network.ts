@@ -8,6 +8,10 @@ const TLS_CODES = new Set([
   "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
   "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_REVOKED", "CERT_UNTRUSTED", "INVALID_CA",
 ]);
+const TRANSPORT_CODES = new Set([
+  "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "ECONNRESET", "ECONNREFUSED",
+  "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN",
+]);
 
 export class ProviderNetworkError extends Error {
   readonly retryable = false;
@@ -19,14 +23,16 @@ export class ProviderNetworkError extends Error {
 }
 
 /** Keep allowlisted transport codes, never raw request objects, credentials or certificate contents. */
-export function providerNetworkError(error: unknown): ProviderNetworkError | undefined {
+export function providerNetworkError(error: unknown, phase?: "before-response-headers"): ProviderNetworkError | undefined {
   const pending: unknown[] = [error], seen = new Set<unknown>();
+  let transportCode: string | undefined;
   for (let checked = 0; pending.length && checked < 24; checked++) {
     const value = pending.shift();
     if (!value || typeof value !== "object" || seen.has(value)) continue;
     if (value instanceof ProviderNetworkError) return value;
     seen.add(value);
     const item = value as { code?: unknown; cause?: unknown; errors?: unknown; message?: unknown };
+    if (!transportCode && typeof item.code === "string" && TRANSPORT_CODES.has(item.code)) transportCode = item.code;
     const code = typeof item.code === "string" && TLS_CODES.has(item.code) ? item.code
       : typeof item.message === "string" ? [...TLS_CODES].find(c => item.message!.toString().includes(c)) : undefined;
     if (code) return new ProviderNetworkError("PROVIDER_TLS",
@@ -34,7 +40,8 @@ export function providerNetworkError(error: unknown): ProviderNetworkError | und
     pending.push(item.cause);
     if (Array.isArray(item.errors)) pending.push(...item.errors.slice(0, 8));
   }
-  return undefined;
+  return transportCode ? new ProviderNetworkError("PROVIDER_TRANSPORT",
+    `Transport connection failed${phase === "before-response-headers" ? " before HTTP response headers" : ""} (${transportCode}); check the provider route before retrying.`, transportCode) : undefined;
 }
 
 let initialized = false;
@@ -100,7 +107,7 @@ export function ensureProviderNetwork(): void {
         return await underlyingFetch(input, request);
       }
       catch (error) {
-        const failure = scope && providerNetworkError(error);
+        const failure = scope && providerNetworkError(error, "before-response-headers");
         if (scope && failure) { scope.failure = failure; throw failure; }
         throw error;
       }

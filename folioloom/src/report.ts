@@ -12,6 +12,7 @@ import {
 import { blockId as losslessBlockId } from "./source/block-builder.js";
 import { scalarLength } from "./source/types.js";
 import { stripEpubStructuralMarkers } from "./source/epub-structure.js";
+import { validateSourceScope, type SourceScopeCertificate } from "./source/source-scope.js";
 import type { BookStore } from "./storage/book-store.js";
 import type { LosslessBookStore } from "./storage/lossless-book-store.js";
 import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
@@ -167,6 +168,7 @@ function friendlyBookArtifactFileNames(
 }
 
 export interface LosslessBookAuditReport {
+  sourceScope?: SourceScopeCertificate;
   lexicalPreferences?: LexicalPreferenceCheck[];
   supervision?: SupervisionSummary;
   schema: "v5-book-store-audit-1";
@@ -233,6 +235,10 @@ export function auditLosslessBookStore(
     left.globalIndex - right.globalIndex || left.blockId.localeCompare(right.blockId)
   ));
   const blockById = new Map(blocks.map((block) => [block.blockId, block]));
+  if (state.sourceScope !== undefined) {
+    try { validateSourceScope(state.sourceScope, state.canonicalSha256, blocks.map(b => b.sourceText).join("")); }
+    catch { incidents.push("SOURCE_SCOPE_INVALID"); }
+  }
   let cursor = 0;
   const canonical = createHash("sha256");
   for (let index = 0; index < blocks.length; index += 1) {
@@ -634,6 +640,7 @@ export function auditLosslessBookStore(
     profile: getSourceLanguageProfile(state.sourceLanguage) });
   return {
     ...(lexicalPreferences.length ? { lexicalPreferences } : {}),
+    ...(state.sourceScope === undefined ? {} : { sourceScope: state.sourceScope }),
     ...(supervision === undefined ? {} : { supervision }),
     schema: "v5-book-store-audit-1",
     runId: state.runId,
@@ -984,8 +991,13 @@ export function auditLosslessBookExport(
     ...baseAudit.incidentCodes,
     ...ledgerIncidents,
   ])].sort();
+  const direct = store.directRecords(runId);
+  const revisioned = ["direct-translation-4", "direct-translation-5"].includes((store.listTranslationRuns().find(r => r.runId === runId)?.metadata as any)?.workflow?.version);
+  const unpublishedNaming = revisioned && direct.some(r => r.kind === "name_wave" && !direct.some(c => c.kind === "name_revision_commit"
+    && direct.some(p => p.kind === "name_revision_plan" && p.payload.waveKey === r.key && c.payload.planKey === p.key)));
+  if (unpublishedNaming) incidentCodes.push("DIRECT_NAMING_WAVE_PENDING");
   const strictExportable = baseAudit.strictExportable
-    && ledgerIncidents.length === 0;
+    && ledgerIncidents.length === 0 && !unpublishedNaming;
   return {
     audit: {
       ...baseAudit,
@@ -993,7 +1005,7 @@ export function auditLosslessBookExport(
       strictExportable,
       // Unknown historical consumption is retained, never estimated or cleared.
       // Accounting corruption/open attempts still prevent a verified export.
-      deliveryReady: baseAudit.deliveryReady && ledgerIncidents.every(code => code === "TOKEN_USAGE_INCOMPLETE"),
+      deliveryReady: baseAudit.deliveryReady && !unpublishedNaming && ledgerIncidents.every(code => code === "TOKEN_USAGE_INCOMPLETE"),
       incidentCodes,
     },
     scheduler,

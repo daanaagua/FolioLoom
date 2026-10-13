@@ -20,6 +20,7 @@ import type {
   ScalarSource,
 } from "./types.js";
 import { UnicodeScalarMap } from "./types.js";
+import { certifySourceScope, SourceScopeError, type SourceScopeCertificate, type SourceScopeEvidence } from "./source-scope.js";
 
 const SCHEMA_VERSION = "v5-source-ledger-1";
 const COORDINATE_UNIT = "unicode_scalar";
@@ -134,6 +135,7 @@ function sourceVersionFor(
   excludedRawRanges: readonly ExcludedRawRange[],
   languageProfile?: SourceLanguageProfile,
   encodingDecision?: SourceEncodingDecision,
+  scopeHash?: string,
 ): string {
   const identity: unknown[] = [
     ["schema_version", stringField(manifest, "schema_version")],
@@ -177,6 +179,7 @@ function sourceVersionFor(
       ["policy_version", encodingDecision.policyVersion],
     ]]);
   }
+  if (scopeHash !== undefined) identity.push(["source_scope_sha256", scopeHash]);
   return sha256(JSON.stringify(identity));
 }
 
@@ -447,6 +450,7 @@ function validateExcludedRanges(
 }
 
 export class SourceLedger implements ScalarSource {
+  readonly scope?: SourceScopeCertificate;
   readonly manifestPath: string;
   readonly rawPath: string;
   readonly canonicalPath: string;
@@ -477,6 +481,7 @@ export class SourceLedger implements ScalarSource {
     canonicalSegments: CanonicalSegment[];
     excludedRawRanges: ExcludedRawRange[];
     coordinates: UnicodeScalarMap;
+    scope?: SourceScopeCertificate;
   }) {
     this.manifestPath = options.manifestPath;
     this.rawPath = options.rawPath;
@@ -493,10 +498,17 @@ export class SourceLedger implements ScalarSource {
     this.excludedRawRanges = options.excludedRawRanges;
     this.coordinates = options.coordinates;
     this.canonicalChars = options.coordinates.length;
+    this.scope = options.scope;
   }
 
   static open(manifestPath: string): SourceLedger {
+    return this.openWithAncestry(manifestPath, new Set());
+  }
+
+  private static openWithAncestry(manifestPath: string, ancestors: Set<string>): SourceLedger {
     const resolvedManifestPath = realpathSync(resolve(manifestPath));
+    if (ancestors.has(resolvedManifestPath) || ancestors.size >= 8) throw new SourceScopeError("SOURCE_SCOPE_INVALID: cyclic original reference");
+    const ancestry = new Set([...ancestors, resolvedManifestPath]);
     let manifest: Record<string, unknown>;
     try {
       manifest = record(
@@ -580,13 +592,34 @@ export class SourceLedger implements ScalarSource {
     const language = languageForManifest(manifest);
     const encoding = stringField(manifest, "encoding");
     const encodingDecision = encodingDecisionForManifest(manifest, encoding);
-    const sourceVersion = sourceVersionFor(
+    const baseSourceVersion = sourceVersionFor(
       manifest,
       canonicalSegments,
       excludedRawRanges,
       language.compatibilityMode ? undefined : language.profile,
       encodingDecision.decision,
     );
+    let scope: SourceScopeCertificate | undefined, scopeHash: string | undefined;
+    if (manifest.source_scope !== undefined) {
+      const reference = record(manifest.source_scope, "source_scope");
+      const bytes = readFileSync(manifestMemberPath(directory, stringField(reference, "path")));
+      scopeHash = sha256(bytes);
+      if (scopeHash !== reference.sha256) throw new SourceScopeError("SOURCE_SCOPE_INVALID: scope evidence hash mismatch");
+      const evidence = JSON.parse(bytes.toString("utf8")) as SourceScopeEvidence;
+      const original = evidence.originManifest === undefined
+        ? { sourceVersion: baseSourceVersion, sourceText, rawSha256: rawHash, canonicalSegments }
+        : this.openWithAncestry(manifestMemberPath(directory, evidence.originManifest), ancestry);
+      if ((evidence.basis === "provided-input") !== (evidence.originManifest === undefined)
+        || ("scope" in original && original.scope?.basis === "original-reference"))
+        throw new SourceScopeError("SOURCE_SCOPE_INVALID: reference must identify an original input");
+      const { originManifest: _origin, ...certificate } = evidence;
+      const expected = certifySourceScope(original, { schema: "folioloom-source-scope-plan-1",
+        originalSourceVersion: evidence.original?.sourceVersion, parts: evidence.parts }, sourceText, evidence.basis);
+      if (JSON.stringify(certificate) !== JSON.stringify(expected)) throw new SourceScopeError("SOURCE_SCOPE_INVALID: scope evidence mismatch");
+      scope = expected;
+    }
+    const sourceVersion = scopeHash === undefined ? baseSourceVersion : sourceVersionFor(manifest, canonicalSegments,
+      excludedRawRanges, language.compatibilityMode ? undefined : language.profile, encodingDecision.decision, scopeHash);
 
     return new SourceLedger({
       manifestPath: resolvedManifestPath,
@@ -602,6 +635,7 @@ export class SourceLedger implements ScalarSource {
       canonicalSegments,
       excludedRawRanges,
       coordinates,
+      ...(scope === undefined ? {} : { scope }),
     });
   }
 

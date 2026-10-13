@@ -34,6 +34,9 @@ config/config.yaml
 !config/config.example.yaml
 
 # Logs
+.env
+.env.*
+!.env.example
 *.log
 logs/
 data/cache/

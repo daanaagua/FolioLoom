@@ -19,10 +19,14 @@ import type { LedgerEvent } from "./token-ledger.js";
 import { emptyRevalidationDrainReport } from "./revalidation-executor.js";
 import { DirectNameWave } from "./direct-name-wave.js";
 import { preflightProviderStream } from "../providers/preflight.js";
-import { directAttemptLimit } from "./direct-recovery.js";
+import { directAttemptLimit, directBaseAttemptLimit, directTokenBudget } from "./direct-recovery.js";
+import { DIRECT_COMPACT_VERSION, DIRECT_COMPACT_SYSTEM_PROMPT, buildCompactPrompt, parseCompactTranslation,
+  planDirectFragments, directGenerationUsage, normalizeNamingReferences } from "./direct-compact.js";
+import { DIRECT_REVISION_SYSTEM_PROMPT, parseRevisionTranslation, planNameRevisionWave, versionedName,
+  type RevisionTranslation, type RevisionWindow, type NameRevisionPlan } from "./direct-name-revisions.js";
 import { DIRECT_TRANSLATION_VERSION, DIRECT_SYSTEM_PROMPT, DirectOutputError, buildDirectPrompt, directHash,
   DIRECT_MEMORY_VERSION, DIRECT_MEMORY_SYSTEM_PROMPT, DirectNamingConflict, assertDirectNamesCompatible, relevantDirectNames,
-  DIRECT_TYPED_VERSION, DIRECT_TYPED_SYSTEM_PROMPT, directNameKey, equivalentDirectRendering,
+  DIRECT_TYPED_VERSION, DIRECT_TYPED_SYSTEM_PROMPT, DIRECT_REVISION_VERSION, directNameKey, equivalentDirectRendering, mergeDirectNames,
   directParagraphs, directNameCandidates, parseDirectResponse,
   type DirectName, type DirectParagraph, type DirectRecord, type DirectTranslation } from "./direct-translation.js";
 
@@ -45,29 +49,35 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
   if (options.supervisorMode === "bounded" || options.chapterReviewMode === "bounded" || options.planningMode === "source")
     throw new Error("direct workflow cannot enable model supervision or chapter review");
   const maxConcurrency = positive(options.maxConcurrency ?? 2, "maxConcurrency");
-  const maxAttempts = positive(options.maxAttempts ?? 4, "maxAttempts");
-  if (maxAttempts > 8) throw new Error("direct maxAttempts cannot exceed 8");
+  if (options.directProtocolVersion !== undefined && ![DIRECT_REVISION_VERSION, DIRECT_COMPACT_VERSION].includes(options.directProtocolVersion))
+    throw new Error("unsupported direct protocol selection");
+  let maxAttempts = directBaseAttemptLimit([], options.maxAttempts);
   const limit = options.maxWindows ?? Number.MAX_SAFE_INTEGER;
   if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("maxWindows must be a nonnegative safe integer");
   const runId = options.runMeta.runId;
   if (!runId?.trim()) throw new Error("runMeta.runId is required");
-  await preflightProviderStream(runtime.streamFn, options.signal, true);
   const context = BookContext.openLossless({ manifestPath: options.manifestPath, legacyV4DbPath: options.legacyV4DbPath });
   mkdirSync(dirname(resolve(options.storePath)), { recursive: true });
   let lease: ReturnType<typeof RunLease.acquire> | undefined;
   let store: LosslessBookStore | undefined;
   try {
+    await preflightProviderStream(runtime.streamFn, options.signal, true);
     lease = RunLease.acquire(`${resolve(options.storePath)}.run.lock`, `lossless:${runId}`);
     store = new LosslessBookStore(options.storePath);
     const db = store;
     const existing = db.listTranslationRuns().find(r => r.runId === runId);
     const recordedVersion = (existing?.metadata as any)?.workflow?.version;
-    const typed = !existing || recordedVersion === DIRECT_TYPED_VERSION;
+    const compact = existing ? recordedVersion === DIRECT_COMPACT_VERSION : options.directProtocolVersion !== DIRECT_REVISION_VERSION;
+    if (existing && options.directProtocolVersion && options.directProtocolVersion !== recordedVersion) throw new Error("direct protocol version mismatch");
+    const revisioned = compact || !existing || recordedVersion === DIRECT_REVISION_VERSION;
+    const typed = revisioned || recordedVersion === DIRECT_TYPED_VERSION;
     const learning = typed || recordedVersion === DIRECT_MEMORY_VERSION;
-    if (existing && ![DIRECT_TRANSLATION_VERSION, DIRECT_MEMORY_VERSION, DIRECT_TYPED_VERSION].includes(recordedVersion))
+    if (existing && ![DIRECT_TRANSLATION_VERSION, DIRECT_MEMORY_VERSION, DIRECT_TYPED_VERSION, DIRECT_REVISION_VERSION, DIRECT_COMPACT_VERSION].includes(recordedVersion))
       throw new Error("unsupported direct workflow version");
-    const version = typed ? DIRECT_TYPED_VERSION : learning ? DIRECT_MEMORY_VERSION : DIRECT_TRANSLATION_VERSION;
-    const systemPrompt = typed ? DIRECT_TYPED_SYSTEM_PROMPT : learning ? DIRECT_MEMORY_SYSTEM_PROMPT : DIRECT_SYSTEM_PROMPT;
+    const version = compact ? DIRECT_COMPACT_VERSION : revisioned ? DIRECT_REVISION_VERSION : typed ? DIRECT_TYPED_VERSION : learning ? DIRECT_MEMORY_VERSION : DIRECT_TRANSLATION_VERSION;
+    const systemPrompt = compact ? DIRECT_COMPACT_SYSTEM_PROMPT : revisioned ? DIRECT_REVISION_SYSTEM_PROMPT : typed ? DIRECT_TYPED_SYSTEM_PROMPT : learning ? DIRECT_MEMORY_SYSTEM_PROMPT : DIRECT_SYSTEM_PROMPT;
+    const references = normalizeNamingReferences(options.namingReferences ?? []);
+    if (!compact && references.length) throw new Error("naming references require direct protocol five");
     const blocks = context.losslessBlocks;
     const maxSourceTokens = options.windowOptions?.maxSourceTokens ?? 4_800;
     const windows = planBookWindows(blocks, { ...options.windowOptions,
@@ -75,13 +85,15 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
       maxSourceTokens, maxBlocks: options.windowOptions?.maxBlocks ?? 6, protocolVersion: options.runMeta.protocolVersion });
     const candidates = directNameCandidates(blocks, context.languageProfile);
     const userNames: DirectName[] = [...context.stableTerms, ...(options.glossary?.stableTerms ?? [])]
-      .map(t => ({ source: t.sourceForm, target: t.target, ...(t.applicableBlockIds ? { applicableBlockIds: t.applicableBlockIds } : {}) }));
+      .map(t => ({ source: t.sourceForm, target: t.target, ...(t.applicableBlockIds ? { applicableBlockIds: t.applicableBlockIds } : {}) }))
+      .map(n => revisioned ? versionedName({ ...n, policy: "locked", authority: "user" }) : n);
     const modelId = options.runMeta.modelId ?? runtime.model.id;
     if (modelId !== runtime.model.id) throw new Error("direct run model mismatch");
     if (options.glossary?.sourceVersion && options.glossary.sourceVersion !== context.sourceLedger.sourceVersion)
       throw new Error("glossary source version mismatch");
     const identity = { version, promptHash: directHash(systemPrompt), source: context.sourceLedger.sourceVersion,
       plan: windows, candidates, names: userNames, style: options.styleState ?? null,
+      ...(compact ? { namingReferences: references, outputPlanning: "paragraph-cost-1", recovery: "failure-credit-1" } : {}),
       model: { id: modelId, provider: runtime.model.provider, api: runtime.model.api, baseUrl: runtime.model.baseUrl,
         contextWindow: runtime.model.contextWindow, maxTokens: runtime.model.maxTokens,
         effort: runtime.effort ?? null, thinkingLevel: runtime.thinkingLevel ?? "high" },
@@ -106,6 +118,7 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
     db.setDeliveryMode(runId, options.deliveryMode ?? db.deliveryMode(runId) ?? "strict");
     const snapshot = db.latestKnowledgeSnapshot(runId);
     const records = db.directRecords(runId);
+    maxAttempts = directBaseAttemptLimit(records, options.maxAttempts);
     const append = (record: DirectRecord) => { db.appendDirectRecord(runId, record); records.push(record); };
     const ledger = db.loadTokenLedger(runId, { mode: options.schedulerMode ?? "off", profile: options.optimizationProfile ?? "balanced",
       tokenIncreaseCap: 0.1, enforceDispatchLifecycle: true });
@@ -157,17 +170,25 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
       return () => { inFlightTokens -= tokens; inFlightRequests--; for (const wake of [...capacityWaiters]) wake(); };
     };
 
-    const execute = async (windowId: string, paragraphs: DirectParagraph[], seed: boolean, depth = 0, sharedNames = names, repair = false): Promise<DirectTranslation> => {
+    const execute = async (windowId: string, paragraphs: DirectParagraph[], seed: boolean, depth = 0, sharedNames = names, repair = false): Promise<DirectTranslation & Partial<Omit<RevisionTranslation, keyof DirectTranslation>>> => {
       options.signal?.throwIfAborted();
+      if (compact) sharedNames = relevantDirectNames(sharedNames, paragraphs);
       const first = allParagraphs.findIndex(p => p.id === paragraphs[0]?.id);
       const last = allParagraphs.findIndex(p => p.id === paragraphs.at(-1)?.id);
       const neighbors = [allParagraphs[first - 1]?.source.slice(-600), allParagraphs[last + 1]?.source.slice(0, 600)].filter((s): s is string => !!s);
-      const prompt = buildDirectPrompt({ paragraphs, candidates, names: sharedNames, neighbors, seed, style: options.styleState, typed });
+      const prompt = compact ? buildCompactPrompt(paragraphs, sharedNames, neighbors, options.styleState, references)
+        : buildDirectPrompt({ paragraphs, candidates, names: sharedNames, neighbors, seed, style: options.styleState, typed, revisioned });
       const key = directHash(typed ? [identityHash, windowId, paragraphs.map(p => p.id), sharedNames, seed, repair] : [identityHash, windowId, paragraphs.map(p => p.id), sharedNames, seed]);
       const parse = (text: string) => {
+        if (compact) return parseCompactTranslation(text, paragraphs, sharedNames);
+        if (revisioned) return parseRevisionTranslation(text, paragraphs, sharedNames);
         const result = parseDirectResponse(text, paragraphs, seed ? candidates : [], typed ? "typed" : learning);
         if (learning && (!typed || repair)) assertDirectNamesCompatible(result.names, sharedNames);
         return result;
+      };
+      const accepted = (requestId: string) => {
+        if (!compact || records.some(r => r.id === `${requestId}:accepted`)) return;
+        append({ id: `${requestId}:accepted`, kind: "fragment_result", windowId, key, at: Date.now(), payload: { requestId, accepted: true } });
       };
       // Every completed response can be replayed after a crash, even before window promotion.
       // Version two can acquire more names while an earlier window is paused. Its
@@ -189,26 +210,54 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
             if (!records.some(r => r.id === id)) append({ id, kind: "replay", windowId, key, at: Date.now(),
               payload: { requestId: response.payload.requestId, responseId: response.id, originalKey: response.key } });
           }
+          accepted(String(response.payload.requestId));
           return result;
         }
         catch (error) { if (!(error instanceof DirectOutputError) && !(error instanceof DirectNamingConflict)) throw error; }
       }
-      if (records.some(r => r.kind === "split" && r.key === key)) return split();
       const predictedTokens = Math.ceil((prompt.length + systemPrompt.length) * 1.5) + runtime.model.maxTokens;
+      let generationBudget = records.find(r => r.kind === "generation_budget" && r.windowId === windowId);
+      if (compact && !generationBudget) {
+        generationBudget = { id: `generation-budget:${windowId}`, kind: "generation_budget", windowId, key: identityHash, at: Date.now(),
+          payload: { tokenLimit: predictedTokens * maxAttempts, failureLimit: maxAttempts, maxCalls: Math.min(256, paragraphs.length * 2 + maxAttempts) } };
+        append(generationBudget);
+      }
+      if (records.some(r => r.kind === "split" && r.key === key)) return split();
+      if (compact) {
+        const planned = planDirectFragments(paragraphs, [...sharedNames, ...relevantDirectNames(references, paragraphs)], runtime.model.maxTokens);
+        if (planned.length > 1) {
+          if (!records.some(r => r.id === `fragment-plan:${key}`)) append({ id: `fragment-plan:${key}`, kind: "fragment_plan", windowId, key, at: Date.now(),
+            payload: { paragraphIds: paragraphs.map(p => p.id), fragments: planned.map(p => p.map(q => q.id)) } });
+          return split(planned[0]!.length, true);
+        }
+      }
       if (predictedTokens > runtime.model.contextWindow) {
         if (paragraphs.length > 1 && depth < 12) return split();
         throw new Error("DIRECT_INPUT_CAPACITY: source paragraph exceeds model capacity");
       }
       const baselineKey = `direct-window:${windowId}`;
-      admission.addBaseline({ taskIds: [baselineKey], baselineTokens: predictedTokens * maxAttempts, source: "translate_horizon", reason: "direct bounded generation" });
+      const effectiveBudget = compact ? directTokenBudget(records, windowId, identityHash)! : undefined;
+      admission.addBaseline({ taskIds: [baselineKey], baselineTokens: compact ? effectiveBudget!.tokenLimit : predictedTokens * maxAttempts, source: "translate_horizon", reason: "direct bounded generation" });
       let attempt = records.filter(r => r.kind === "request" && r.key === key).length;
       const attemptLimit = directAttemptLimit(records, windowId, maxAttempts, identityHash);
+      const assertAllowance = () => {
+        if (!compact) {
+          if (records.filter(r => r.kind === "request" && r.windowId === windowId).length >= attemptLimit) throw new DirectRecoveryPausedError(windowId);
+          return;
+        }
+        const usage = directGenerationUsage(records, windowId);
+        if (usage.failures >= attemptLimit) throw new DirectRecoveryPausedError(`${windowId} (failure allowance)`);
+        if (usage.requests >= Number(generationBudget!.payload.maxCalls)) throw new DirectRecoveryPausedError(`${windowId} (total call guard)`);
+        if (usage.chargedTokens + predictedTokens > effectiveBudget!.tokenLimit)
+          throw new Error(`DIRECT_TOKEN_BUDGET_EXHAUSTED: ${windowId}; durable budget is not renewed on resume`);
+      };
       while (ledger.state().terminalRequestIds.has(`direct:${key}:${attempt}`)) attempt++;
-      if (attempt >= attemptLimit || records.filter(r => r.kind === "request" && r.windowId === windowId).length >= attemptLimit)
+      if (attempt >= attemptLimit)
         throw new DirectRecoveryPausedError(windowId);
+      assertAllowance();
       for (; attempt < attemptLimit; attempt++) {
         options.signal?.throwIfAborted();
-        if (records.filter(r => r.kind === "request" && r.windowId === windowId).length >= attemptLimit) throw new DirectRecoveryPausedError(windowId);
+        assertAllowance();
         const waiting = records.findLast(r => r.kind === "retry" && r.key === key);
         const waitMs = Math.max(0, Number(waiting?.payload.nextAttemptAt ?? 0) - Date.now());
         if (waitMs) await delay(waitMs, undefined, { signal: options.signal });
@@ -219,7 +268,8 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
         let failure: unknown;
         try {
           const transaction = admission.begin({ requestId, taskIds: [baselineKey], purpose: "translate", predictedTokens, attempt, conservativeHorizonFloor: 0 });
-          append({ id: requestId, kind: "request", windowId, key, at: Date.now(), payload: { paragraphIds: paragraphs.map(p => p.id), seed } });
+          append({ id: requestId, kind: "request", windowId, key, at: Date.now(), payload: { paragraphIds: paragraphs.map(p => p.id), seed,
+            ...(compact ? { predictedTokens } : {}) } });
           transaction.markDispatched();
           try {
             result = await new PiRuntime().run({ systemPrompt, prompt, phase: "translation", model: runtime.model,
@@ -245,7 +295,7 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
           if (result?.deadlineExceeded) failure = new ModelProviderError("direct request timeout", "timeout", true, result);
           else if (result?.stopReason !== "stop") failure = new DirectOutputError(`incomplete generation: ${result?.stopReason}`);
           else {
-            try { return parse(String(responseFor(requestId)?.payload.text ?? "")); }
+            try { const parsed = parse(String(responseFor(requestId)?.payload.text ?? "")); accepted(requestId); return parsed; }
             catch (error) { failure = error; }
           }
         }
@@ -259,17 +309,20 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
       }
       throw new DirectRecoveryPausedError(windowId);
 
-      async function split(): Promise<DirectTranslation> {
-        if (!records.some(r => r.kind === "split" && r.key === key)) append({
+      async function split(plannedCut?: number, preplanned = false): Promise<DirectTranslation & Partial<Omit<RevisionTranslation, keyof DirectTranslation>>> {
+        if (!preplanned && !records.some(r => r.kind === "split" && r.key === key)) append({
           id: `split:${key}`, kind: "split", windowId, key, at: Date.now(), payload: { paragraphIds: paragraphs.map(p => p.id) },
         });
-        const cut = Math.ceil(paragraphs.length / 2);
-        const left = await execute(windowId, paragraphs.slice(0, cut), seed, depth + 1, sharedNames, repair);
+        const cut = plannedCut ?? Math.ceil(paragraphs.length / 2);
+        const nextDepth = depth + (preplanned ? 0 : 1);
+        const left = await execute(windowId, paragraphs.slice(0, cut), seed, nextDepth, sharedNames, repair);
         const inherited = learning ? [...sharedNames, ...left.names.filter(n => !sharedNames.some(s => directNameKey(s) === directNameKey(n)))] : seed ? left.names : sharedNames;
-        const right = await execute(windowId, paragraphs.slice(cut), false, depth + 1, inherited, repair);
+        const right = await execute(windowId, paragraphs.slice(cut), false, nextDepth, inherited, repair);
         const joined = [...left.paragraphs, ...right.paragraphs];
         const merged = parseDirectResponse(JSON.stringify({ paragraphs: joined }), paragraphs, []);
-        return { ...merged, names: learning ? [...left.names, ...right.names.filter(n => !left.names.some(s => directNameKey(s) === directNameKey(n)))] : left.names };
+        return { ...merged, names: learning ? [...left.names, ...right.names.filter(n => !left.names.some(s => directNameKey(s) === directNameKey(n)))] : left.names,
+          ...(revisioned ? { nameUses: [...left.nameUses!, ...right.nameUses!], nameChanges: [...left.nameChanges!, ...right.nameChanges!],
+            namingIssues: [...left.namingIssues!, ...right.namingIssues!] } : {}) } as DirectTranslation & Partial<Omit<RevisionTranslation, keyof DirectTranslation>>;
       }
     };
 
@@ -321,6 +374,13 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
             sharedNames = latest; saveContext(sharedNames);
             continue;
           }
+          if (typed && wavePlan) {
+            // Repairs return only changed entries. Retain accepted local proposals
+            // only when their original evidence still matches the final translation.
+            const local = wavePlan.filter(n => paragraphs.some(p => p.id === n.evidence?.paragraphId));
+            const retained = parseDirectResponse(JSON.stringify({ paragraphs: result.paragraphs, names: local }), paragraphs, [], "typed").names;
+            result.names = mergeDirectNames(result.names, retained);
+          }
         }
         if (!saved) append({ id: `checkpoint:${checkpointKey}`, kind: "checkpoint", windowId: window.windowId, key: checkpointKey,
           at: Date.now(), payload: { paragraphs: result.paragraphs, names: result.names } });
@@ -346,7 +406,83 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
           windowId: window.windowId, key, at: Date.now(), payload: { names: contextNames, ...(typed ? { repair } : {}) } });
       }
     };
+    const runRevisionWave = async (members: typeof windows, seed = false, saved?: DirectRecord) => {
+      const key = saved?.key ?? directHash([identityHash, "name_wave", members.map(w => w.windowId)]);
+      if (records.some(r => r.kind === "name_revision_commit" && r.payload.planKey === directHash([key, "revision-plan"]))) return;
+      const catalog = [...userNames, ...db.directNames(runId).filter(n => !userNames.some(u => u.nameId === n.nameId))].map(versionedName);
+      const wave = saved ?? { id: `name_wave:${key}`, kind: "name_wave" as const, windowId: members[0]!.windowId, key, at: Date.now(),
+        payload: { windowIds: members.map(w => w.windowId), names: catalog } };
+      if (!saved) append(wave);
+      const fullMembers = (wave.payload.windowIds as string[]).map(id => windows.find(w => w.windowId === id)!);
+      const baseNames = (wave.payload.names as DirectName[]).map(versionedName);
+      const planKey = directHash([key, "revision-plan"]);
+      let planRecord = records.find(r => r.kind === "name_revision_plan" && r.key === planKey);
+      waves.push({ wave: waves.length, concurrency: maxConcurrency, windowIds: fullMembers.map(w => w.windowId) });
+      if (!planRecord) {
+        const results = await Promise.allSettled(fullMembers.map(async window => {
+          const prior = records.find(r => r.kind === "name_revision_draft" && r.payload.waveKey === key && r.windowId === window.windowId);
+          if (prior) return { windowId: window.windowId, source: prior.payload.source, result: prior.payload.result } as RevisionWindow;
+          const paragraphs = directParagraphs(window.blockIds.map(id => byBlock.get(id)!));
+          db.bindWindowsToSnapshot(runId, [window.windowId], snapshot.id); db.claimWindow(runId, window.windowId);
+          const sharedNames = relevantDirectNames(baseNames, paragraphs);
+          const contextKey = directHash([key, window.windowId, "name_context"]);
+          if (!records.some(r => r.id === `name_context:${contextKey}`)) append({ id: `name_context:${contextKey}`, kind: "name_context",
+            windowId: window.windowId, key: contextKey, at: Date.now(), payload: { names: sharedNames } });
+          const result = await execute(window.windowId, paragraphs, seed, 0, sharedNames) as RevisionTranslation;
+          const draftKey = directHash([key, window.windowId, "revision-draft"]);
+          append({ id: `name-revision-draft:${draftKey}`, kind: "name_revision_draft", windowId: window.windowId, key: draftKey, at: Date.now(),
+            payload: { waveKey: key, source: paragraphs, result } });
+          return { windowId: window.windowId, source: paragraphs, result };
+        }));
+        const failure = results.find(r => r.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+        const history = new Map<string, RevisionWindow>();
+        for (const record of records.filter(r => r.kind === "name_revision_commit"))
+          for (const window of record.payload.windows as RevisionWindow[]) history.set(window.windowId, window);
+        const plan = planNameRevisionWave(baseNames, results.map(r => (r as PromiseFulfilledResult<RevisionWindow>).value), [...history.values()]);
+        plan.history = plan.history.filter(w => plan.patches.some(p => p.windowId === w.windowId));
+        const active = db.activeTranslations(runId);
+        const historicalPatches = plan.history.flatMap(w => w.result.translations.map(t => ({ ...t, windowId: w.windowId }))).flatMap(t => {
+          const current = active.find(a => a.blockId === t.blockId)!;
+          const before = history.get(t.windowId)!.result.translations.find(old => old.blockId === t.blockId)!.text;
+          if (current.text !== before) throw new Error("historical naming receipt no longer matches active text");
+          return current.text === t.text ? [] : [{ blockId: t.blockId, expectedVersion: current.version, before, after: t.text }];
+        });
+        planRecord = { id: `name-revision-plan:${planKey}`, kind: "name_revision_plan", windowId: wave.windowId, key: planKey, at: Date.now(),
+          payload: { waveKey: key, baseCatalogHash: directHash(db.directNames(runId)), plan, historicalPatches } };
+        append(planRecord);
+      }
+      const plan = planRecord.payload.plan as NameRevisionPlan;
+      const unfinished = plan.windows.filter(item => db.allWindows(runId).find(w => w.windowId === item.windowId)!.status !== "completed").length;
+      for (const item of plan.windows) {
+        const status = db.allWindows(runId).find(w => w.windowId === item.windowId)!.status;
+        if (status === "completed") continue;
+        if (status !== "staged") {
+          if (status === "pending") { db.bindWindowsToSnapshot(runId, [item.windowId], snapshot.id); db.claimWindow(runId, item.windowId); }
+          db.stageWindow({ runId, windowId: item.windowId, snapshotId: snapshot.id, status: "completed",
+            translations: item.result.translations.map(t => ({ ...t, sourceHash: byBlock.get(t.blockId)!.sourceHash })), knowledgeCandidates: [], styleTail: "", warnings: [],
+            budget: { modelCalls: records.filter(r => r.kind === "request" && r.windowId === item.windowId).length }, conceptBindings: { usages: [], concepts: [] } });
+        }
+        promoteReady();
+      }
+      const patches = planRecord.payload.historicalPatches as Array<{ blockId: string; expectedVersion: number; before: string; after: string }>;
+      const commit = db.commitDirectNameRevisionPlan(runId, planKey, patches);
+      if (!records.some(r => r.id === commit.id)) records.push(commit);
+      completedThisInvocation += unfinished;
+      seedFinished = true;
+    };
     try {
+      if (revisioned) {
+        for (const wave of records.filter(r => r.kind === "name_wave")) {
+          const planKey = directHash([wave.key, "revision-plan"]);
+          if (records.some(r => r.kind === "name_revision_commit" && r.payload.planKey === planKey)) continue;
+          const members = windows.filter(w => (wave.payload.windowIds as string[]).includes(w.windowId));
+          const needed = db.allWindows(runId).filter(w => w.status !== "completed" && members.some(m => m.windowId === w.windowId));
+          if (needed.length > limit - completedThisInvocation) throw new Error("DIRECT_WAVE_LIMIT: maxWindows must include the remaining saved naming wave");
+          if (options.shouldPause?.()) break;
+          await runRevisionWave(members, members[0]!.ordinal === 0 && !userNames.length, wave);
+        }
+      }
       const pending = db.pendingWindows(runId).slice(0, limit);
       const runWave = async (members: typeof windows, seed = false, saved?: DirectRecord) => {
         const key = saved?.key ?? directHash([identityHash, "name_wave", members.map(w => w.windowId)]);
@@ -361,12 +497,19 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
         }));
         if (stop) throw stop;
       };
-      if (pending.length && !seedFinished && !options.shouldPause?.()) {
+      if (revisioned) {
+        pending.splice(Math.max(0, limit - completedThisInvocation));
+        if (pending[0]?.ordinal === 0 && !userNames.length && !options.shouldPause?.()) await runRevisionWave([pending.shift()!], true);
+        while (pending.length && !options.shouldPause?.() && !options.signal?.aborted) {
+          const members = pending.splice(0, maxConcurrency);
+          await runRevisionWave(members);
+        }
+      } else if (pending.length && !seedFinished && !options.shouldPause?.()) {
         const first = pending.shift()!;
         if (typed) await runWave([first], true, records.find(r => r.kind === "name_wave" && (r.payload.windowIds as string[]).includes(first.windowId)));
         else await translateWindow(first, true);
       }
-      if (typed) {
+      if (typed && !revisioned) {
         while (pending.length && !options.shouldPause?.() && !options.signal?.aborted) {
           const saved = records.find(r => r.kind === "name_wave" && (r.payload.windowIds as string[]).includes(pending[0]!.windowId));
           const needed = saved ? db.pendingWindows(runId).filter(w => (saved.payload.windowIds as string[]).includes(w.windowId)) : [];
@@ -375,7 +518,7 @@ export async function runDirectBook(options: LosslessBookRunOptions): Promise<Lo
           await runWave(members, false, saved);
           pending.splice(0, members.length);
         }
-      } else {
+      } else if (!revisioned) {
       let next = 0;
       if (pending.length) waves.push({ wave: 0, concurrency: maxConcurrency, windowIds: pending.map(w => w.windowId) });
       const worker = async () => {

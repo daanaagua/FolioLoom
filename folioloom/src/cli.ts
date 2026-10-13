@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { loadNamingReferences } from "./fullbook/direct-compact.js";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -79,10 +80,14 @@ import {
 import { buildLosslessBlocks } from "./source/block-builder.js";
 import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
 import { importSource } from "./source/source-importer.js";
+import { createScopePlan, type SourceScopePlan, type SourceScopeCertificate } from "./source/source-scope.js";
+import { buildOmissionReviewPlan, validateOmissionReviewPlan, type OmissionReviewPlan } from "./fullbook/omission-review.js";
+import { loadOmissionReviewInput, readOmissionReviewStatus, runOmissionReview } from "./fullbook/omission-review-runner.js";
 import { annotateStructure } from "./source/structure-annotator.js";
 import { LosslessBookStore } from "./storage/lossless-book-store.js";
 import { RuntimeProfileStore } from "./storage/runtime-profile-store.js";
-import { directRecoveryStatus, releaseDirectTransportRecovery } from "./fullbook/direct-recovery.js";
+import { directRecoveryStatus, releaseDirectTransportRecovery, extendDirectTokenBudget } from "./fullbook/direct-recovery.js";
+import { directNamingStatus } from "./fullbook/direct-name-revisions.js";
 import { validateCommitKnowledgeCommandsRequest } from "./knowledge/knowledge-commands.js";
 import { TerminologyControlService } from "./knowledge/terminology-control-service.js";
 import {
@@ -92,7 +97,9 @@ import {
 
 export type CliCommand =
   | "book-direct-recovery-status"
+  | "book-direct-naming-status"
   | "book-direct-recovery-release"
+  | "book-direct-recovery-extend-budget"
   | "book-supervisor-status"
   | "book-supervisor-release"
   | "book-quality-status"
@@ -102,6 +109,10 @@ export type CliCommand =
   | "book-preflight"
   | "book-doctor"
   | "book-audit"
+  | "book-scope"
+  | "book-review-scan"
+  | "book-review-run"
+  | "book-review-status"
   | "book-recover"
   | "book-verify-export"
   | "book-migrate-v1"
@@ -118,6 +129,14 @@ export type CliCommand =
   | "book-retrofit-rollback";
 
 export interface CliOptions {
+  reviewMaxCandidates?: number;
+  reviewSamples?: number;
+  reviewSeed?: string;
+  reviewMaxCalls?: number;
+  reviewMaxTokens?: number;
+  reviewMaxOutputTokens?: number;
+  originalManifest?: string;
+  scopePlan?: string;
   workflow?: "direct" | "supervised";
   planningMode?: "supervised" | "source";
   supervisorMode?: SupervisionMode;
@@ -153,6 +172,7 @@ export interface CliOptions {
   styleProfile?: string;
   prompt?: string;
   glossary?: string;
+  namingReference?: string;
   runMode?: TranslationRunMode;
   optimizationProfile?: OptimizationProfile;
   schedulerMode?: SchedulerMode;
@@ -172,6 +192,7 @@ export interface CliOptions {
 }
 
 export interface BookDoctorReport {
+  sourceScope?: SourceScopeCertificate;
   schema: "v5-book-doctor-1";
   sourceVersion: string;
   sourceChars: number;
@@ -251,6 +272,7 @@ export function doctorBook(
   const windows = planBookWindows(blocks, windowOptions);
   return {
     schema: "v5-book-doctor-1",
+    ...(ledger.scope === undefined ? {} : { sourceScope: ledger.scope }),
     sourceVersion: ledger.sourceVersion,
     sourceChars: audit.sourceChars,
     coveredChars: audit.coveredChars,
@@ -786,18 +808,46 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     }
     throw new Error(`unknown book retrofit action: ${String(operation)}`);
   }
+  if (action === "review") {
+    const sub = argv[2];
+    if (!["scan", "run", "status"].includes(sub ?? "")) throw new Error("book review requires scan, run or status");
+    const flags = sub === "status" ? ["--output"] : sub === "scan"
+      ? ["--store", "--run", "--output", "--max-candidates", "--samples", "--seed"]
+      : ["--store", "--run", "--input", "--output", "--config", "--opencode-auth", "--max-calls", "--max-tokens", "--max-output-tokens", "--hard-deadline-ms"];
+    const { values } = parseFlags(argv.slice(3), `book review ${sub}`, flags);
+    if (sub === "status") return { command: "book-review-status", output: pathValue(values, "--output") };
+    const common = { store: pathValue(values, "--store"), runId: identifierValue(values, "--run", true), output: pathValue(values, "--output") };
+    if (sub === "scan") {
+      const reviewSamples = values.has("--samples") ? Number(values.get("--samples")) : 3;
+      const reviewMaxCandidates = positiveFlag(values, "--max-candidates") ?? 20;
+      if (!Number.isSafeInteger(reviewSamples) || reviewSamples < 0 || reviewSamples > reviewMaxCandidates) throw new Error("invalid --samples count");
+      return { command: "book-review-scan", ...common, reviewMaxCandidates, reviewSamples, reviewSeed: identifierValue(values, "--seed") ?? "omission-review-1" };
+    }
+    const reviewMaxCalls = positiveFlag(values, "--max-calls"), reviewMaxTokens = positiveFlag(values, "--max-tokens"), reviewMaxOutputTokens = positiveFlag(values, "--max-output-tokens");
+    if (reviewMaxCalls === undefined || reviewMaxTokens === undefined || reviewMaxOutputTokens === undefined) throw new Error("review run requires explicit --max-calls, --max-tokens and --max-output-tokens budgets");
+    return { command: "book-review-run", ...common, input: pathValue(values, "--input"), config: pathValue(values, "--config"),
+      openCodeAuth: pathValue(values, "--opencode-auth", false), reviewMaxCalls, reviewMaxTokens, reviewMaxOutputTokens,
+      hardDeadlineMs: positiveFlag(values, "--hard-deadline-ms") };
+  }
+  if (action === "scope") {
+    const { values } = parseFlags(argv.slice(2), "book scope", ["--manifest", "--output"]);
+    return { command: "book-scope", manifest: pathValue(values, "--manifest"), output: pathValue(values, "--output", false) };
+  }
   if (action === "import") {
     const { values } = parseFlags(
       argv.slice(2),
       "book import",
-      ["--source", "--project", "--source-language", "--encoding"],
+      ["--source", "--project", "--source-language", "--encoding", "--original-manifest", "--scope-plan"],
     );
     const sourceEncoding = identifierValue(values, "--encoding");
+    const originalManifest = pathValue(values, "--original-manifest", false), scopePlan = pathValue(values, "--scope-plan", false);
+    if ((originalManifest === undefined) !== (scopePlan === undefined)) throw new Error("--original-manifest and --scope-plan must be supplied together");
     return {
       command: "book-import",
       source: pathValue(values, "--source"),
       project: pathValue(values, "--project"),
       sourceLanguage: identifierValue(values, "--source-language", true),
+      ...(originalManifest === undefined ? {} : { originalManifest, scopePlan }),
       ...(sourceEncoding === undefined ? {} : { sourceEncoding }),
     };
   }
@@ -816,12 +866,17 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   }
   if (action === "direct-recovery") {
     const operation = argv[2];
-    if (operation !== "status" && operation !== "release") throw new Error("book direct-recovery requires status or release");
+    if (operation !== "status" && operation !== "release" && operation !== "extend-budget") throw new Error("book direct-recovery requires status, release or extend-budget");
     const { values } = parseFlags(argv.slice(3), `book direct-recovery ${operation}`,
       operation === "status" ? ["--store", "--run", "--max-attempts"] : ["--store", "--run", "--input"]);
-    return { command: operation === "status" ? "book-direct-recovery-status" : "book-direct-recovery-release",
+    return { command: operation === "status" ? "book-direct-recovery-status" : operation === "release" ? "book-direct-recovery-release" : "book-direct-recovery-extend-budget",
       store: pathValue(values, "--store"), runId: identifierValue(values, "--run", true),
-      ...(operation === "release" ? { input: pathValue(values, "--input") } : { maxAttempts: positiveFlag(values, "--max-attempts") }) };
+      ...(operation !== "status" ? { input: pathValue(values, "--input") } : { maxAttempts: positiveFlag(values, "--max-attempts") }) };
+  }
+  if (action === "direct-naming") {
+    if (argv[2] !== "status") throw new Error("book direct-naming requires status");
+    const { values } = parseFlags(argv.slice(3), "book direct-naming status", ["--store", "--run"]);
+    return { command: "book-direct-naming-status", store: pathValue(values, "--store"), runId: identifierValue(values, "--run", true) };
   }
   if (action === "doctor") {
     const { values } = parseFlags(
@@ -951,7 +1006,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--opencode-auth", "--run", "--max-windows", "--max-concurrency",
         "--max-attempts", "--max-blocks", "--max-source-tokens",
         "--hard-deadline-ms", "--style-profile", "--prompt",
-        "--glossary", "--run-mode", "--max-in-flight-tokens",
+        "--glossary", "--naming-reference", "--run-mode", "--max-in-flight-tokens",
         "--optimization-profile", "--scheduler-mode",
         "--runtime-profile-store",
         "--worker", "--codex-model", "--codex-context-window",
@@ -984,6 +1039,10 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     const worker = rawWorker as "codex" | "external" | undefined;
     const workflow = identifierValue(values, "--workflow");
     if (workflow !== undefined && workflow !== "direct" && workflow !== "supervised") throw new Error("--workflow must be direct or supervised");
+    const namingReference = pathValue(values, "--naming-reference", false);
+    if (namingReference && (workflow === "supervised" || worker !== undefined || values.has("--planning-mode")
+      || values.get("--supervisor") === "bounded" || values.get("--chapter-review") === "bounded"))
+      throw new Error("--naming-reference requires native direct translation");
     const planningMode = identifierValue(values, "--planning-mode");
     if (planningMode !== undefined && planningMode !== "source" && planningMode !== "supervised") throw new Error("--planning-mode must be source or supervised");
     const supervisorMode = identifierValue(values, "--supervisor");
@@ -1037,6 +1096,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     }
     return {
       command: "book-run",
+      ...(namingReference === undefined ? {} : { namingReference }),
       ...(workflow === undefined ? {} : { workflow }),
       ...(planningMode === undefined ? {} : { planningMode }),
       deliveryMode: deliveryModeFlag(values),
@@ -1214,6 +1274,29 @@ export async function main(
   dependencyOverrides: Partial<CliRuntimeDependencies> = {},
 ): Promise<void> {
   const options = parseArgs(argv);
+  if (options.command === "book-review-status") {
+    console.log(JSON.stringify(readOmissionReviewStatus(requireOption(options, "output")), null, 2)); return;
+  }
+  if (options.command === "book-review-scan" || options.command === "book-review-run") {
+    const currentInput = () => loadOmissionReviewInput(requireOption(options, "store"), requireOption(options, "runId"));
+    if (options.command === "book-review-scan") {
+      const plan = buildOmissionReviewPlan(currentInput(), { maxCandidates: options.reviewMaxCandidates!, sampleCount: options.reviewSamples!, seed: options.reviewSeed! });
+      writeFileSync(requireOption(options, "output"), `${JSON.stringify(plan, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+      console.log(JSON.stringify({ ...plan, modelCalls: 0 }, null, 2)); return;
+    }
+    const plan = JSON.parse(readFileSync(requireOption(options, "input"), "utf8")) as OmissionReviewPlan;
+    validateOmissionReviewPlan(plan);
+    if (buildOmissionReviewPlan(currentInput(), plan.options).planHash !== plan.planHash) throw new Error("stale review plan: source or translation changed");
+    const runtime = buildTranslationRuntimeSet(loadRuntimeConfig(options), "quality", {
+      createModel: dependencyOverrides.createModel ?? createDeepSeekModel, createStreamFn: dependencyOverrides.createStreamFn ?? createDeepSeekStreamFn,
+    }).primary;
+    const result = await runOmissionReview({ plan, currentInput, model: runtime.model, streamFn: runtime.streamFn,
+      thinkingLevel: runtime.thinkingLevel, outputDirectory: requireOption(options, "output"),
+      limits: { maxCalls: options.reviewMaxCalls!, maxTokens: options.reviewMaxTokens!, maxOutputTokens: options.reviewMaxOutputTokens! }, deadlineMs: options.hardDeadlineMs });
+    console.log(JSON.stringify(result, null, 2));
+    if (!["complete", "budget_exhausted"].includes(result.stoppedReason)) throw new CliCommandError("OMISSION_REVIEW_STOPPED", result.stoppedReason);
+    return;
+  }
   if (options.command === "book-quality-status" || options.command === "book-quality-rework") {
     const store = options.command === "book-quality-status"
       ? LosslessBookStore.openReadOnly(requireOption(options, "store")) : new LosslessBookStore(requireOption(options, "store"));
@@ -1318,11 +1401,21 @@ export async function main(
       store.close();
     }
   }
+  if (options.command === "book-scope") {
+    const ledger = SourceLedger.open(requireOption(options, "manifest"));
+    const plan = createScopePlan(ledger);
+    if (options.output) writeFileSync(options.output, `${JSON.stringify(plan, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    console.log(JSON.stringify({ scope: ledger.scope ?? null, sourceVersion: ledger.sourceVersion,
+      sections: ledger.canonicalSegments, plan }, null, 2));
+    return;
+  }
   if (options.command === "book-import") {
     const result = await importSource({
       sourcePath: requireOption(options, "source"),
       projectDirectory: requireOption(options, "project"),
       sourceLanguage: requireOption(options, "sourceLanguage"),
+      ...(options.originalManifest === undefined ? {} : { originalManifestPath: options.originalManifest }),
+      ...(options.scopePlan === undefined ? {} : { scopePlan: JSON.parse(readFileSync(options.scopePlan, "utf8")) as SourceScopePlan }),
       ...(options.sourceEncoding === undefined
         ? {}
         : { explicitEncoding: options.sourceEncoding }),
@@ -1401,14 +1494,21 @@ export async function main(
     }
     return;
   }
-  if (options.command === "book-direct-recovery-release") {
+  if (options.command === "book-direct-recovery-release" || options.command === "book-direct-recovery-extend-budget") {
     const request = JSON.parse(readFileSync(requireOption(options, "input"), "utf8").replace(/^\uFEFF/u, ""));
-    console.log(JSON.stringify(releaseDirectTransportRecovery(requireOption(options, "store"), requireOption(options, "runId"), request), null, 2));
+    const apply = options.command === "book-direct-recovery-release" ? releaseDirectTransportRecovery : extendDirectTokenBudget;
+    console.log(JSON.stringify(apply(requireOption(options, "store"), requireOption(options, "runId"), request), null, 2));
     return;
   }
   if (options.command === "book-direct-recovery-status") {
     const store = LosslessBookStore.openReadOnly(requireOption(options, "store"));
     try { console.log(JSON.stringify(directRecoveryStatus(store, requireOption(options, "runId"), options.maxAttempts), null, 2)); }
+    finally { store.close(); }
+    return;
+  }
+  if (options.command === "book-direct-naming-status") {
+    const store = LosslessBookStore.openReadOnly(requireOption(options, "store"));
+    try { console.log(JSON.stringify(directNamingStatus(store, requireOption(options, "runId")), null, 2)); }
     finally { store.close(); }
     return;
   }
@@ -1539,6 +1639,8 @@ export async function main(
       ? "source" : "supervised");
     const chapterReviewMode = options.chapterReviewMode
       ?? (planningMode === "source" || (selectedRun?.metadata as { chapterReview?: { mode?: string } } | undefined)?.chapterReview?.mode === "bounded" ? "bounded" : "off");
+    if (options.namingReference && workflow !== "direct") throw new Error("--naming-reference requires native direct translation");
+    const namingReferences = options.namingReference ? loadNamingReferences(options.namingReference) : undefined;
     const style = loadStyleProfile({
       ...(options.styleProfile === undefined ? {} : { profilePath: options.styleProfile }),
       ...(options.prompt === undefined ? {} : { cliPrompt: options.prompt }),
@@ -1646,6 +1748,7 @@ export async function main(
         schedulerMode,
         runtimeProfileStore,
         styleState: style.styleState,
+        ...(namingReferences === undefined ? {} : { namingReferences }),
         ...(glossary === undefined ? {} : { glossary }),
         windowOptions: {
           maxBlocks: options.maxBlocks,

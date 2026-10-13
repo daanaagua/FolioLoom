@@ -104,6 +104,8 @@ test("desktop source service does not reuse a legacy plain-text manifest without
     const legacy = ready(await service.importSource({ sourcePath: firstPath, sourceLanguage: "auto" }));
     const manifest = JSON.parse(readFileSync(legacy.manifestPath, "utf8")) as Record<string, unknown>;
     delete manifest.encodingDecision;
+    // Historical imports predate both encoding decisions and pinned scope evidence.
+    delete manifest.source_scope;
     writeFileSync(legacy.manifestPath, JSON.stringify(manifest), "utf8");
 
     assert.equal(SourceLedger.open(legacy.manifestPath).sourceEncodingCompatibilityMode, true);

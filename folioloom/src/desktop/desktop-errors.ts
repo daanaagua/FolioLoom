@@ -19,6 +19,11 @@ interface PublicErrorDefinition {
 }
 
 const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.freeze({
+  SOURCE_SCOPE_INVALID: {
+    message: "原书范围核对未通过",
+    nextAction: "请核对原始文件与范围计划，补齐每部分的处理方式；分批书稿必须与所选原文一致。",
+    retryable: false,
+  },
   DIRECT_RECOVERY_PAUSED: {
     message: "直接翻译的自动恢复额度已用尽",
     nextAction: "译文和响应检查点已保存。请检查连接或输出异常；普通续跑不会清空已用额度。",
@@ -27,6 +32,11 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
   PROVIDER_TLS: {
     message: "模型连接的证书校验失败",
     nextAction: "请检查代理路径与证书来源；只配置已核验的可信证书机构，不要关闭证书校验。",
+    retryable: false,
+  },
+  PROVIDER_TRANSPORT: {
+    message: "模型连接在传输过程中中断",
+    nextAction: "请检查模型服务与代理线路后再续跑。已保存的译文和用量记录会保留。",
     retryable: false,
   },
   PROVIDER_PROXY_CONFIGURATION: {

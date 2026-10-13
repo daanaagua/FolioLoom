@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { validateSourceScope, type SourceScopeCertificate } from "../source/source-scope.js";
+
 import {
   closeSync,
   copyFileSync,
@@ -21,7 +23,7 @@ import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import { validateCandidateCheckpoint, type CandidateCheckpointRecord } from "../fullbook/candidate-checkpoint.js";
 import { validateRecoveryRecord, type RecoveryRecord } from "../fullbook/automatic-recovery.js";
 import { QualityQueue, qualityReviewId, validateQualityRecord, type QualityRecord, type QualityReworkRequest, type DeliveryMode } from "../fullbook/delivery-policy.js";
-import { validateDirectRecord, directNameKey, equivalentDirectRendering, type DirectName, type DirectRecord } from "../fullbook/direct-translation.js";
+import { validateDirectRecord, directNameKey, directHash as directHashForNaming, equivalentDirectRendering, type DirectName, type DirectRecord } from "../fullbook/direct-translation.js";
 import { assertQualityClosure, hasChangedIssueEvidence, priorQualityIssues, needsDispositionVerification, type QualityClosure } from "../domain/quality-closure.js";
 import { validateSurfaceObservation, surfaceObservationNoiseReason } from "../knowledge/surface-consistency.js";
 import { MAX_LIFETIME_REVIEWS_PER_WINDOW, SUPERVISION_POLICY, supervisionCandidateHash, supervisorIssueFailures, isProvenUnlaunchedSupervisorFailure } from "../domain/supervision.js";
@@ -210,7 +212,13 @@ export interface CertifiedSourceRange {
   rawEnd?: number;
 }
 
+function checkedSourceScope(scope: SourceScopeCertificate, canonicalHash: string): SourceScopeCertificate {
+  validateSourceScope(scope, canonicalHash);
+  return structuredClone(scope);
+}
+
 export interface CertifiedSourceInput {
+  scope?: import("../source/source-scope.js").SourceScopeCertificate;
   sourceVersion: string;
   rawSha256: string;
   canonicalSha256: string;
@@ -687,6 +695,7 @@ export interface LosslessAuditMissingConceptBinding {
 }
 
 export interface LosslessAuditState {
+  sourceScope?: import("../source/source-scope.js").SourceScopeCertificate;
   sourceLanguage?: string;
   runId: string;
   sourceVersion: string;
@@ -6767,6 +6776,9 @@ export class LosslessBookStore {
   /** Learned direct-workflow names are a replayable SQLite projection, not semantic revisions. */
   directNames(runId: string): import("../fullbook/direct-translation.js").DirectName[] {
     this.#run(runId);
+    const revised = one<{ payload_json: string }>(this.#database.prepare(
+      "SELECT payload_json FROM events WHERE run_id=? AND kind='direct_translation_record' AND json_extract(payload_json,'$.kind')='name_revision_commit' ORDER BY sequence DESC LIMIT 1"), runId);
+    if (revised) { const record = JSON.parse(revised.payload_json) as DirectRecord; validateDirectRecord(record); return record.payload.names as DirectName[]; }
     const names = new Map<string, import("../fullbook/direct-translation.js").DirectName>();
     const rows = all<{ payload_json: string }>(this.#database.prepare(
       "SELECT payload_json FROM events WHERE run_id=? AND kind='direct_translation_record' AND json_extract(payload_json,'$.kind')='names' ORDER BY sequence"), runId);
@@ -6782,8 +6794,59 @@ export class LosslessBookStore {
     return [...names.values()];
   }
 
+  /** Publish one frozen wave and its precisely anchored historical edits atomically. */
+  commitDirectNameRevisionPlan(runId: string, planKey: string, historical: Array<{ blockId: string; expectedVersion: number; before: string; after: string }>): DirectRecord {
+    return this.#transaction(() => {
+      const records = this.directRecords(runId);
+      const prior = records.find(r => r.kind === "name_revision_commit" && r.payload.planKey === planKey);
+      if (prior) return prior;
+      const saved = records.find(r => r.kind === "name_revision_plan" && r.key === planKey);
+      if (!saved || !["direct-translation-4", "direct-translation-5"].includes((this.listTranslationRuns().find(r => r.runId === runId)?.metadata as any)?.workflow?.version))
+        throw new Error("naming revision requires a saved protocol-four plan");
+      const plan = saved.payload.plan as import("../fullbook/direct-name-revisions.js").NameRevisionPlan;
+      if (canonicalJson(historical) !== canonicalJson(saved.payload.historicalPatches)) throw new Error("historical naming patches differ from frozen plan");
+      if (directHashForNaming(this.directNames(runId)) !== saved.payload.baseCatalogHash) throw new Error("stale naming revision catalog");
+      for (const w of plan.windows) {
+        if (this.#window(runId, w.windowId)?.status !== "completed") throw new Error("naming wave translations are not committed");
+        const active = this.activeTranslations(runId).filter(t => t.windowId === w.windowId);
+        if (active.length !== w.result.translations.length || w.result.translations.some(t => !active.some(a => a.blockId === t.blockId && a.text === t.text)))
+          throw new Error("naming wave translation differs from frozen plan");
+      }
+      const changed = plan.history.flatMap(w => w.result.translations);
+      if (new Set(historical.map(p => p.blockId)).size !== historical.length) throw new Error("duplicate naming patch");
+      for (const patch of historical) {
+        if (!changed.some(t => t.blockId === patch.blockId && t.text === patch.after)) throw new Error("naming patch outside frozen plan");
+        const current = one<{ translation_id: number; version: number; text: string; stage_state: string }>(this.#database.prepare(
+          "SELECT translation_id,version,text,stage_state FROM translations WHERE run_id=? AND block_id=? AND active=1"), runId, patch.blockId);
+        if (!current || current.version !== patch.expectedVersion || current.text !== patch.before || current.stage_state !== "promoted")
+          throw new Error("stale naming translation patch");
+        if (one<{ count: number }>(this.#database.prepare("SELECT COUNT(*) AS count FROM translation_concept_bindings WHERE translation_id=?"), current.translation_id)?.count)
+          throw new Error("naming patch cannot bypass concept-bound revalidation");
+        this.#database.prepare("UPDATE translations SET active=0 WHERE translation_id=?").run(current.translation_id);
+        const inserted = this.#database.prepare(`INSERT INTO translations(run_id,window_id,source_version,block_id,version,source_hash,text,result_status,stage_state,active,snapshot_id)
+          SELECT run_id,window_id,source_version,block_id,(SELECT COALESCE(MAX(version),0)+1 FROM translations WHERE run_id=? AND block_id=?),
+                 source_hash,?,result_status,'promoted',1,snapshot_id FROM translations WHERE translation_id=?`)
+          .run(runId, patch.blockId, patch.after, current.translation_id);
+        const replacementTranslationId = Number(inserted.lastInsertRowid);
+        this.#appendEvent(runId, "direct_name_local_patch", { planKey, blockId: patch.blockId, oldTranslationId: current.translation_id,
+          replacementTranslationId, oldVersion: current.version,
+          newVersion: one<{ version: number }>(this.#database.prepare("SELECT version FROM translations WHERE translation_id=?"), replacementTranslationId)!.version,
+          beforeHash: hashText(patch.before), afterHash: hashText(patch.after) });
+      }
+      const after = this.activeTranslations(runId);
+      if (changed.some(t => !after.some(a => a.blockId === t.blockId && a.text === t.text))) throw new Error("incomplete historical naming patches");
+      const record: DirectRecord = { id: `name-revision-commit:${planKey}`, kind: "name_revision_commit", windowId: saved.windowId,
+        key: directHashForNaming([planKey, "commit"]), at: Date.now(), payload: { planKey, names: plan.names,
+          windows: [...plan.history, ...plan.windows], decisions: plan.decisions, pending: plan.pending, patches: plan.patches } };
+      validateDirectRecord(record);
+      this.#appendEvent(runId, "direct_translation_record", record);
+      return record;
+    });
+  }
+
   appendDirectRecord(runId: string, record: DirectRecord): void {
     validateDirectRecord(record);
+    if (record.kind === "name_revision_commit") throw new Error("publish naming revisions through their frozen plan transaction");
     this.#transaction(() => {
       this.#run(runId);
       if (!this.#window(runId, record.windowId)) throw new Error("direct record window outside run");
@@ -7167,6 +7230,8 @@ export class LosslessBookStore {
       runStatus: run.status,
       runMetadata: JSON.parse(run.metadata_json) as unknown,
       canonicalSha256: source.canonical_sha256,
+      ...((JSON.parse(source.source_payload_json) as CertifiedSourceInput).scope === undefined ? {} : {
+        sourceScope: (JSON.parse(source.source_payload_json) as CertifiedSourceInput).scope }),
       sourceLanguage: getSourceLanguageProfile((JSON.parse(source.source_payload_json) as { sourceLanguage?: string }).sourceLanguage).id,
       canonicalChars: source.canonical_chars,
       blocks,
@@ -7759,6 +7824,7 @@ export class LosslessBookStore {
       sourceLanguageProfileVersion,
       sourceLanguageCompatibilityMode,
       ranges,
+      ...(input.scope === undefined ? {} : { scope: checkedSourceScope(input.scope, canonicalSha256) }),
     };
   }
 
@@ -7875,6 +7941,8 @@ export class LosslessBookStore {
     if (reconstructedCanonical.digest("hex") !== source.canonical_sha256) {
       throw new Error("reconstructed canonical hash does not match certified source");
     }
+    const scope = (JSON.parse(source.source_payload_json) as CertifiedSourceInput).scope;
+    if (scope !== undefined) validateSourceScope(scope, source.canonical_sha256, blocks.map(block => block.sourceText).join(""));
     return { estimatorVersion, annotations, blocks };
   }
 

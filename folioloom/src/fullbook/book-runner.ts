@@ -435,6 +435,10 @@ export interface LosslessBookRunMeta {
 }
 
 export interface LosslessBookRunOptions {
+  /** Immutable model-generated suggestions, filtered for each direct request. */
+  namingReferences?: readonly import("./direct-translation.js").DirectName[];
+  /** Compatibility selection for new stores; existing stores retain their protocol. */
+  directProtocolVersion?: "direct-translation-4" | "direct-translation-5";
   workflow?: TranslationWorkflow;
   planningMode?: PlanningMode;
   deliveryMode?: DeliveryMode;
@@ -4691,6 +4695,7 @@ export async function runBook(
       }
     } finally { store.close(); }
   }
+  if ("manifestPath" in options && options.namingReferences?.length) throw new Error("naming references require direct translation");
   const streams = new Set([options.streamFn]);
   if ("manifestPath" in options && options.runtimeSet) {
     streams.add(options.runtimeSet.primary.streamFn);

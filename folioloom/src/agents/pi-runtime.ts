@@ -93,6 +93,7 @@ export interface PiToolError {
 
 export type ModelProviderErrorKind =
   | "tls"
+  | "transport"
   | "auth"
   | "quota"
   | "throttled"
@@ -135,6 +136,7 @@ function retryableProviderErrorKind(kind: ModelProviderErrorKind): boolean {
 export function classifyProviderErrorMessage(message: string): ModelProviderErrorKind {
   const normalized = message.normalize("NFKC").toLocaleLowerCase();
   if (/(?:provider_tls|self_signed_cert_in_chain|depth_zero_self_signed_cert|cert_has_expired|cert_not_yet_valid|unable_to_verify_leaf_signature|unable_to_get_issuer_cert|err_tls_cert_altname_invalid|certificate validation failed)/u.test(normalized)) return "tls";
+  if (/\bprovider_transport\b/u.test(normalized)) return "transport";
   if (/(?:insufficient[_ -]?quota|quota exceeded|billing|out of budget|usage limit|credit balance)/u
     .test(normalized)) {
     return "quota";

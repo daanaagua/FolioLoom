@@ -13,6 +13,8 @@ import { runBook } from "../src/fullbook/book-runner.js";
 import { importSource } from "../src/source/source-importer.js";
 import { bindTaskContext } from "../src/agents/task-context.js";
 import { preflightProviderStream } from "../src/providers/preflight.js";
+import { providerNetworkError } from "../src/providers/network.js";
+import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 import net from "node:net";
 import tls from "node:tls";
 
@@ -21,6 +23,66 @@ function certificateError() {
     { code: "SELF_SIGNED_CERT_IN_CHAIN" }) });
 }
 const profile = { providerId: "deepseek" as const, modelId: "deepseek-flash", reasoningEffort: "high" as const };
+
+function closedSocketError() {
+  return new TypeError("fetch failed", { cause: Object.assign(new Error("fixture-secret at private.example closed"),
+    { code: "UND_ERR_SOCKET", socket: { remoteAddress: "192.0.2.5", bytesWritten: 1000, bytesRead: 0 } }) });
+}
+
+test("known transport causes survive the SDK boundary without raw error data", async () => {
+  const original = globalThis.fetch; let calls = 0;
+  globalThis.fetch = async () => { calls++; throw closedSocketError(); };
+  try {
+    const runtime = createProviderRuntime(profile, "fixture-secret");
+    const response = await (await runtime.streamFn(runtime.model,
+      { messages: [{ role: "user", content: "fixture", timestamp: 0 }] }, { maxRetries: 8 })).result();
+    assert.equal(calls, 1);
+    assert.match(response.errorMessage ?? "", /PROVIDER_TRANSPORT/u);
+    assert.match(response.errorMessage ?? "", /UND_ERR_SOCKET/u);
+    assert.match(response.errorMessage ?? "", /before HTTP response headers/u);
+    assert.doesNotMatch(response.errorMessage ?? "", /fixture-secret|private\.example|192\.0\.2/u);
+    const failure = new ModelProviderError(response.errorMessage!);
+    assert.equal(failure.kind, "transport"); assert.equal(failure.retryable, false);
+    assert.equal(toDesktopError(failure).code, "PROVIDER_TRANSPORT");
+  } finally { globalThis.fetch = original; }
+});
+
+test("a confirmed transport failure stops direct recovery after one dispatch and retains unknown usage", async () => {
+  const root = mkdtempSync(join(tmpdir(), "folioloom-transport-stop-")), source = join(root, "source.txt"), storePath = join(root, "book.db");
+  writeFileSync(source, "The visitor waited beside the door.", "utf8");
+  const imported = await importSource({ sourcePath: source, projectDirectory: join(root, "source"), sourceLanguage: "en" });
+  const original = globalThis.fetch; let posts = 0;
+  globalThis.fetch = async (_input, init) => {
+    if (init?.method !== "POST") return new Response('{"data":[]}', { status: 200 });
+    posts++; throw closedSocketError();
+  };
+  try {
+    const runtime = createProviderRuntime(profile, "fixture-secret");
+    await assert.rejects(() => runBook({ workflow: "direct", manifestPath: imported.manifestPath, storePath,
+      runMeta: { runId: "transport-stop", protocolVersion: "fixture", modelId: profile.modelId },
+      model: runtime.model, streamFn: runtime.streamFn, maxAttempts: 2 }),
+    (error: any) => error.kind === "transport" && error.retryable === false);
+    assert.equal(posts, 1);
+    const db = LosslessBookStore.openReadOnly(storePath);
+    try {
+      assert.equal(db.directRecords("transport-stop").filter(r => r.kind === "request").length, 1);
+      const settled = db.loadTokenLedgerEvents("transport-stop").filter(e => e.type === "settled");
+      assert.equal(settled.length, 1); assert.equal(settled[0]!.usageComplete, false);
+      assert.equal(db.statusSummary("transport-stop").runningWindows, 0);
+    } finally { db.close(); }
+  } finally { globalThis.fetch = original; }
+});
+
+test("transport normalization uses exact allowlisted codes and preserves certificate priority", () => {
+  for (const code of ["ECONNRESET", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"]) {
+    const failure = providerNetworkError(Object.assign(new Error("secret details"), { code }));
+    assert.equal(failure?.code, "PROVIDER_TRANSPORT"); assert.equal(failure?.transportCode, code);
+    assert.doesNotMatch(failure?.message ?? "", /secret/u);
+  }
+  assert.equal(providerNetworkError(Object.assign(new Error("UND_ERR_SOCKET secret"), { code: "UNKNOWN_SECRET_CODE" })), undefined);
+  const tls = providerNetworkError(Object.assign(new Error("socket closed"), { code: "UND_ERR_SOCKET", cause: certificateError() }));
+  assert.equal(tls?.code, "PROVIDER_TLS");
+});
 
 test("explicit classical TLS compatibility scopes supported groups and preserves certificate/version defaults", async () => {
   const originalCurve = tls.DEFAULT_ECDH_CURVE, originalMax = tls.DEFAULT_MAX_VERSION;
